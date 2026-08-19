@@ -7,4 +7,4 @@ Saw that {{CompanyName}} is connected to {{EventName}} and figured it was worth 
 Open to a quick conversation if the timing's right?
 
 Best,
-[Your Name]
+Harish
