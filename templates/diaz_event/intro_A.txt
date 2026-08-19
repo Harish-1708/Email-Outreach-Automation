@@ -7,4 +7,4 @@ I came across {{CompanyName}} while looking into who's involved with {{EventName
 We work with event teams on [what you do], and thought there might be a fit given what you're planning. Would you be open to a short call to see if it's relevant?
 
 Best,
-[Your Name]
+Harish
