@@ -2,7 +2,7 @@
 # to run multiple independent campaigns from the same repo.
 campaigns:
   diaz_event_outreach:
-    sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
+    sheet_id: "1beCHJ9dIZV2YW9BR5SmMhnAGv_F8ko0lMjRLtzL5Bzw"
     master_tab: "Master"
     responses_tab: "Responses"
     send_log_tab: "SendLog"     # optional — defaults to "SendLog" if omitted
