@@ -1,0 +1,8 @@
+Subject: Bumping this - {{EventName}}
+
+Hi {{FirstName}},
+
+Wanted to bump my earlier note about {{EventName}} in case it got buried. No pressure either way, just didn't want it to fall through the cracks.
+
+Regards,
+[Your Name]
