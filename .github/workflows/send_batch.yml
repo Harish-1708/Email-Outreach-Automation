@@ -1,0 +1,71 @@
+name: Send Batch
+
+# Requires you to type SEND in the confirm field — this is a deliberate
+# safety gate so a batch can never go out by accident from this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "Campaign name (from config/campaigns.yaml)"
+        required: true
+        default: "diaz_event_outreach"
+      stage:
+        description: "Stage name (intro, followup1, followup2, followup3, followup4)"
+        required: true
+        default: "intro"
+      batch_size:
+        description: "How many leads to send to (actual count may be lower — see caps below)"
+        required: true
+        default: "10"
+      variant:
+        description: 'Variant to force (A/B/C/D), or "Auto" for balanced rotation'
+        required: false
+        default: "Auto"
+      confirm:
+        description: 'Type SEND (in caps) to confirm you have already reviewed a Preview Batch run for this exact batch'
+        required: true
+        default: ""
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "SEND" ]; then
+            echo "::error::You must type SEND (exact match, all caps) in the confirm field to run this workflow."
+            exit 1
+          fi
+
+  send:
+    needs: guard
+    runs-on: ubuntu-latest
+    # A batch of N emails with jittered delays can legitimately take a while
+    # (batch_size * up to delay_max_minutes). Adjust if you run larger batches.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Send batch
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          GMAIL_SENDER_ADDRESS: ${{ secrets.GMAIL_SENDER_ADDRESS }}
+        run: |
+          python outreach.py send \
+            --campaign "${{ github.event.inputs.campaign }}" \
+            --stage "${{ github.event.inputs.stage }}" \
+            --batch-size "${{ github.event.inputs.batch_size }}" \
+            --variant "${{ github.event.inputs.variant }}" \
+            | tee send_output.txt
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat send_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
