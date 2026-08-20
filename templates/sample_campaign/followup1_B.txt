@@ -1,0 +1,10 @@
+Subject: Following up
+
+Hello {{FirstName}},
+
+Circling back on this in case it slipped by. Still think there could be a good fit between {{CompanyName}} and what we do.
+
+Let me know if it's worth a quick conversation.
+
+Thanks,
+[Your Name]
