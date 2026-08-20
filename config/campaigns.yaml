@@ -23,10 +23,10 @@ campaigns:
         wait_days_after_previous: 0
       - name: followup1
         template_prefix: followup1
-        wait_days_after_previous: 0
+        wait_days_after_previous: 3
       - name: followup2
         template_prefix: followup2
-        wait_days_after_previous: 0
+        wait_days_after_previous: 4
       - name: followup3
         template_prefix: followup3
         wait_days_after_previous: 5
