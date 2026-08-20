@@ -2,7 +2,7 @@
 # its own tabs, auto-named "<campaign_key>_Master" / "_Responses" / "_SendLog"
 # and auto-CREATED the first time that campaign runs — adding a new campaign
 # is just adding a new block under `campaigns`, nothing to set up by hand.
-shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
+shared_sheet_id: "1beCHJ9dIZV2YW9BR5SmMhnAGv_F8ko0lMjRLtzL5Bzw"
 
 # Which sending account to use when a lead's own SenderAccount cell is blank
 # and the campaign doesn't set its own default_sender_account. Must match a
