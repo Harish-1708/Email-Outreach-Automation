@@ -1,0 +1,80 @@
+# ONE Google Sheet is shared across every campaign below. Each campaign gets
+# its own tabs, auto-named "<campaign_key>_Master" / "_Responses" / "_SendLog"
+# and auto-CREATED the first time that campaign runs — adding a new campaign
+# is just adding a new block under `campaigns`, nothing to set up by hand.
+shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
+
+# Which sending account to use when a lead's own SenderAccount cell is blank
+# and the campaign doesn't set its own default_sender_account. Must match a
+# key in the EMAIL_ACCOUNTS_JSON secret.
+email_accounts:
+  default_account: "sales1"
+
+campaigns:
+  sample_campaign:
+    templates_dir: "templates/sample_campaign"
+    variants: ["A", "B", "C", "D"]
+
+    # Order matters: this defines the sequence a lead moves through. Length
+    # is fully configurable per campaign (1 to 5 stages) — not hard-coded.
+    stages:
+      - name: intro
+        template_prefix: intro
+        wait_days_after_previous: 0
+      - name: followup1
+        template_prefix: followup1
+        wait_days_after_previous: 3
+      - name: followup2
+        template_prefix: followup2
+        wait_days_after_previous: 4
+      - name: followup3
+        template_prefix: followup3
+        wait_days_after_previous: 5
+      - name: followup4
+        template_prefix: followup4
+        wait_days_after_previous: 5
+
+    sending:
+      timezone: "Asia/Kolkata"
+      window_start: "09:00"
+      window_end: "17:00"
+      delay_min_minutes: 3
+      delay_max_minutes: 7
+      daily_limit: 100
+
+    reply_monitor:
+      lookback_hours: 24
+
+    # Optional overrides (uncomment if you want this campaign on a
+    # different sheet, different tab names, or a specific sender account
+    # instead of the global default):
+    # sheet_id: "A_DIFFERENT_SHEET_ID"
+    # master_tab: "CustomMasterName"
+    # responses_tab: "CustomResponsesName"
+    # send_log_tab: "CustomSendLogName"
+    # default_sender_account: "sales2"
+
+  # Example of a SECOND, independent campaign with a shorter sequence —
+  # demonstrates that campaigns are fully config-driven: just add a block
+  # here and its tabs get created automatically on first run, in the same
+  # shared sheet above. Uncomment and fill in real templates to use it.
+  #
+  # another_campaign:
+  #   templates_dir: "templates/another_campaign"
+  #   variants: ["A", "B"]
+  #   stages:
+  #     - name: intro
+  #       template_prefix: intro
+  #       wait_days_after_previous: 0
+  #     - name: followup1
+  #       template_prefix: followup1
+  #       wait_days_after_previous: 4
+  #   sending:
+  #     timezone: "Asia/Kolkata"
+  #     window_start: "09:00"
+  #     window_end: "17:00"
+  #     delay_min_minutes: 3
+  #     delay_max_minutes: 7
+  #     daily_limit: 100
+  #   reply_monitor:
+  #     lookback_hours: 24
