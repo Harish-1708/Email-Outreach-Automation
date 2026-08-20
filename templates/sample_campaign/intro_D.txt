@@ -1,4 +1,4 @@
-Subject: Introduction from [Your Company]
+Subject: Introduction from {{CompanyName}}
 
 Hi {{FirstName}},
 
