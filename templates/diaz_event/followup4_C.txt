@@ -1,8 +1,0 @@
-Subject: Last check-in - {{EventName}}
-
-Hi {{FirstName}},
-
-This'll be my final note for now. If it's ever useful to revisit {{EventName}} plans together, my door's open - just reach out whenever works.
-
-Regards,
-[Your Name]

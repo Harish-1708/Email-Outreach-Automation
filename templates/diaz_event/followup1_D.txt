@@ -1,8 +1,0 @@
-Subject: Checking back in re: {{CompanyName}}
-
-Hi {{FirstName}},
-
-Checking back in on my earlier message about {{EventName}}. If now isn't the right time, happy to reconnect later - just let me know either way.
-
-Best,
-[Your Name]

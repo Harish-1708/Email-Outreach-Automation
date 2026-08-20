@@ -1,8 +1,0 @@
-Subject: Closing the loop - {{EventName}}
-
-Hello {{FirstName}},
-
-I'll leave it here for now so I'm not overloading your inbox. If {{CompanyName}}'s plans around {{EventName}} change, I'd still love to reconnect.
-
-Thanks for your time,
-[Your Name]

@@ -1,8 +1,0 @@
-Subject: Re: {{EventName}} - quick value note
-
-Hi {{FirstName}},
-
-Rather than just following up again, thought I'd share something concrete: [specific value point relevant to EventName / CompanyName]. Happy to elaborate if useful.
-
-Best,
-[Your Name]

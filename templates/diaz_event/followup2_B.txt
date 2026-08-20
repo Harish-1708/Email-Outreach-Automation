@@ -1,8 +1,0 @@
-Subject: Still worth a look? - {{EventName}}
-
-Hello {{FirstName}},
-
-Following up once more on {{CompanyName}} and {{EventName}}. If this isn't a priority right now, totally understand - just wanted to leave the door open.
-
-Thanks,
-[Your Name]
