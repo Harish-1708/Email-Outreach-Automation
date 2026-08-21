@@ -1,0 +1,8 @@
+Subject: Bumping this up
+
+Hi {{FirstName}},
+
+Wanted to bump my earlier note in case it got buried. No pressure either way, just didn't want it to fall through the cracks.
+
+Regards,
+[Your Name]

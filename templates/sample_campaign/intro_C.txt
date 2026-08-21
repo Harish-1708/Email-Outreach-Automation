@@ -1,0 +1,10 @@
+Subject: Reaching out to {{CompanyName}}
+
+Hi {{FirstName}},
+
+I'll keep this short. {{CompanyName}}'s work caught my attention, and I think there's a natural connection to what we're building.
+
+If it's useful, happy to share more - otherwise no worries at all.
+
+Regards,
+[Your Name]
