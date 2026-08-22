@@ -1539,3 +1539,86 @@ def test_dashboard_shows_sender_usage_today_without_cap():
     rows = outreach.compute_campaign_dashboard(campaign_cfg, leads, [], send_log, [])
     d = _rows_to_dict(rows)
     assert d[("Sender Usage Today", "sales1 - Sent Today")] == "1 (no per-account cap set)"
+
+
+# =============================================================================
+# apply_sending_overrides — per-run CLI overrides for send
+# =============================================================================
+
+def test_apply_sending_overrides_no_args_changes_nothing():
+    original_sending = {"daily_limit": 100, "sender_rotation": False}
+    campaign_cfg = {"sending": original_sending}
+    overridden = outreach.apply_sending_overrides(campaign_cfg)
+    assert overridden == []
+    assert campaign_cfg["sending"]["daily_limit"] == 100
+    assert campaign_cfg["sending"]["sender_rotation"] is False
+    # The dict itself must be a NEW object — never the same one that was
+    # passed in — so nothing shared/cached elsewhere gets mutated.
+    assert campaign_cfg["sending"] is not original_sending
+
+
+def test_apply_sending_overrides_daily_limit():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    overridden = outreach.apply_sending_overrides(campaign_cfg, daily_limit=25)
+    assert overridden == ["daily_limit"]
+    assert campaign_cfg["sending"]["daily_limit"] == 25
+
+
+def test_apply_sending_overrides_per_account_daily_limit():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    overridden = outreach.apply_sending_overrides(campaign_cfg, per_account_daily_limit=5)
+    assert overridden == ["per_account_daily_limit"]
+    assert campaign_cfg["sending"]["per_account_daily_limit"] == 5
+
+
+def test_apply_sending_overrides_sender_rotation_true():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    overridden = outreach.apply_sending_overrides(campaign_cfg, sender_rotation="true")
+    assert overridden == ["sender_rotation"]
+    assert campaign_cfg["sending"]["sender_rotation"] is True
+
+
+def test_apply_sending_overrides_sender_rotation_false():
+    campaign_cfg = {"sending": {"daily_limit": 100, "sender_rotation": True}}
+    overridden = outreach.apply_sending_overrides(campaign_cfg, sender_rotation="false")
+    assert overridden == ["sender_rotation"]
+    assert campaign_cfg["sending"]["sender_rotation"] is False
+
+
+def test_apply_sending_overrides_all_three_at_once():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    overridden = outreach.apply_sending_overrides(
+        campaign_cfg, daily_limit=10, per_account_daily_limit=2, sender_rotation="true")
+    assert set(overridden) == {"daily_limit", "per_account_daily_limit", "sender_rotation"}
+    assert campaign_cfg["sending"]["daily_limit"] == 10
+    assert campaign_cfg["sending"]["per_account_daily_limit"] == 2
+    assert campaign_cfg["sending"]["sender_rotation"] is True
+
+
+def test_apply_sending_overrides_rejects_non_positive_daily_limit():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    try:
+        outreach.apply_sending_overrides(campaign_cfg, daily_limit=0)
+        assert False, "should have raised ValueError"
+    except ValueError:
+        pass
+
+
+def test_apply_sending_overrides_rejects_negative_per_account_daily_limit():
+    campaign_cfg = {"sending": {"daily_limit": 100}}
+    try:
+        outreach.apply_sending_overrides(campaign_cfg, per_account_daily_limit=-3)
+        assert False, "should have raised ValueError"
+    except ValueError:
+        pass
+
+
+def test_apply_sending_overrides_never_mutates_yaml_source_dict():
+    # Simulates the real scenario: campaign_cfg['sending'] initially IS the
+    # same dict object loaded from yaml. After calling the override
+    # function, that ORIGINAL dict must be untouched.
+    yaml_loaded_sending = {"daily_limit": 100}
+    campaign_cfg = {"sending": yaml_loaded_sending}
+    outreach.apply_sending_overrides(campaign_cfg, daily_limit=5)
+    assert yaml_loaded_sending["daily_limit"] == 100  # untouched
+    assert campaign_cfg["sending"]["daily_limit"] == 5  # only the copy changed
