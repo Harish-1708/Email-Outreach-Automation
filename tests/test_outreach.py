@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import outreach  # noqa: E402
 
 
-TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "templates", "sample_campaign")
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "templates", "Kelson_Creators_Licensing")
 
 STAGES = [
     {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
