@@ -12,7 +12,7 @@ email_accounts:
   default_account: "sales1"
 
 campaigns:
-  sample_campaign:
+  Kelson_Creators_Licensing:
     templates_dir: "templates/Kelson_Creators_Licensing"
     variants: ["A", "B", "C", "D"]
 
