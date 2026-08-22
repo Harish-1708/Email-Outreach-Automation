@@ -174,6 +174,16 @@ sends from follows manual assignment, then automatic rotation if enabled,
 then the single default (see Section 10). Automatically refreshes that
 campaign's dashboard afterward.
 
+Three more inputs let you override `sending.daily_limit`,
+`sending.per_account_daily_limit`, and `sending.sender_rotation` **for
+this run only** — leave them blank/at their default to use whatever's in
+`campaigns.yaml`. Nothing you enter here is ever written back to the
+config file, so this is safe to use for a one-off (e.g. "just this once,
+send with a lower daily cap while I'm testing a new template") without
+touching the repo at all. The job output/summary always states plainly
+which values were used and whether each came `[from config]` or was
+`[overridden]` for that run.
+
 ### Check Replies
 
 Runs automatically every 30 minutes — checks every account in
@@ -524,6 +534,11 @@ sending:
                                                 # account in EMAIL_ACCOUNTS_JSON
 ```
 
+> All three of `sender_rotation`, `per_account_daily_limit`, and
+> `daily_limit` can also be set (or overridden) directly as **`Send
+> Batch` workflow inputs** for a single run, without editing this file —
+> see Section 4.
+
 - **`sender_rotation`** (`true`/`false`, default `false`) — turns rotation
   on for blank `SenderAccount` cells.
 - **`per_account_daily_limit`** (optional integer) — caps how many emails
@@ -594,7 +609,7 @@ outreach.py                 Everything: CLI, Sheets, SMTP send, IMAP read,
                              dashboards, error monitoring
 config/campaigns.yaml       shared_sheet_id + email_accounts + campaigns
 templates/sample_campaign/  20 template files (5 stages x 4 variants)
-tests/test_outreach.py      116 unit tests
+tests/test_outreach.py      125 unit tests
 .github/workflows/
   preview_batch.yml         Manual — shows what would be sent
   send_batch.yml            Manual, requires typing SEND — sends, then
