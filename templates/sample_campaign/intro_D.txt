@@ -1,0 +1,10 @@
+Subject: Introduction from [Your Company]
+
+Hi {{FirstName}},
+
+Figured it was worth a note. We help teams like {{CompanyName}} with [what you do], and I suspect there's some relevant overlap.
+
+Open to a quick conversation if the timing's right?
+
+Best,
+[Your Name]
