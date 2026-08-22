@@ -21,6 +21,23 @@ on:
         description: 'Variant to force (A/B/C/D), or "Auto" for balanced rotation'
         required: false
         default: "Auto"
+      daily_limit:
+        description: "Override campaign daily send limit for THIS RUN ONLY (leave blank to use config value)"
+        required: false
+        default: ""
+      per_account_daily_limit:
+        description: "Override per-account daily limit for THIS RUN ONLY (leave blank to use config value)"
+        required: false
+        default: ""
+      sender_rotation:
+        description: "Override automatic sender rotation for THIS RUN ONLY"
+        required: false
+        type: choice
+        options:
+          - "(use config default)"
+          - "true"
+          - "false"
+        default: "(use config default)"
       confirm:
         description: 'Type SEND (in caps) to confirm you have already reviewed a Preview Batch run for this exact batch'
         required: true
@@ -54,12 +71,23 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           EMAIL_ACCOUNTS_JSON: ${{ secrets.EMAIL_ACCOUNTS_JSON }}
         run: |
-          python outreach.py send \
-            --campaign "${{ github.event.inputs.campaign }}" \
-            --stage "${{ github.event.inputs.stage }}" \
-            --batch-size "${{ github.event.inputs.batch_size }}" \
-            --variant "${{ github.event.inputs.variant }}" \
-            | tee send_output.txt
+          CMD=(python outreach.py send
+            --campaign "${{ github.event.inputs.campaign }}"
+            --stage "${{ github.event.inputs.stage }}"
+            --batch-size "${{ github.event.inputs.batch_size }}"
+            --variant "${{ github.event.inputs.variant }}")
+
+          if [ -n "${{ github.event.inputs.daily_limit }}" ]; then
+            CMD+=(--daily-limit "${{ github.event.inputs.daily_limit }}")
+          fi
+          if [ -n "${{ github.event.inputs.per_account_daily_limit }}" ]; then
+            CMD+=(--per-account-daily-limit "${{ github.event.inputs.per_account_daily_limit }}")
+          fi
+          if [ "${{ github.event.inputs.sender_rotation }}" = "true" ] || [ "${{ github.event.inputs.sender_rotation }}" = "false" ]; then
+            CMD+=(--sender-rotation "${{ github.event.inputs.sender_rotation }}")
+          fi
+
+          "${CMD[@]}" | tee send_output.txt
       - name: Add to job summary
         if: always()
         run: |
