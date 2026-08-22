@@ -3,7 +3,7 @@
 # "<name> Custom Log Sheet", "<name> Error Log", "<name> Dashboard" — all
 # auto-CREATED the first time that campaign runs. Adding a new campaign is
 # just adding a new block under `campaigns`, nothing to set up by hand.
-shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
+shared_sheet_id: "1beCHJ9dIZV2YW9BR5SmMhnAGv_F8ko0lMjRLtzL5Bzw"
 
 # Which sending account to use when a lead's own SenderAccount cell is blank
 # and the campaign doesn't set its own default_sender_account. Must match a
@@ -13,7 +13,7 @@ email_accounts:
 
 campaigns:
   sample_campaign:
-    templates_dir: "templates/sample_campaign"
+    templates_dir: "templates/Kelson_Creators_Licensing"
     variants: ["A", "B", "C", "D"]
 
     # Order matters: this defines the sequence a lead moves through. Length
