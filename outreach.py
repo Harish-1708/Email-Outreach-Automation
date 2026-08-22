@@ -1452,10 +1452,58 @@ def cmd_preview(args):
     print("\nNothing has been sent. Re-run with the 'send' command to actually send this batch.")
 
 
+def apply_sending_overrides(campaign_cfg: Dict, daily_limit: Optional[int] = None,
+                             per_account_daily_limit: Optional[int] = None,
+                             sender_rotation: Optional[str] = None) -> List[str]:
+    """Applies CLI-provided overrides for a single run — never touches
+    campaigns.yaml. Replaces campaign_cfg['sending'] with a fresh copy
+    before mutating it, so nothing shared/cached elsewhere is affected.
+    Returns the list of keys that were actually overridden (for reporting).
+    Raises ValueError for an invalid override value."""
+    campaign_cfg["sending"] = dict(campaign_cfg["sending"])
+    sending = campaign_cfg["sending"]
+    overridden = []
+
+    if daily_limit is not None:
+        if daily_limit <= 0:
+            raise ValueError("--daily-limit must be a positive integer.")
+        sending["daily_limit"] = daily_limit
+        overridden.append("daily_limit")
+
+    if per_account_daily_limit is not None:
+        if per_account_daily_limit <= 0:
+            raise ValueError("--per-account-daily-limit must be a positive integer.")
+        sending["per_account_daily_limit"] = per_account_daily_limit
+        overridden.append("per_account_daily_limit")
+
+    if sender_rotation is not None:
+        sending["sender_rotation"] = (sender_rotation == "true")
+        overridden.append("sender_rotation")
+
+    return overridden
+
+
 def cmd_send(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
     accounts = load_email_accounts()
+
+    try:
+        overridden = apply_sending_overrides(campaign_cfg, args.daily_limit,
+                                              args.per_account_daily_limit, args.sender_rotation)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    sending = campaign_cfg["sending"]
+    print(
+        f"Sending config for this run: daily_limit={sending.get('daily_limit')}"
+        f"{' [overridden]' if 'daily_limit' in overridden else ' [from config]'}, "
+        f"per_account_daily_limit={sending.get('per_account_daily_limit')}"
+        f"{' [overridden]' if 'per_account_daily_limit' in overridden else ' [from config]'}, "
+        f"sender_rotation={sending.get('sender_rotation', False)}"
+        f"{' [overridden]' if 'sender_rotation' in overridden else ' [from config]'}\n"
+    )
 
     forced_variant = None if args.variant in (None, "Auto") else args.variant
     results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size, forced_variant=forced_variant)
@@ -1559,6 +1607,15 @@ def main():
     p_send.add_argument("--batch-size", type=int, required=True)
     p_send.add_argument("--variant", default="Auto",
                          help="Force a specific variant letter for the whole batch. Default: Auto")
+    p_send.add_argument("--daily-limit", type=int, default=None,
+                         help="Override sending.daily_limit for THIS RUN ONLY — never written to "
+                              "campaigns.yaml. Omit to use the value from config.")
+    p_send.add_argument("--per-account-daily-limit", type=int, default=None,
+                         help="Override sending.per_account_daily_limit for THIS RUN ONLY — never "
+                              "written to campaigns.yaml. Omit to use the value from config.")
+    p_send.add_argument("--sender-rotation", choices=["true", "false"], default=None,
+                         help="Override sending.sender_rotation for THIS RUN ONLY — never written "
+                              "to campaigns.yaml. Omit to use the value from config.")
     p_send.set_defaults(func=cmd_send)
 
     p_replies = sub.add_parser("check-replies", help="Check all configured inboxes for new replies/bounces")
