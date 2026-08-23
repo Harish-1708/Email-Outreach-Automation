@@ -8,7 +8,12 @@ error monitoring.
 
 **Runs 100% on GitHub Actions. Nothing runs on your computer, ever.**
 Setup is: create a Google Sheet, create a Google service account, generate
-an App Password, paste values into GitHub Secrets, edit one YAML file, push.
+an App Password, paste values into GitHub Secrets, edit one small settings
+file, push.
+
+**Launching a brand-new campaign needs no code or config changes at all** —
+create a folder of templates and type the name into a workflow input. See
+Section 5.
 
 ---
 
@@ -25,17 +30,18 @@ Preview Batch  -->  you review  -->  Send Batch (type "SEND")
    Email sent (SMTP)          Check Replies (every 30 min, IMAP)
         |                              |
         v                              v
-  Sheet updated              reply classified, lead stopped if
-  (sent, variant,             it's a genuine reply/bounce
-  next eligible date)                   |
-        |                              v
+  Sheet updated              reply matched + classified, lead
+  (sent, variant,             stopped ONLY on a verified match
+  next eligible date)         to THIS campaign's own thread
+        |                              |
         +----------> Dashboard refreshed automatically
                       (after every Send / Check Replies,
                       plus every 6 hours as a backstop)
 ```
 
 Every batch is: you pick a campaign + stage + how many leads, GitHub shows
-you exactly what would be sent, and only then do you tell it to actually send.
+you exactly what would be sent, and only then do you tell it to actually
+send.
 
 ---
 
@@ -59,8 +65,8 @@ This one sheet holds every campaign you run, in separate tabs.
    - Name: `GOOGLE_SERVICE_ACCOUNT_JSON`
    - Value: the entire contents of that JSON file, pasted as-is.
 
-Nothing further needed — the 5 tabs per campaign (see Section 7) are
-created automatically the first time you run that campaign.
+Nothing further needed — each campaign's 5 tabs (see Section 7) are
+created automatically the first time it runs.
 
 ### Step 3 — Create an App Password for each sending account
 
@@ -82,10 +88,10 @@ Combine every account into **one** GitHub secret:
 }
 ```
 
-List one account or many — adding/removing an account is just editing this
-one secret.
+List one account or many — adding/removing an account is just editing
+this one secret.
 
-### Step 4 — Edit `config/campaigns.yaml`
+### Step 4 — Edit `config/settings.yaml`
 
 ```yaml
 shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"   # from Step 1
@@ -95,26 +101,23 @@ email_accounts:
                                 # when a lead doesn't specify one
 ```
 
-The repo ships with one working example, `sample_campaign`, ready to use
-as-is — see [Section 5](#5-configuring-a-campaign) to customize it or add more.
+This is the **only** file every campaign shares. It also holds
+`default_campaign_settings` — the stages, variants, and sending limits
+every campaign inherits unless it overrides them. You won't normally need
+to touch that part.
 
-### Step 5 — Edit your email templates
+### Step 5 — Push to GitHub
 
-Templates live in `templates/sample_campaign/` — 20 files (5 stages ×
-4 variants). Replace the bracketed placeholders (`[Your Name]`,
-`[what you do]`, etc.) with your real content. See [Section 6](#6-templates).
-
-### Step 6 — Push to GitHub
-
-Push with both secrets set. That's the entire setup.
+Push with both secrets set. That's the entire one-time setup — see
+Section 5 for how to actually launch a campaign.
 
 ---
 
 ## 3. Adding leads
 
-Add leads as rows in the **Master Sheet** tab (created automatically the
-first time you run `Preview Batch` for a campaign — see Section 7 for the
-exact tab name).
+Add leads as rows in a campaign's **Master Sheet** tab (created
+automatically the first time you run `Preview Batch` for that campaign —
+see Section 7 for the exact tab name).
 
 **Only the `Email` column is required.** Everything else is optional:
 
@@ -144,11 +147,10 @@ Every other column (`CurrentStage`, `IntroSentAt`, `Status`, etc.) is
 
 ### Adding your own custom columns (e.g. Industry, Job Title)
 
-You can add extra columns to the Master Sheet **after** the required ones
-— e.g. `Industry`, `JobTitle`, `Region` — and reference them directly in
-templates as `{{Industry}}`, `{{JobTitle}}`, etc. No code changes needed.
-A blank value in one of these renders as nothing (not a literal
-`{{Industry}}` in the email) — see Section 6 for exactly how this works.
+Add extra columns to the Master Sheet **after** the required ones — e.g.
+`Industry`, `JobTitle` — and reference them directly in templates as
+`{{Industry}}`, `{{JobTitle}}`. No code changes needed. A blank value
+renders as nothing, never as literal `{{Industry}}` text.
 
 ---
 
@@ -159,49 +161,36 @@ Everything happens from your repo's **Actions** tab.
 ### Preview Batch
 
 Run this first, always. Shows exactly who's eligible and exactly what
-each email will say — **nothing is sent**. Also flags, per lead:
-- Any email address that doesn't look correctly formatted.
-- Any template variable that didn't match a real column (a likely typo) —
-  these render as blank text in the actual email, so Preview is where you
-  catch them before sending.
+each email will say — **nothing is sent**. Flags, per lead: any email
+address that doesn't look correctly formatted, and any template variable
+that didn't match a real column (a likely typo).
 
 ### Send Batch
 
-Same inputs as Preview, plus you must type `SEND` (exact match). This is
-the only thing that actually sends email — one by one with a random delay
-between each, updating the Sheet as it goes. Which account each email
-sends from follows manual assignment, then automatic rotation if enabled,
-then the single default (see Section 10). Automatically refreshes that
-campaign's dashboard afterward.
-
-Three more inputs let you override `sending.daily_limit`,
-`sending.per_account_daily_limit`, and `sending.sender_rotation` **for
-this run only** — leave them blank/at their default to use whatever's in
-`campaigns.yaml`. Nothing you enter here is ever written back to the
-config file, so this is safe to use for a one-off (e.g. "just this once,
-send with a lower daily cap while I'm testing a new template") without
-touching the repo at all. The job output/summary always states plainly
-which values were used and whether each came `[from config]` or was
-`[overridden]` for that run.
+Same inputs as Preview, plus you must type `SEND` (exact match). Sends
+one by one with a random delay between each, updating the Sheet as it
+goes. `daily_limit`, `per_account_daily_limit`, and `sender_rotation` can
+all be overridden here **for this run only** (see Section 10) — nothing
+you type here is ever written back to config. Automatically refreshes
+that campaign's dashboard afterward.
 
 ### Check Replies
 
 Runs automatically every 30 minutes — checks every account in
 `EMAIL_ACCOUNTS_JSON`, logs everything to Responses, stops a lead's
-sequence on a genuine reply or hard bounce. Also refreshes the dashboard
-afterward. Can be triggered manually too.
+sequence **only on a verified match to that campaign's own thread** (see
+Section 9). Also refreshes the dashboard afterward.
 
 ### Update Dashboard
 
-Manual (pick one campaign, or "update all"), plus runs automatically every
-6 hours as a backstop, on top of the automatic refresh after every Send/
-Check Replies run.
+Manual (pick one campaign, or "update all"), plus runs automatically
+every 6 hours as a backstop.
 
 ### A normal week looks like:
 
 1. Add 50 new leads to the Master Sheet, `Approval = Yes`.
 2. Run **Preview Batch**: stage `intro`, batch size `20`. Fix anything it
-   flags (bad email formats, unrecognized variables).
+   flags.
 3. Happy with it → run **Send Batch**, same inputs, type `SEND`.
 4. `Check Replies` runs on its own from here.
 5. Check the campaign's **Dashboard** tab anytime for current stats.
@@ -210,62 +199,74 @@ Check Replies run.
 
 ---
 
-## 5. Configuring a campaign
+## 5. Launching a campaign
 
-Everything lives in `config/campaigns.yaml`:
+**A campaign exists the moment its templates folder exists — nothing
+needs to be registered anywhere.** This is deliberate: the old design
+required editing a shared YAML file to "register" every campaign before
+it could run, which meant a real risk of launching in production having
+forgotten that step. Now, the folder you'd have to create anyway (you
+need template content regardless) *is* the registration.
 
-```yaml
-shared_sheet_id: "..."
-email_accounts:
-  default_account: "sales1"
+### Launching a brand-new campaign
 
-campaigns:
-  sample_campaign:                          # <- the "campaign name" you
-                                             #    type into workflow inputs
-    templates_dir: "templates/sample_campaign"
-    variants: ["A", "B", "C", "D"]
+1. Create `templates/<your_campaign_name>/` with your `.txt` template
+   files (20 files for the default 5-stage × 4-variant shape — see
+   Section 6 for the exact format).
+2. Type `<your_campaign_name>` into any workflow's `campaign` input.
 
-    stages:                                  # 1 to 5 stages, any names/order
-      - name: intro
-        template_prefix: intro
-        wait_days_after_previous: 0
-      - name: followup1
-        template_prefix: followup1
-        wait_days_after_previous: 3
-      # ...
+That's it. It runs on the shared defaults from
+`config/settings.yaml`'s `default_campaign_settings` — no YAML edit
+required.
 
-    sending:
-      timezone: "Asia/Kolkata"
-      window_start: "09:00"                  # advisory — not a hard block
-      window_end: "17:00"
-      delay_min_minutes: 3
-      delay_max_minutes: 7
-      daily_limit: 100
-      sender_rotation: false                  # see Section 10 for full details
-      # per_account_daily_limit: 5
-      # rotation_accounts: ["sales1", "sales2"]
+If you type a campaign name with no matching templates folder, you get a
+clear error immediately, before anything is attempted:
 
-    reply_monitor:
-      lookback_hours: 24
+```
+No templates found for campaign 'Foo' — expected a folder at
+'templates/Foo'. Create it with your template files before running
+this campaign. Currently available campaigns: Kelson_Creators_Licensing
 ```
 
-### Adding a second campaign
+### Giving one campaign different settings
 
-Add another block under `campaigns:`. Its 5 tabs (see Section 7) get
-created automatically in the same shared sheet the first time you run
-`Preview Batch` for it.
-
-### Optional per-campaign overrides
+Most campaigns need nothing beyond the shared defaults. If one needs to
+differ — a lower daily limit, fewer stages, its own sender — create
+`config/campaigns/<campaign_name>.yaml` with **only what's different**:
 
 ```yaml
-    sheet_id: "A_DIFFERENT_SHEET_ID"
-    master_tab: "CustomMasterName"
-    responses_tab: "CustomResponsesName"
-    send_log_tab: "CustomSendLogName"
-    error_log_tab: "CustomErrorLogName"
-    dashboard_tab: "CustomDashboardName"
-    default_sender_account: "sales2"
+# config/campaigns/DudeRobe_Creator_Outreach.yaml
+sending:
+  daily_limit: 50
+
+stages:
+  - name: intro
+    template_prefix: intro
+    wait_days_after_previous: 0
+  - name: followup1
+    template_prefix: followup1
+    wait_days_after_previous: 5
 ```
+
+Everything you don't mention — `variants`, `reply_monitor`, the rest of
+`sending`, etc. — is still inherited from `config/settings.yaml`. See
+`config/campaigns/README.md` for more examples.
+
+### The safety net: templates are validated, not inferred
+
+The system never guesses a campaign's shape from whatever files happen to
+exist. It reads the configured `stages` and `variants` (from defaults, or
+an override file) and checks that **every** implied template file is
+actually present — so a single missing file (say, someone forgot to
+create `followup3_D.txt`) fails loudly with the exact missing filenames,
+rather than silently running a campaign with one fewer variant than you
+think it has.
+
+### Seeing every campaign that currently exists
+
+`dashboard --all` (manual or the 6-hourly scheduled run) discovers every
+campaign by scanning `templates/` for subfolders — there's no separate
+list to keep in sync. Whatever's in that folder is exactly what exists.
 
 ---
 
@@ -302,20 +303,21 @@ Best,
 
 2. **Any other `{{Variable}}`** — resolved directly against a Master Sheet
    column of the same name (your own custom columns, e.g. `{{Industry}}`).
-   Blank data for a real column just renders as nothing — completely
-   normal, not flagged as an error.
+   Blank data for a real column just renders as nothing — normal, not
+   flagged as an error.
 
 3. **A variable matching no column at all** — almost always a typo.
-   Renders as nothing (never as literal `{{...}}` text in a real email),
-   **and gets flagged**: shown as a warning in `Preview Batch`, and logged
-   to the Error Log as `Missing Template Variable` after a real send.
+   Renders as nothing, **and gets flagged**: shown as a warning in
+   `Preview Batch`, and logged to the Error Log as `Missing Template
+   Variable` after a real send.
 
 Bracketed text like `[Your Name]` is **not** a variable — just a
 placeholder for you to manually edit.
 
 Follow-ups automatically reply within the same email thread as the Intro
 (real `In-Reply-To`/`References` headers), so the recipient sees one
-conversation, not disconnected emails.
+conversation, not disconnected emails. This threading is also what makes
+reply matching trustworthy — see Section 9.
 
 To force one specific variant instead of auto-rotation, use the `variant`
 input on Preview/Send (default `Auto`).
@@ -325,19 +327,18 @@ input on Preview/Send (default `Auto`).
 ## 7. The five sheet tabs, per campaign
 
 Every campaign gets these, auto-created and auto-named from the campaign
-key (e.g. for `sample_campaign`):
+folder name (e.g. for `Kelson_Creators_Licensing`):
 
 | Tab | Default name | Purpose |
 |---|---|---|
-| Master | `sample_campaign Master Sheet` | One row per lead — current state |
-| Responses | `sample_campaign Response Sheet` | One row per inbound message ever detected |
-| Send Log | `sample_campaign Custom Log Sheet` | One row per outbound send attempt ever made |
-| Error Log | `sample_campaign Error Log` | One row per error, categorized (see Section 9) |
-| Dashboard | `sample_campaign Dashboard` | Computed stats snapshot, rewritten on every refresh |
+| Master | `Kelson_Creators_Licensing Master Sheet` | One row per lead — current state |
+| Responses | `Kelson_Creators_Licensing Response Sheet` | One row per inbound message ever detected |
+| Send Log | `Kelson_Creators_Licensing Custom Log Sheet` | One row per outbound send attempt ever made |
+| Error Log | `Kelson_Creators_Licensing Error Log` | One row per error, categorized (see Section 10) |
+| Dashboard | `Kelson_Creators_Licensing Dashboard` | Computed stats snapshot, rewritten on every refresh |
 
 Plus one **shared, non-per-campaign** tab: **`All Campaigns Dashboard`** —
-side-by-side comparison across every configured campaign, written when you
-run `dashboard --all` (the periodic scheduled run always does this).
+side-by-side comparison across every campaign, written by `dashboard --all`.
 
 ### Master Sheet — full column reference
 
@@ -358,7 +359,7 @@ run `dashboard --all` (the periodic scheduled run always does this).
 | `Status` | System | `Intro Sent`, `Stopped - Replied`, `Stopped - Bounced`, `Paused`, etc. |
 | `LastActionAt` | System | Timestamp of the most recent send/reply/bounce |
 | `Error` | System | Last error for this lead, if any |
-| `MessageID`, `ThreadReferences` | System | Email threading headers |
+| `MessageID`, `ThreadReferences` | System | Email threading headers — see Section 9 |
 | *(any extra columns you add)* | You | Available as custom template variables — see Section 6 |
 
 ### Response Sheet
@@ -368,12 +369,9 @@ run `dashboard --all` (the periodic scheduled run always does this).
 | `ResponseID`, `LeadID`, `Campaign` | Identifiers |
 | `ReceivedAt`, `From`, `Subject`, `Snippet` | From the inbound message |
 | `Classification` | `Genuine Reply` / `Auto-Reply` / `Out of Office` / `Bounce (Hard)` / `Bounce (Soft)` |
-| `MatchMethod` | `Header` (strong — matched via In-Reply-To/References) or `Email` (fallback) |
+| `MatchMethod` | `Header` (strong — see Section 9) or `Email` (weak, sender-only) |
 | `MessageID`, `InReplyTo` | Raw headers, for your own auditing |
-| `ActionTaken` | `Stopped Sequence` or `Logged Only` |
-
-Only `Genuine Reply` and `Bounce (Hard)` stop a lead's sequence — the rest
-are logged but don't interrupt anything.
+| `ActionTaken` | `Stopped Sequence` / `Logged Only` / `Logged Only (Unverified Match)` / `Logged Only (Predates Contact)` — see Section 9 |
 
 ### Custom Log Sheet (send history)
 
@@ -381,24 +379,24 @@ are logged but don't interrupt anything.
 |---|---|
 | `BatchID` | Groups every email from one `Send Batch` run |
 | `Timestamp`, `LeadID`, `Email`, `Campaign`, `Stage`, `Variant`, `SenderAccount` | What was sent, to whom, from which account |
-| `Status` | `sent` or `error` |
+| `Status` | `sent`, `error`, or `skipped` (sender-capacity deferred — see Section 11) |
 | `MessageID`, `Error` | Result details |
 
 ### Error Log
 
-See Section 9.
+See Section 10.
 
 ### Dashboard
 
-See Section 8. This tab is **fully rewritten** on every refresh (not
-appended to) — it's a snapshot of current state, not a history log.
+See Section 8. Fully rewritten on every refresh — a snapshot, not a
+history log.
 
 ---
 
 ## 8. Dashboards
 
 Each campaign's Dashboard tab is a 3-column `Section | Metric | Value`
-sheet, recomputed fresh every time. Sections:
+sheet, recomputed fresh every time:
 
 - **Overview** — Total Leads, Unique Leads Contacted, Total Emails Sent,
   Delivered (estimated), Bounced (Hard/Soft), Genuine Replies, Reply Rate,
@@ -407,11 +405,10 @@ sheet, recomputed fresh every time. Sections:
 - **Sender Performance** — sent / replies / reply rate, broken down by
   `SenderAccount`.
 - **Sender Usage Today** — whether `sender_rotation` is on, and each
-  account's send count today (shown as `used / cap` if
-  `per_account_daily_limit` is set, or just the count if not). This is
-  the at-a-glance view for "is any account close to its daily limit."
+  account's send count today (`used / cap` if `per_account_daily_limit`
+  is set).
 - **Variant Performance** — sent / replies / reply rate, broken down by
-  stage + variant (e.g. `intro-A`).
+  stage + variant.
 - **Errors (All Time)** — count of every error logged, by type.
 - **Recent Errors** — the last 10 error log entries.
 
@@ -419,49 +416,90 @@ Two things worth knowing about the numbers:
 
 - **"Delivered" is an estimate** (`Total Sent minus Hard Bounces`), not a
   real delivery receipt — SMTP doesn't provide confirmed-delivery data.
-  Labeled as an estimate rather than overclaiming precision.
-- **Variant reply attribution is approximate.** A reply is attributed to
-  whichever stage/variant was that lead's most recent send at the time
-  they replied (their `CurrentStage`), since there's no per-message reply
-  tracking at the individual-email level.
+- **Variant reply attribution is approximate** — attributed to whichever
+  stage/variant was that lead's most recent send at the time of a
+  *verified* (Header-matched) reply.
 
-### The combined view across campaigns
-
-Run `dashboard --all` (or wait for the 6-hourly scheduled run) to also
-write the shared **All Campaigns Dashboard** tab — one row per campaign,
-with the same core metrics side by side for comparison.
+Run `dashboard --all` to also write the shared **All Campaigns
+Dashboard** — one row per campaign, discovered from `templates/`
+subfolders (see Section 5), for comparison.
 
 ### About visual charts (roadmap, not built yet)
 
-The Dashboard tab is currently tabular (`Section | Metric | Value`), by
-design — it's rebuilt from scratch on every refresh, which keeps the
-numbers always-correct but means anything placed on top of it needs to
-tolerate that. Two honest options going forward:
-
-- **Build charts yourself, right now, with zero extra code** — since the
-  Dashboard tab already holds real numbers that refresh automatically,
-  you can select any range on it in Google Sheets and insert a native
-  chart (Insert → Chart) today. It'll keep showing current data as long
-  as the *rows you selected* keep meaning the same thing — which mostly
-  holds, but isn't guaranteed if e.g. a new sender account starts
-  appearing partway down the "Sender Usage Today" section and shifts
-  later rows down.
-- **Auto-generated charts via the Sheets API** — technically possible,
-  but a real scope of work, not a small addition: `gspread` has no
-  high-level chart support, so it means hand-building raw Sheets API v4
-  `AddChartRequest` calls, and making them resilient to a tab that gets
-  fully cleared and rewritten every refresh (chart objects reference
-  specific cell ranges, which is exactly what changes shape when the
-  underlying data does). This is worth doing properly rather than
-  bolting on quickly, so it's intentionally scoped as a separate next
-  update rather than attempted here.
+The Dashboard tab is tabular by design, rebuilt from scratch every
+refresh. You can already select any range on it and insert a native
+Google Sheets chart (Insert → Chart) today — it'll show current data as
+long as the rows you selected keep meaning the same thing. Fully
+auto-generating charts via the Sheets API is real, separate engineering
+work (no high-level chart support in `gspread`, and charts need to
+survive a tab that's fully cleared and rewritten every refresh) —
+intentionally scoped as a future update, not attempted here.
 
 ---
 
-## 9. Error monitoring
+## 9. Reply matching safety
 
-Every error anywhere in the system is classified into one of these
-categories and logged to that campaign's **Error Log** tab:
+This is the most important section if you're running more than one
+campaign, or reusing lead lists across campaigns.
+
+### The problem this section exists to prevent
+
+Email replies from the same address can arrive that have nothing to do
+with your current campaign — a lead's reply to an *old* campaign (or one
+you've since deleted), sitting in the same shared inbox, from an address
+that also happens to be a lead in your *new* campaign. Matching purely by
+"this sender emailed us" cannot tell those apart, and incorrectly
+stopping a live sequence — or reporting a false reply on your dashboard —
+is a real production risk, not a theoretical one.
+
+### How matching actually works
+
+Every inbound message is checked against two signals, in order:
+
+1. **Header match** — the message's `In-Reply-To` or `References`
+   contains a `Message-ID` this system genuinely sent, for a lead in
+   *this* campaign's own Master Sheet. This is provable: it means the
+   message is literally part of a thread this campaign started. **Only a
+   Header match can stop a sequence.**
+2. **Email match** — the sender's address matches a lead, but there's no
+   header link. This is real signal (logged, always visible), but is
+   **never enough on its own** to stop a sequence, mark a reply, or
+   affect the dashboard's reply count. It's a fallback for visibility,
+   not a trigger.
+
+For an Email-only match, one more check runs before deciding how to log
+it: if the message's `Date` is **before** the most recent stage this
+system actually sent to that lead, it's chronologically impossible for
+it to be a reply to this campaign's outreach — logged as `Logged Only
+(Predates Contact)`. Otherwise it's logged as `Logged Only (Unverified
+Match)`. Either way, **`ReplyStatus` and `Status` are left untouched** —
+the sequence keeps running.
+
+| Match | Classification | What happens |
+|---|---|---|
+| Header | Genuine Reply | **Stops the sequence** |
+| Header | Bounce (Hard) | **Stops the sequence** |
+| Header | Auto-Reply / OOO / Bounce (Soft) | Logged only, sequence continues |
+| Email | *(any)* | **Never stops anything** — logged as Unverified Match or Predates Contact |
+
+### If a lead was already incorrectly stopped by this before the fix
+
+This logic wasn't always this strict — earlier versions treated any
+sender-email match the same as a header match. If a lead's `Status` shows
+`Stopped - Replied` from before you had this fix, and you believe it was
+a false positive (check the `Responses` tab's `MatchMethod` column for
+that lead — `Email` with an unrelated `InReplyTo` is the signature),
+you'll need to manually clear `ReplyStatus`, `Status`, and `ReplyAt` on
+that row to let the sequence resume. This can't be done automatically —
+there's no way to distinguish "this was a false positive" from "this was
+correctly stopped" after the fact without a human looking at it.
+
+---
+
+## 10. Error monitoring
+
+Every error anywhere in the system is classified and logged to that
+campaign's **Error Log** tab:
 
 | ErrorType | When it fires |
 |---|---|
@@ -473,117 +511,68 @@ categories and logged to that campaign's **Error Log** tab:
 | `Missing Template Variable` | A `{{Variable}}` in a template matched no column (see Section 6) |
 | `Missing Sender Account` | A lead's `SenderAccount` (or the configured default) doesn't exist in `EMAIL_ACCOUNTS_JSON` |
 | `Reply Check Failure` | An IMAP problem during `Check Replies` that wasn't an authentication failure |
-| `Sender Capacity Reached` | Every account eligible for a lead (manual, rotated, or default) is already at its `per_account_daily_limit` for today — see Section 10 |
-
-Every entry includes a timestamp, the campaign, the lead (if applicable),
-the stage, the batch ID (if applicable), and a message with details.
+| `Sender Capacity Reached` | Every account eligible for a lead is already at its `per_account_daily_limit` for today — see Section 11 |
 
 **Two failure modes are flagged distinctly from ordinary errors, since
 neither means something actually broke:**
 
-- `sent_but_sheet_error` — the email genuinely sent, but the *sheet update
-  afterward* failed (e.g. a transient Sheets API error), so that lead's
-  `SentAt` never gets recorded — which risks a duplicate send next run.
-  Logged with an explicit "check manually" note.
-- `skipped` — the lead was eligible and included in the batch, but every
-  account it could use was already at capacity for the day. Nothing was
-  attempted, nothing failed; it's automatically retried on a later run.
+- `sent_but_sheet_error` — the email genuinely sent, but the sheet update
+  afterward failed, so that lead's `SentAt` never got recorded — risking
+  a duplicate send next run. Logged with an explicit "check manually" note.
+- `skipped` — the lead was eligible, but every account it could use was
+  already at capacity for the day. Nothing was attempted or failed; it's
+  retried automatically on a later run.
 
 Ordinary errors never interrupt a batch — one lead's failure is isolated
 and logged, and the batch continues to the rest.
 
 ---
 
-## 10. Multi-account sending
-
-### Account resolution order
+## 11. Multi-account sending
 
 Every lead's `SenderAccount` column can name any key from
 `EMAIL_ACCOUNTS_JSON`. Resolution order:
 
-1. **The lead's own `SenderAccount` cell, if set — always wins.** This is
-   a hard override: if you've manually pinned a lead to an account, the
-   system uses exactly that account, never a different one, even if
-   automatic rotation is turned on.
-2. **Automatic rotation**, if `sending.sender_rotation: true` — see below.
-3. **The campaign's `default_sender_account`** (optional), then **the
-   global `email_accounts.default_account`** — the original single-default
-   behavior, used when rotation is off and the lead has no override.
-
-Whichever account is used gets **written back into the lead's
-`SenderAccount` cell** after the first successful send, so every later
-stage reuses it — a consistent sender identity across the whole
-conversation with that lead, and from then on that lead's cell counts as
-a manual override for all future stages too.
-
-### Automatic sender rotation
-
-Set `sending.sender_rotation: true` on a campaign, and any lead whose
-`SenderAccount` cell is **blank** gets auto-assigned the account that's
-been used **least so far today**, instead of always the single default.
-This is what makes using several accounts practical — you stop having to
-hand-assign an account to every lead yourself; leave `SenderAccount`
-blank and the system spreads the load for you.
+1. **The lead's own `SenderAccount` cell, if set — always wins.** Even if
+   `sender_rotation` is on. If that account is at its daily cap, the lead
+   is **skipped**, never silently rerouted to a different account.
+2. **Automatic rotation**, if `sending.sender_rotation: true` — picks
+   whichever account has been used least today.
+3. **The campaign's `default_sender_account`**, then the global
+   `email_accounts.default_account`.
 
 ```yaml
 sending:
   daily_limit: 100
   sender_rotation: true
   per_account_daily_limit: 5
-  # rotation_accounts: ["sales1", "sales2"]   # optional — omit to use every
-                                                # account in EMAIL_ACCOUNTS_JSON
+  # rotation_accounts: ["sales1", "sales2"]   # omit to use every account
 ```
 
 > All three of `sender_rotation`, `per_account_daily_limit`, and
-> `daily_limit` can also be set (or overridden) directly as **`Send
-> Batch` workflow inputs** for a single run, without editing this file —
-> see Section 4.
+> `daily_limit` can also be set directly as **`Send Batch` workflow
+> inputs** for a single run, without editing any config — see Section 4.
 
-- **`sender_rotation`** (`true`/`false`, default `false`) — turns rotation
-  on for blank `SenderAccount` cells.
-- **`per_account_daily_limit`** (optional integer) — caps how many emails
-  a single account can send per day. **Applies uniformly** — a manually
-  pinned account, an account picked by rotation, and the single default
-  are all capped the same way. If a lead's only eligible account has
-  already hit this cap today, that lead is marked **`skipped`** (not
-  `error` — nothing went wrong, it's just deferred) and picked up
-  automatically on a later run once capacity frees up.
-- **`rotation_accounts`** (optional list) — restricts rotation to a subset
-  of `EMAIL_ACCOUNTS_JSON`, e.g. if some accounts are reserved for a
-  different campaign. Omit it to rotate across every configured account.
+Whichever account is used gets **written back into the lead's
+`SenderAccount` cell** after the first successful send, so every later
+stage reuses it — a consistent sender identity across the whole
+conversation with that lead.
 
-Rotation counts each account's usage from that campaign's Custom Log
-Sheet (today's `sent` rows), plus everything assigned so far within the
-*current* batch — so a single large batch stays balanced even before any
-of it hits the sheet.
-
-### Where usage shows up
-
-The `Send Batch` output reports four outcomes now: `sent`,
-`sent_but_sheet_error` (see Section 9), **`skipped`** (sender-capacity
-deferred), and `error`. Every account's usage — today's count, and
-against the cap if one's set — is visible at a glance in each campaign's
-**Dashboard → Sender Usage Today** section (see Section 8).
-
-### Checking replies across accounts
-
-`Check Replies` checks **every** configured account's inbox on every run,
-regardless of rotation settings. One account's IMAP problem doesn't block
-the others (logged to Error Log, checking continues).
+`Check Replies` checks **every** configured account's inbox on every run.
+One account's IMAP problem doesn't block the others.
 
 > Gmail/Workspace sending limits apply per account regardless of how many
 > you rotate through — multiple accounts are for legitimate organizational
-> reasons, not for evading anti-abuse limits. `per_account_daily_limit` is
-> a tool for staying comfortably under those limits, not around them.
+> reasons, not for evading anti-abuse limits.
 
 ---
 
-## 11. Safety behavior
+## 12. Safety behavior
 
 - **Duplicate protection** — a lead with a timestamp already in a stage's
   `SentAt` column can never be sent that stage again.
-- **Reply/bounce = automatic stop** — enforced at the eligibility check
-  itself, not just hidden in a UI.
+- **Reply/bounce = automatic stop, only when verified** — see Section 9.
+  Enforced at the eligibility check itself, not just hidden in a UI.
 - **Per-lead error isolation** — one lead failing never aborts the batch;
   that lead's `SentAt` is never written on failure, so it's retry-eligible.
 - **Daily send limit** — `Send Batch` automatically caps itself near
@@ -592,33 +581,40 @@ the others (logged to Error Log, checking continues).
   `SEND` exactly.
 - **No template execution** — variables are plain string substitution,
   never evaluated as code.
-- **Custom-column headers are relaxed, not silently accepted** — Master/
-  Responses/SendLog/Error Log tabs only require your header row to
-  *start with* the system's required columns, in order. Extra trailing
-  columns are fine (that's how custom variables work); missing or
-  reordered required columns raise a clear error rather than silently
-  writing into the wrong place.
+- **Templates are validated, not inferred** — see Section 5.
+- **Custom-column headers are relaxed, not silently accepted** — sheet
+  tabs only require your header row to *start with* the system's
+  required columns, in order. Extra trailing columns are fine; missing or
+  reordered required columns raise a clear error.
 
 ---
 
-## 12. Project structure
+## 13. Project structure
 
 ```
-outreach.py                 Everything: CLI, Sheets, SMTP send, IMAP read,
-                             templating, eligibility, classification,
-                             dashboards, error monitoring
-config/campaigns.yaml       shared_sheet_id + email_accounts + campaigns
-templates/sample_campaign/  20 template files (5 stages x 4 variants)
-tests/test_outreach.py      125 unit tests
+outreach.py                  Everything: CLI, Sheets, SMTP send, IMAP read,
+                              templating, eligibility, reply-matching
+                              safety, dashboards, error monitoring
+config/
+  settings.yaml               shared_sheet_id + email_accounts +
+                               default_campaign_settings — the ONE shared
+                               config file
+  campaigns/                  optional per-campaign override files, named
+                               <campaign_name>.yaml — most campaigns need
+                               none at all
+templates/
+  Kelson_Creators_Licensing/  20 template files (5 stages x 4 variants) —
+                               this folder's EXISTENCE is what makes the
+                               campaign name valid, nothing else
+tests/test_outreach.py        142 unit tests
 .github/workflows/
-  preview_batch.yml         Manual — shows what would be sent
-  send_batch.yml            Manual, requires typing SEND — sends, then
-                             refreshes that campaign's dashboard
-  check_replies.yml         Automatic every 30 min, or manual — checks
-                             replies, then refreshes the dashboard
-  dashboard.yml             Manual (one campaign or --all), plus automatic
-                             every 6 hours as a backstop
-  ci.yml                    Runs the test suite on every push
+  preview_batch.yml           Manual — shows what would be sent
+  send_batch.yml               Manual, requires typing SEND — sends, then
+                               refreshes that campaign's dashboard
+  check_replies.yml            Automatic every 30 min, or manual
+  dashboard.yml                 Manual (one campaign or --all), plus
+                               automatic every 6 hours
+  ci.yml                       Runs the test suite on every push
 requirements.txt
 ```
 
@@ -628,7 +624,7 @@ dependency. Only Google Sheets access needs a package (`gspread` +
 
 ---
 
-## 13. Running the tests yourself (optional)
+## 14. Running the tests yourself (optional)
 
 ```bash
 pip install -r requirements.txt
