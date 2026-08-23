@@ -252,39 +252,59 @@ def test_templates_contain_no_diaz_or_event_branding():
 
 
 # =============================================================================
-# config loader — shared sheet + auto-derived per-campaign tab names
+# config loader — template-folder discovery, settings.yaml, optional overrides
 # =============================================================================
 
-def _write_config(tmp_path, extra_campaign_yaml="", shared_sheet_id="real_sheet_id_123"):
-    config_content = f"""
+def _make_config_fixture(tmp_path, shared_sheet_id="real_sheet_id_123", extra_settings_yaml="",
+                          campaign_name="test_campaign", create_templates=True, template_variants=("A",),
+                          override_yaml=None):
+    """Builds a full settings.yaml + templates/<campaign>/ + optional
+    config/campaigns/<campaign>.yaml fixture under tmp_path, and returns
+    the (settings_path, campaigns_dir, templates_root) tuple to pass into
+    get_campaign()."""
+    settings_path = tmp_path / "settings.yaml"
+    campaigns_dir = tmp_path / "campaigns"
+    templates_root = tmp_path / "templates"
+    campaigns_dir.mkdir(exist_ok=True)
+    templates_root.mkdir(exist_ok=True)
+
+    settings_content = f"""
 shared_sheet_id: "{shared_sheet_id}"
 email_accounts:
   default_account: "sales1"
-campaigns:
-  test_campaign:
-    templates_dir: "templates/x"
-    variants: ["A"]
-    stages:
-      - name: intro
-        template_prefix: intro
-        wait_days_after_previous: 0
-    sending:
-      timezone: "Asia/Kolkata"
-      window_start: "09:00"
-      window_end: "17:00"
-      delay_min_minutes: 1
-      delay_max_minutes: 2
-      daily_limit: 10
-{extra_campaign_yaml}
+default_campaign_settings:
+  variants: {list(template_variants)!r}
+  stages:
+    - name: intro
+      template_prefix: intro
+      wait_days_after_previous: 0
+  sending:
+    timezone: "Asia/Kolkata"
+    window_start: "09:00"
+    window_end: "17:00"
+    delay_min_minutes: 1
+    delay_max_minutes: 2
+    daily_limit: 10
+{extra_settings_yaml}
 """
-    config_file = tmp_path / "campaigns.yaml"
-    config_file.write_text(config_content)
-    return str(config_file)
+    settings_path.write_text(settings_content)
+
+    if create_templates:
+        campaign_templates_dir = templates_root / campaign_name
+        campaign_templates_dir.mkdir(exist_ok=True)
+        for variant in template_variants:
+            (campaign_templates_dir / f"intro_{variant}.txt").write_text("Subject: Hi\n\nBody")
+
+    if override_yaml is not None:
+        (campaigns_dir / f"{campaign_name}.yaml").write_text(override_yaml)
+
+    return str(settings_path), str(campaigns_dir), str(templates_root)
 
 
 def test_get_campaign_auto_derives_tab_names_from_campaign_key(tmp_path):
-    path = _write_config(tmp_path)
-    cfg = outreach.get_campaign("test_campaign", path=path)
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
     assert cfg["sheet_id"] == "real_sheet_id_123"
     assert cfg["master_tab"] == "test_campaign Master Sheet"
     assert cfg["responses_tab"] == "test_campaign Response Sheet"
@@ -295,27 +315,128 @@ def test_get_campaign_auto_derives_tab_names_from_campaign_key(tmp_path):
 
 
 def test_get_campaign_rejects_missing_shared_sheet_id(tmp_path):
-    path = _write_config(tmp_path, shared_sheet_id="")
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, shared_sheet_id="")
     try:
-        outreach.get_campaign("test_campaign", path=path)
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
         assert False, "should have raised ConfigError"
     except outreach.ConfigError:
         pass
 
 
+def test_get_campaign_missing_campaign_raises_and_lists_available(tmp_path):
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
+    try:
+        outreach.get_campaign("does_not_exist", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError as exc:
+        assert "does_not_exist" in str(exc)
+        assert "test_campaign" in str(exc)  # lists what IS available
+
+
+def test_get_campaign_works_with_zero_override_files(tmp_path):
+    # The core promise: a campaign with templates but NO override file at
+    # all must just work, using pure defaults.
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["sending"]["daily_limit"] == 10
+    assert cfg["variants"] == ["A"]
+
+
+def test_get_campaign_override_file_changes_only_what_it_specifies(tmp_path):
+    override = """
+sending:
+  daily_limit: 999
+"""
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["sending"]["daily_limit"] == 999          # overridden
+    assert cfg["sending"]["window_start"] == "09:00"      # still inherited
+    assert cfg["variants"] == ["A"]                       # still inherited
+
+
 def test_get_campaign_explicit_tab_override_wins_over_auto_derivation(tmp_path):
-    path = _write_config(tmp_path, extra_campaign_yaml="    master_tab: \"CustomMaster\"")
-    cfg = outreach.get_campaign("test_campaign", path=path)
+    override = 'master_tab: "CustomMaster"\n'
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
     assert cfg["master_tab"] == "CustomMaster"
     assert cfg["responses_tab"] == "test_campaign Response Sheet"  # still auto-derived
 
 
-def test_get_campaign_missing_campaign_raises():
+# =============================================================================
+# Template-folder discovery IS campaign existence (the actual safety gate)
+# =============================================================================
+
+def test_get_campaign_raises_clearly_when_templates_folder_missing(tmp_path):
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, create_templates=False)
     try:
-        outreach.get_campaign("does_not_exist", path="config/campaigns.yaml")
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
         assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
+    except outreach.ConfigError as exc:
+        assert "No templates found" in str(exc)
+        assert "test_campaign" in str(exc)
+
+
+def test_get_campaign_raises_when_a_required_template_file_is_missing(tmp_path):
+    # 2 variants configured, but only create the template file for one —
+    # this must fail loudly rather than silently treating the campaign as
+    # single-variant.
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(
+        tmp_path, template_variants=("A", "B"))
+    # Delete the B file that _make_config_fixture created.
+    os.remove(os.path.join(templates_root, "test_campaign", "intro_B.txt"))
+    try:
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError as exc:
+        assert "intro_B.txt" in str(exc)
+
+
+def test_discover_campaign_names_lists_template_subfolders(tmp_path):
+    templates_root = tmp_path / "templates"
+    templates_root.mkdir()
+    (templates_root / "CampaignA").mkdir()
+    (templates_root / "CampaignB").mkdir()
+    (templates_root / ".hidden").mkdir()  # must be excluded
+    (templates_root / "not_a_dir.txt").write_text("x")  # must be excluded — not a directory
+    names = outreach.discover_campaign_names(str(templates_root))
+    assert names == ["CampaignA", "CampaignB"]
+
+
+def test_discover_campaign_names_empty_when_no_templates_root():
+    names = outreach.discover_campaign_names("/tmp/definitely_does_not_exist_xyz")
+    assert names == []
+
+
+# =============================================================================
+# _deep_merge
+# =============================================================================
+
+def test_deep_merge_overrides_only_specified_keys():
+    base = {"a": 1, "sending": {"daily_limit": 100, "timezone": "UTC"}}
+    override = {"sending": {"daily_limit": 5}}
+    result = outreach._deep_merge(base, override)
+    assert result == {"a": 1, "sending": {"daily_limit": 5, "timezone": "UTC"}}
+
+
+def test_deep_merge_replaces_lists_wholesale_not_elementwise():
+    base = {"stages": [{"name": "intro"}, {"name": "followup1"}]}
+    override = {"stages": [{"name": "intro"}]}
+    result = outreach._deep_merge(base, override)
+    assert result["stages"] == [{"name": "intro"}]  # fully replaced, not merged
+
+
+def test_deep_merge_does_not_mutate_base():
+    base = {"sending": {"daily_limit": 100}}
+    override = {"sending": {"daily_limit": 5}}
+    outreach._deep_merge(base, override)
+    assert base["sending"]["daily_limit"] == 100  # untouched
 
 
 # =============================================================================
@@ -662,7 +783,7 @@ def test_check_replies_falls_back_to_email_when_no_header_match(monkeypatch):
         return [{
             "message_id": "<reply2@mail.gmail.com>", "in_reply_to": "", "references": "",
             "subject": "Re: Hello", "from": "john@abc.com",
-            "headers": {}, "body": "sounds good", "snippet": "sounds good",
+            "headers": {}, "body": "sounds good", "snippet": "sounds good", "date": None,
         }]
 
     monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
@@ -670,6 +791,14 @@ def test_check_replies_falls_back_to_email_when_no_header_match(monkeypatch):
     actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
     assert len(actions) == 1
     assert actions[0]["match_method"] == "Email"
+    # An Email-only match must NEVER stop a sequence, even when the content
+    # would otherwise classify as a genuine reply — this is the exact
+    # production bug this suite guards against (see the tests below).
+    assert actions[0]["classification"] == outreach.CLASSIFICATION_GENUINE
+    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNVERIFIED
+    updated_lead = fake_sheets._leads[0]
+    assert updated_lead["ReplyStatus"] != "Replied"
+    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
 
 
 def test_check_replies_genuine_reply_stops_sequence(monkeypatch):
@@ -1325,92 +1454,37 @@ def test_classify_sender_capacity_reached_error():
 # =============================================================================
 
 def test_validate_campaign_rejects_non_positive_per_account_daily_limit(tmp_path):
-    config_content = """
-shared_sheet_id: "real_sheet_id_123"
-email_accounts:
-  default_account: "sales1"
-campaigns:
-  test_campaign:
-    templates_dir: "templates/x"
-    variants: ["A"]
-    stages:
-      - name: intro
-        template_prefix: intro
-        wait_days_after_previous: 0
-    sending:
-      timezone: "Asia/Kolkata"
-      window_start: "09:00"
-      window_end: "17:00"
-      delay_min_minutes: 1
-      delay_max_minutes: 2
-      daily_limit: 10
-      per_account_daily_limit: 0
-"""
-    config_file = tmp_path / "campaigns2.yaml"
-    config_file.write_text(config_content)
+    override = "sending:\n  per_account_daily_limit: 0\n"
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
     try:
-        outreach.get_campaign("test_campaign", path=str(config_file))
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
         assert False, "should have raised ConfigError"
     except outreach.ConfigError:
         pass
 
 
 def test_validate_campaign_accepts_valid_rotation_config(tmp_path):
-    config_content = """
-shared_sheet_id: "real_sheet_id_123"
-email_accounts:
-  default_account: "sales1"
-campaigns:
-  test_campaign:
-    templates_dir: "templates/x"
-    variants: ["A"]
-    stages:
-      - name: intro
-        template_prefix: intro
-        wait_days_after_previous: 0
-    sending:
-      timezone: "Asia/Kolkata"
-      window_start: "09:00"
-      window_end: "17:00"
-      delay_min_minutes: 1
-      delay_max_minutes: 2
-      daily_limit: 10
-      per_account_daily_limit: 5
-      sender_rotation: true
-      rotation_accounts: ["sales1", "sales2"]
-"""
-    config_file = tmp_path / "campaigns3.yaml"
-    config_file.write_text(config_content)
-    cfg = outreach.get_campaign("test_campaign", path=str(config_file))
+    override = (
+        "sending:\n"
+        "  per_account_daily_limit: 5\n"
+        "  sender_rotation: true\n"
+        "  rotation_accounts: [\"sales1\", \"sales2\"]\n"
+    )
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
     assert cfg["sending"]["per_account_daily_limit"] == 5
     assert cfg["sending"]["sender_rotation"] is True
     assert cfg["sending"]["rotation_accounts"] == ["sales1", "sales2"]
 
 
 def test_validate_campaign_rejects_non_bool_sender_rotation(tmp_path):
-    config_content = """
-shared_sheet_id: "real_sheet_id_123"
-campaigns:
-  test_campaign:
-    templates_dir: "templates/x"
-    variants: ["A"]
-    stages:
-      - name: intro
-        template_prefix: intro
-        wait_days_after_previous: 0
-    sending:
-      timezone: "Asia/Kolkata"
-      window_start: "09:00"
-      window_end: "17:00"
-      delay_min_minutes: 1
-      delay_max_minutes: 2
-      daily_limit: 10
-      sender_rotation: "yes please"
-"""
-    config_file = tmp_path / "campaigns4.yaml"
-    config_file.write_text(config_content)
+    override = 'sending:\n  sender_rotation: "yes please"\n'
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
     try:
-        outreach.get_campaign("test_campaign", path=str(config_file))
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
         assert False, "should have raised ConfigError"
     except outreach.ConfigError:
         pass
@@ -1622,3 +1696,184 @@ def test_apply_sending_overrides_never_mutates_yaml_source_dict():
     outreach.apply_sending_overrides(campaign_cfg, daily_limit=5)
     assert yaml_loaded_sending["daily_limit"] == 100  # untouched
     assert campaign_cfg["sending"]["daily_limit"] == 5  # only the copy changed
+
+
+# =============================================================================
+# check_replies — reply-matching safety fix (production incident regression)
+#
+# Reported scenario: a lead's email address was reused across campaigns
+# (an old/deleted campaign, then a fresh "Kelson_Creators_Licensing" style
+# campaign with the same lead list). An old reply — genuinely In-Reply-To a
+# DIFFERENT, unrelated Message-ID — was incorrectly matched to the new
+# campaign's lead via sender-email fallback alone, and incorrectly stopped
+# the new sequence. These tests reproduce that exact shape and assert it's
+# now impossible.
+# =============================================================================
+
+def _most_recent_send_at_lead(**overrides):
+    lead = make_lead(**overrides)
+    return lead
+
+
+def test_most_recent_send_at_picks_latest_across_stages():
+    old = "2026-08-01 10:00:00"
+    newer = "2026-08-10 10:00:00"
+    lead = _most_recent_send_at_lead(IntroSentAt=old, FollowUp1SentAt=newer, FollowUp2SentAt="")
+    result = outreach._most_recent_send_at(lead)
+    assert result == outreach._parse_dt(newer)
+
+
+def test_most_recent_send_at_none_when_nothing_sent():
+    lead = _most_recent_send_at_lead()
+    assert outreach._most_recent_send_at(lead) is None
+
+
+def test_check_replies_old_campaign_reply_never_stops_new_campaign_sequence(monkeypatch):
+    # This is the reported bug, reproduced directly: the lead's current
+    # (new campaign) intro was sent recently; the inbound message is an old
+    # reply whose In-Reply-To points at a DIFFERENT, unrelated Message-ID
+    # (simulating a deleted/previous campaign's thread) and whose Date
+    # predates the new campaign's intro entirely.
+    new_intro_sent_at = datetime.now().strftime(outreach.DATETIME_FMT)
+    old_message_date = datetime.now() - timedelta(days=10)  # before the new intro was ever sent
+
+    leads = [make_lead(_row=2, LeadID="L3", Email="creator@example.com",
+                        MessageID="<new_campaign_intro@mail.gmail.com>",  # current campaign's own message id
+                        IntroSentAt=new_intro_sent_at)]
+    fake_sheets = FakeSheets(leads)
+
+    def fake_imap_fetch_recent(address, app_password, since_dt):
+        return [{
+            "message_id": "<old_reply@mail.gmail.com>",
+            "in_reply_to": "<old_unrelated_campaign_intro@mail.gmail.com>",  # NOT the current campaign's id
+            "references": "<old_unrelated_campaign_intro@mail.gmail.com>",
+            "subject": "Re: old campaign", "from": "creator@example.com",  # same lead address, reused
+            "headers": {}, "body": "sounds good, let's talk", "snippet": "sounds good, let's talk",
+            "date": old_message_date,
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+
+    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
+                                      campaign_name="Kelson_Creators_Licensing")
+
+    assert len(actions) == 1
+    assert actions[0]["match_method"] == "Email"  # header match correctly fails — different message id
+    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNRELATED  # date predates the new intro
+
+    updated_lead = fake_sheets._leads[0]
+    # The critical assertion: the new campaign's sequence must NOT be stopped.
+    assert updated_lead["ReplyStatus"] != "Replied"
+    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
+    assert updated_lead.get("ReplyAt", "") == ""
+
+
+def test_check_replies_email_match_after_contact_logged_unverified_not_stopped(monkeypatch):
+    # Sender-only match where the message date IS plausible (after the
+    # lead's most recent send) — still must not auto-stop, just logged
+    # as unverified for human review.
+    intro_sent_at = (datetime.now() - timedelta(days=2)).strftime(outreach.DATETIME_FMT)
+    plausible_date = datetime.now() - timedelta(hours=1)  # after intro was sent
+
+    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com",
+                        MessageID="<intro@mail.gmail.com>", IntroSentAt=intro_sent_at)]
+    fake_sheets = FakeSheets(leads)
+
+    def fake_imap_fetch_recent(address, app_password, since_dt):
+        return [{
+            "message_id": "<new_thread_reply@mail.gmail.com>", "in_reply_to": "", "references": "",
+            "subject": "New conversation", "from": "creator@example.com",
+            "headers": {}, "body": "hey, reaching out separately", "snippet": "hey, reaching out separately",
+            "date": plausible_date,
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+
+    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
+    assert actions[0]["match_method"] == "Email"
+    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNVERIFIED
+
+    updated_lead = fake_sheets._leads[0]
+    assert updated_lead["ReplyStatus"] != "Replied"
+    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
+    # Still visible for a human to notice, even though it didn't auto-stop:
+    assert updated_lead["LastInboundClassification"] == outreach.CLASSIFICATION_GENUINE
+
+
+def test_check_replies_header_match_genuine_reply_still_stops_sequence_after_fix(monkeypatch):
+    # Regression guard: the FIX must not have broken the legitimate,
+    # trusted path — a real reply to the current campaign's own thread
+    # must still stop the sequence exactly as before.
+    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com",
+                        MessageID="<current_campaign_intro@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+
+    def fake_imap_fetch_recent(address, app_password, since_dt):
+        return [{
+            "message_id": "<real_reply@mail.gmail.com>",
+            "in_reply_to": "<current_campaign_intro@mail.gmail.com>",  # matches THIS lead's tracked id
+            "references": "<current_campaign_intro@mail.gmail.com>",
+            "subject": "Re: intro", "from": "creator@example.com",
+            "headers": {}, "body": "yes, interested", "snippet": "yes, interested",
+            "date": datetime.now(),
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+
+    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
+    assert actions[0]["match_method"] == "Header"
+    assert actions[0]["action"] == outreach.ACTION_STOPPED
+
+    updated_lead = fake_sheets._leads[0]
+    assert updated_lead["ReplyStatus"] == "Replied"
+    assert updated_lead["Status"] == outreach.STATUS_STOPPED_REPLIED
+
+
+def test_check_replies_email_match_hard_bounce_never_stops_sequence_either(monkeypatch):
+    # The uniform rule applies regardless of classification: sender-only
+    # match never stops the sequence, even if content looks like a bounce.
+    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com", MessageID="")]
+    fake_sheets = FakeSheets(leads)
+
+    def fake_imap_fetch_recent(address, app_password, since_dt):
+        return [{
+            "message_id": "<weird@mail.gmail.com>", "in_reply_to": "", "references": "",
+            "subject": "undeliverable", "from": "creator@example.com",  # unusual, but same lead address
+            "headers": {}, "body": "this address does not exist", "snippet": "this address does not exist",
+            "date": datetime.now(),
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+
+    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
+    assert actions[0]["match_method"] == "Email"
+    assert actions[0]["action"] != outreach.ACTION_STOPPED
+
+    updated_lead = fake_sheets._leads[0]
+    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_BOUNCED
+
+
+# =============================================================================
+# _message_to_dict — parsed date field
+# =============================================================================
+
+def test_message_to_dict_parses_date_header():
+    from email.utils import formatdate
+    msg = MIMEText("body")
+    msg["Subject"] = "has a date"
+    msg["From"] = "a@b.com"
+    msg["Message-ID"] = "<x@mail.gmail.com>"
+    msg["Date"] = formatdate(localtime=True)
+    parsed = outreach._parse_email_message(msg.as_bytes())
+    assert parsed["date"] is not None
+    assert isinstance(parsed["date"], datetime)
+
+
+def test_message_to_dict_handles_missing_date_header():
+    from email.mime.text import MIMEText
+    msg = MIMEText("body")
+    msg["Subject"] = "no date header"
+    msg["From"] = "a@b.com"
+    msg["Message-ID"] = "<x@mail.gmail.com>"
+    parsed = outreach._parse_email_message(msg.as_bytes())
+    assert parsed["date"] is None
