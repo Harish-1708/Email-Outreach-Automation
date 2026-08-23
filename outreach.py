@@ -90,7 +90,9 @@ RESPONSES_COLUMNS = [
     "MatchMethod",
     "MessageID",
     "InReplyTo",
-    "ActionTaken",
+    "ActionTaken",       # Stopped Sequence | Logged Only |
+                         # Logged Only (Unverified Match) | Logged Only (Predates Contact)
+                         # — only a Header-matched message can produce "Stopped Sequence"
 ]
 
 SEND_LOG_COLUMNS = [
@@ -185,36 +187,84 @@ class SenderCapacityReachedError(ValueError):
 
 
 # =============================================================================
-# SECTION 2: Config loading (config/campaigns.yaml)
+# SECTION 2: Config loading — template-folder discovery, no central list
 #
-# One shared Google Sheet across all campaigns. Each campaign gets its own
-# 5 tabs, auto-named and auto-CREATED the first time that campaign runs.
+# A campaign "exists" the moment templates/<name>/ exists — nothing needs
+# to be registered anywhere just to make a campaign name recognized. Global
+# settings (shared sheet, default account, and the DEFAULT campaign
+# settings every campaign inherits) live in config/settings.yaml. A
+# campaign only needs its own config/campaigns/<name>.yaml if it wants to
+# override something from the defaults — most campaigns need nothing there
+# at all.
 # =============================================================================
 
 class ConfigError(Exception):
     pass
 
 
-def load_config(path: str = "config/campaigns.yaml") -> dict:
+def load_settings(path: str = "config/settings.yaml") -> dict:
     if not os.path.exists(path):
-        raise ConfigError(f"Config file not found: {path}")
+        raise ConfigError(f"Settings file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    if "campaigns" not in data or not data["campaigns"]:
-        raise ConfigError("No 'campaigns' key found in config file.")
+    if "shared_sheet_id" not in data:
+        raise ConfigError(f"{path} is missing 'shared_sheet_id'.")
+    if "default_campaign_settings" not in data:
+        raise ConfigError(f"{path} is missing 'default_campaign_settings'.")
     return data
 
 
-def get_campaign(campaign_name: str, path: str = "config/campaigns.yaml") -> dict:
-    data = load_config(path)
-    campaigns = data["campaigns"]
-    if campaign_name not in campaigns:
-        available = ", ".join(campaigns.keys())
-        raise ConfigError(f"Campaign '{campaign_name}' not found. Available: {available}")
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merges override into a COPY of base. Nested dicts merge
+    key by key (so e.g. an override can set just sending.daily_limit
+    without redefining the whole sending block); anything else — including
+    lists like stages/variants — is replaced wholesale by the override,
+    since merging a list element-by-element isn't meaningful here."""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
-    cfg = dict(campaigns[campaign_name])  # shallow copy — never mutate the shared dict
-    shared_sheet_id = data.get("shared_sheet_id", "")
 
+def discover_campaign_names(templates_root: str = "templates") -> List[str]:
+    """Every campaign that currently exists, full stop — determined purely
+    by having a subfolder under templates/. This is what dashboard --all
+    iterates over; there is no other list of "configured campaigns"."""
+    if not os.path.isdir(templates_root):
+        return []
+    return sorted(
+        name for name in os.listdir(templates_root)
+        if os.path.isdir(os.path.join(templates_root, name)) and not name.startswith(".")
+    )
+
+
+def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml",
+                  campaigns_dir: str = "config/campaigns", templates_root: str = "templates") -> dict:
+    settings = load_settings(settings_path)
+    shared_sheet_id = settings.get("shared_sheet_id", "")
+
+    # The actual safety gate: no templates folder, no campaign — regardless
+    # of what name was typed into a workflow input.
+    templates_dir = os.path.join(templates_root, campaign_name)
+    if not os.path.isdir(templates_dir):
+        raise ConfigError(
+            f"No templates found for campaign '{campaign_name}' — expected a folder at "
+            f"'{templates_dir}'. Create it with your template files before running this campaign. "
+            f"Currently available campaigns: {', '.join(discover_campaign_names(templates_root)) or '(none)'}"
+        )
+
+    cfg = dict(settings.get("default_campaign_settings", {}))
+
+    override_path = os.path.join(campaigns_dir, f"{campaign_name}.yaml")
+    if os.path.exists(override_path):
+        with open(override_path, "r", encoding="utf-8") as f:
+            override = yaml.safe_load(f) or {}
+        cfg = _deep_merge(cfg, override)
+
+    cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
     cfg["sheet_id"] = cfg.get("sheet_id") or shared_sheet_id
     cfg["master_tab"] = cfg.get("master_tab") or f"{campaign_name} Master Sheet"
     cfg["responses_tab"] = cfg.get("responses_tab") or f"{campaign_name} Response Sheet"
@@ -222,9 +272,10 @@ def get_campaign(campaign_name: str, path: str = "config/campaigns.yaml") -> dic
     cfg["error_log_tab"] = cfg.get("error_log_tab") or f"{campaign_name} Error Log"
     cfg["dashboard_tab"] = cfg.get("dashboard_tab") or f"{campaign_name} Dashboard"
     cfg["_campaign_name"] = campaign_name
-    cfg["_global_default_account"] = (data.get("email_accounts") or {}).get("default_account", "")
+    cfg["_global_default_account"] = (settings.get("email_accounts") or {}).get("default_account", "")
 
     _validate_campaign(campaign_name, cfg)
+    _validate_templates_exist(campaign_name, cfg)
     return cfg
 
 
@@ -236,8 +287,8 @@ def _validate_campaign(name: str, cfg: dict) -> None:
 
     if not cfg.get("sheet_id") or str(cfg["sheet_id"]).startswith("PUT_YOUR"):
         raise ConfigError(
-            f"Campaign '{name}': no sheet_id resolved. Set 'shared_sheet_id' at the "
-            "top of config/campaigns.yaml (or 'sheet_id' on this specific campaign)."
+            f"Campaign '{name}': no sheet_id resolved. Set 'shared_sheet_id' in "
+            "config/settings.yaml (or 'sheet_id' in this campaign's override file)."
         )
     if len(cfg["stages"]) == 0:
         raise ConfigError(f"Campaign '{name}' has no stages defined.")
@@ -269,6 +320,26 @@ def _validate_campaign(name: str, cfg: dict) -> None:
                 f"Campaign '{name}': sending.rotation_accounts must be a non-empty list of account "
                 "names, or omitted entirely to rotate across all EMAIL_ACCOUNTS_JSON accounts."
             )
+
+
+def _validate_templates_exist(name: str, cfg: dict) -> None:
+    """Deliberately does NOT infer stages/variants from whatever template
+    files happen to exist — that would let a silently-missing file quietly
+    shrink a campaign's sequence. Instead: the configured stages/variants
+    are the source of truth, and every file they imply must actually be
+    present, or this fails loudly before any send is attempted."""
+    missing = []
+    for stage in cfg["stages"]:
+        for variant in cfg["variants"]:
+            path = os.path.join(cfg["templates_dir"], f"{stage['template_prefix']}_{variant}.txt")
+            if not os.path.exists(path):
+                missing.append(path)
+    if missing:
+        listing = "\n".join(f"  - {p}" for p in missing)
+        raise ConfigError(
+            f"Campaign '{name}' is missing {len(missing)} template file(s):\n{listing}\n"
+            "Add these files, or adjust this campaign's stages/variants."
+        )
 
 
 def _stage_index(stages: List[Dict], stage_name: str) -> int:
@@ -828,10 +899,21 @@ def _message_to_dict(msg) -> Dict:
     references = (msg.get("References", "") or "").strip()
     body = _extract_plain_text_body(msg)
     headers = {k.lower(): v for k, v in msg.items()}
+
+    parsed_date = None
+    date_header = headers.get("date", "")
+    if date_header:
+        try:
+            parsed_date = parsedate_to_datetime(date_header)
+            if parsed_date.tzinfo is not None:
+                parsed_date = parsed_date.replace(tzinfo=None)
+        except (TypeError, ValueError):
+            parsed_date = None
+
     return {
         "message_id": message_id, "in_reply_to": in_reply_to, "references": references,
         "subject": subject, "from": from_, "headers": headers, "body": body,
-        "snippet": body[:200],
+        "snippet": body[:200], "date": parsed_date,
     }
 
 
@@ -858,15 +940,7 @@ def imap_fetch_recent(address: str, app_password: str, since_dt: datetime) -> Li
             raw = msg_data[0][1]
             parsed = _parse_email_message(raw)
 
-            msg_date = None
-            date_header = parsed["headers"].get("date", "")
-            if date_header:
-                try:
-                    msg_date = parsedate_to_datetime(date_header)
-                    if msg_date.tzinfo is not None:
-                        msg_date = msg_date.replace(tzinfo=None)
-                except (TypeError, ValueError):
-                    msg_date = None
+            msg_date = parsed["date"]
             if msg_date is not None and msg_date < since_dt:
                 continue
 
@@ -1105,6 +1179,34 @@ def _extract_email(from_header: str) -> str:
     return match.group(0).lower() if match else ""
 
 
+def _most_recent_send_at(lead: Dict) -> Optional[datetime]:
+    """Latest send timestamp across every stage for this lead. Used to
+    sanity-check whether an inbound message could plausibly be a reply to
+    THIS campaign's own outreach — it can't be a reply to something that
+    hadn't been sent to this lead yet."""
+    latest = None
+    for field in ("IntroSentAt", "FollowUp1SentAt", "FollowUp2SentAt", "FollowUp3SentAt", "FollowUp4SentAt"):
+        dt = _parse_dt(lead.get(field, ""))
+        if dt is not None and (latest is None or dt > latest):
+            latest = dt
+    return latest
+
+
+# Reply-matching outcomes. A Header match (inbound In-Reply-To/References
+# contains a Message-ID this system actually sent) is the only signal
+# trusted enough to stop a live sequence. An Email-only match (same sender
+# address, no header link) is real signal worth logging, but NEVER trusted
+# on its own to stop anything — the same address can legitimately appear
+# across more than one campaign (or a previous, since-replaced campaign),
+# and sender-address alone can't tell those apart. See README "Reply
+# matching safety" for the full rationale and the production incident that
+# prompted this.
+ACTION_STOPPED = "Stopped Sequence"
+ACTION_LOGGED_ONLY = "Logged Only"
+ACTION_LOGGED_UNVERIFIED = "Logged Only (Unverified Match)"
+ACTION_LOGGED_UNRELATED = "Logged Only (Predates Contact)"
+
+
 OOO_KEYWORDS = [
     "out of office", "automatic reply", "auto-reply", "auto reply",
     "away from my desk", "on leave", "on vacation", "currently unavailable",
@@ -1218,17 +1320,34 @@ def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], 
             classification = classify_message(msg["headers"], msg["subject"], msg["body"], msg["from"])
             now_str = datetime.now().strftime(DATETIME_FMT)
 
-            action_taken = "Logged Only"
             master_updates = {"LastInboundClassification": classification, "LastInboundAt": now_str,
                                "LastActionAt": now_str}
 
-            if classification == CLASSIFICATION_GENUINE:
-                master_updates.update({"ReplyStatus": "Replied", "ReplyAt": now_str,
-                                        "Status": STATUS_STOPPED_REPLIED})
-                action_taken = "Stopped Sequence"
-            elif classification == CLASSIFICATION_BOUNCE_HARD:
-                master_updates["Status"] = STATUS_STOPPED_BOUNCED
-                action_taken = "Stopped Sequence"
+            if match_method == "Header":
+                # Strong signal: this message is provably part of THIS
+                # campaign's own outbound thread. Safe to act on.
+                action_taken = ACTION_LOGGED_ONLY
+                if classification == CLASSIFICATION_GENUINE:
+                    master_updates.update({"ReplyStatus": "Replied", "ReplyAt": now_str,
+                                            "Status": STATUS_STOPPED_REPLIED})
+                    action_taken = ACTION_STOPPED
+                elif classification == CLASSIFICATION_BOUNCE_HARD:
+                    master_updates["Status"] = STATUS_STOPPED_BOUNCED
+                    action_taken = ACTION_STOPPED
+            else:
+                # Sender-only match — logged for visibility, but NEVER
+                # allowed to stop a sequence (ReplyStatus/Status are
+                # deliberately left untouched below in both branches).
+                last_sent = _most_recent_send_at(matched_lead)
+                msg_date = msg.get("date")
+                if last_sent is not None and msg_date is not None and msg_date < last_sent:
+                    # Chronologically impossible to be a reply to this
+                    # campaign's outreach — almost certainly a stale message
+                    # tied to a different (possibly deleted) campaign that
+                    # happens to share this lead's email address.
+                    action_taken = ACTION_LOGGED_UNRELATED
+                else:
+                    action_taken = ACTION_LOGGED_UNVERIFIED
 
             try:
                 sheets.update_lead_fields(matched_lead["_row"], master_updates)
@@ -1554,9 +1673,12 @@ def cmd_dashboard(args):
         sys.exit(1)
 
     if args.all:
-        data = load_config()
-        shared_sheet_id = data.get("shared_sheet_id", "")
-        campaign_names = list(data["campaigns"].keys())
+        settings = load_settings()
+        shared_sheet_id = settings.get("shared_sheet_id", "")
+        campaign_names = discover_campaign_names()
+        if not campaign_names:
+            print("No campaigns found — no subfolders under templates/.")
+            return
         all_rows = []
         for name in campaign_names:
             campaign_cfg = get_campaign(name)
