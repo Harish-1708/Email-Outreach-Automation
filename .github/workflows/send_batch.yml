@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: "Campaign name (from config/campaigns.yaml)"
+        description: "Campaign name (must have a matching templates/<name>/ folder)"
         required: true
         default: "Kelson_Creators_Licensing"
       stage:
