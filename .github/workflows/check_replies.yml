@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: "Campaign name (from config/campaigns.yaml)"
+        description: "Campaign name (must have a matching templates/<name>/ folder)"
         required: true
         default: "Kelson_Creators_Licensing"
   schedule:
@@ -27,7 +27,7 @@ jobs:
           EMAIL_ACCOUNTS_JSON: ${{ secrets.EMAIL_ACCOUNTS_JSON }}
         run: |
           python outreach.py check-replies \
-            --campaign "${{ github.event.inputs.campaign || 'sample_campaign' }}" \
+            --campaign "${{ github.event.inputs.campaign || 'Kelson_Creators_Licensing' }}" \
             | tee replies_output.txt
       - name: Add to job summary
         run: |
@@ -40,4 +40,4 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          python outreach.py dashboard --campaign "${{ github.event.inputs.campaign || 'sample_campaign' }}"
+          python outreach.py dashboard --campaign "${{ github.event.inputs.campaign || 'Kelson_Creators_Licensing' }}"
