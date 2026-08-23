@@ -1,0 +1,52 @@
+# Global settings, shared by every campaign. A campaign does NOT need to be
+# listed anywhere here — it exists purely by having a folder under
+# templates/<campaign_name>/. See config/campaigns/ for optional per-campaign
+# overrides.
+
+shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
+
+# Which sending account to use when a lead's own SenderAccount cell is blank
+# and the campaign doesn't set its own default_sender_account. Must match a
+# key in the EMAIL_ACCOUNTS_JSON secret.
+email_accounts:
+  default_account: "sales1"
+
+# Every campaign inherits ALL of this unless its own
+# config/campaigns/<name>.yaml overrides part of it. Most campaigns need no
+# override file at all — these defaults are enough to launch immediately.
+default_campaign_settings:
+  variants: ["A", "B", "C", "D"]
+
+  # Order matters: this defines the sequence a lead moves through. 1 to 5
+  # stages. A campaign's override file can replace this entirely with a
+  # shorter/longer sequence if needed.
+  stages:
+    - name: intro
+      template_prefix: intro
+      wait_days_after_previous: 0
+    - name: followup1
+      template_prefix: followup1
+      wait_days_after_previous: 3
+    - name: followup2
+      template_prefix: followup2
+      wait_days_after_previous: 4
+    - name: followup3
+      template_prefix: followup3
+      wait_days_after_previous: 5
+    - name: followup4
+      template_prefix: followup4
+      wait_days_after_previous: 5
+
+  sending:
+    timezone: "Asia/Kolkata"
+    window_start: "09:00"
+    window_end: "17:00"
+    delay_min_minutes: 3
+    delay_max_minutes: 7
+    daily_limit: 100
+    sender_rotation: false
+    # per_account_daily_limit: 5
+    # rotation_accounts: ["sales1", "sales2"]
+
+  reply_monitor:
+    lookback_hours: 24
