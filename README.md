@@ -208,19 +208,24 @@ it could run, which meant a real risk of launching in production having
 forgotten that step. Now, the folder you'd have to create anyway (you
 need template content regardless) *is* the registration.
 
+**Stages and variants are auto-discovered from whichever template files
+you actually create — 1 stage with 1 variant is a completely valid,
+minimal campaign.** You are never required to build all 5 stages × 4
+variants; that's just the maximum, not a minimum.
+
 ### Launching a brand-new campaign
 
 1. Create `templates/<your_campaign_name>/` with your `.txt` template
-   files (20 files for the default 5-stage × 4-variant shape — see
-   Section 6 for the exact format).
+   files — as few as one (`intro_A.txt`), or as many as 20 (5 stages × 4
+   variants). See Section 6 for the exact format and how the shape is
+   detected.
 2. Type `<your_campaign_name>` into any workflow's `campaign` input.
 
-That's it. It runs on the shared defaults from
-`config/settings.yaml`'s `default_campaign_settings` — no YAML edit
-required.
+That's it. No YAML edit required, regardless of how many stages or
+variants you built.
 
-If you type a campaign name with no matching templates folder, you get a
-clear error immediately, before anything is attempted:
+If you type a campaign name with no matching templates folder at all, you
+get a clear error immediately, before anything is attempted:
 
 ```
 No templates found for campaign 'Foo' — expected a folder at
@@ -228,39 +233,59 @@ No templates found for campaign 'Foo' — expected a folder at
 this campaign. Currently available campaigns: Kelson_Creators_Licensing
 ```
 
+### How the shape is detected
+
+The system scans your templates folder in a fixed order — Intro, then
+FollowUp1 through FollowUp4 — and stops at the first stage with no
+template files at all. So:
+
+| Files present | Discovered shape |
+|---|---|
+| `intro_A.txt` | 1 stage, 1 variant |
+| `intro_A.txt`, `intro_B.txt` | 1 stage, 2 variants |
+| `intro_A.txt`, `followup1_A.txt` | 2 stages, 1 variant each |
+| All 20 (5 stages × A–D) | 5 stages, 4 variants |
+
+Two rules keep this safe rather than silently permissive:
+
+- **Stages must be contiguous from Intro.** If you have `intro` and
+  `followup2` files but no `followup1` files, discovery stops at `intro`
+  — it will never skip a gap.
+- **Every discovered stage must offer the exact same variant letters as
+  Intro.** A campaign with fewer variants *overall* is fine (e.g. just
+  A). But if Intro has A/B/C/D and a later stage is missing just one of
+  those — say, someone forgot `followup3_D.txt` — that's treated as a
+  likely mistake, not an intentional design, and rejected with the exact
+  missing filename. This is what actually prevents the risk of silently
+  running a campaign with fewer variants than you think it has.
+
+Wait times between auto-discovered stages come from
+`config/settings.yaml`'s `default_campaign_settings.stage_wait_days`
+lookup table (0 days for Intro, 3/4/5/5 for the follow-ups by default) —
+edit that file if you want different default spacing across the board.
+
 ### Giving one campaign different settings
 
-Most campaigns need nothing beyond the shared defaults. If one needs to
-differ — a lower daily limit, fewer stages, its own sender — create
+Most campaigns need nothing beyond the shared defaults. If one needs a
+different daily limit, wait time, or sender, create
 `config/campaigns/<campaign_name>.yaml` with **only what's different**:
 
 ```yaml
 # config/campaigns/DudeRobe_Creator_Outreach.yaml
 sending:
   daily_limit: 50
-
-stages:
-  - name: intro
-    template_prefix: intro
-    wait_days_after_previous: 0
-  - name: followup1
-    template_prefix: followup1
-    wait_days_after_previous: 5
+default_sender_account: "sales2"
 ```
 
-Everything you don't mention — `variants`, `reply_monitor`, the rest of
-`sending`, etc. — is still inherited from `config/settings.yaml`. See
-`config/campaigns/README.md` for more examples.
+Its stages/variants are still auto-discovered from the template files
+exactly as if this file didn't exist — an override file doesn't opt you
+out of auto-discovery by itself.
 
-### The safety net: templates are validated, not inferred
-
-The system never guesses a campaign's shape from whatever files happen to
-exist. It reads the configured `stages` and `variants` (from defaults, or
-an override file) and checks that **every** implied template file is
-actually present — so a single missing file (say, someone forgot to
-create `followup3_D.txt`) fails loudly with the exact missing filenames,
-rather than silently running a campaign with one fewer variant than you
-think it has.
+If you genuinely want to *force* an exact stage/variant shape instead
+(strict validation, every implied file required to exist), declare
+**both** `stages` and `variants` explicitly together in the override —
+specifying only one raises a clear error. See
+`config/campaigns/README.md` for that syntax and more examples.
 
 ### Seeing every campaign that currently exists
 
@@ -272,9 +297,11 @@ list to keep in sync. Whatever's in that folder is exactly what exists.
 
 ## 6. Templates
 
-Each stage has 4 variant files in `templates/<campaign>/`, named
-`<stage>_<variant>.txt`. The system picks whichever variant has been used
-least so far for that stage, keeping your 4 versions evenly distributed.
+Templates live in `templates/<campaign>/`, named `<stage>_<variant>.txt`
+— e.g. `intro_A.txt`, `followup1_B.txt`. How many stages and variants you
+create is entirely up to that campaign (see Section 5) — the system picks
+whichever variant has been used least so far for a given stage, keeping
+however many versions you built evenly distributed.
 
 **File format** — subject line, blank line, then body:
 
@@ -581,7 +608,11 @@ One account's IMAP problem doesn't block the others.
   `SEND` exactly.
 - **No template execution** — variables are plain string substitution,
   never evaluated as code.
-- **Templates are validated, not inferred** — see Section 5.
+- **Templates are validated, or auto-discovered — never guessed
+  silently** — auto-discovery only includes a stage/variant if its file
+  genuinely exists; an inconsistent shape (one stage missing a variant
+  the others have) is rejected with the exact missing filename rather
+  than quietly running a smaller campaign than intended. See Section 5.
 - **Custom-column headers are relaxed, not silently accepted** — sheet
   tabs only require your header row to *start with* the system's
   required columns, in order. Extra trailing columns are fine; missing or
@@ -603,10 +634,12 @@ config/
                                <campaign_name>.yaml — most campaigns need
                                none at all
 templates/
-  Kelson_Creators_Licensing/  20 template files (5 stages x 4 variants) —
-                               this folder's EXISTENCE is what makes the
-                               campaign name valid, nothing else
-tests/test_outreach.py        142 unit tests
+  Kelson_Creators_Licensing/  Template files — as few as 1 (intro_A.txt)
+                               or up to 20 (5 stages x 4 variants). This
+                               folder's EXISTENCE makes the campaign name
+                               valid; its CONTENTS determine the shape
+                               (auto-discovered — see Section 5)
+tests/test_outreach.py        152 unit tests
 .github/workflows/
   preview_batch.yml           Manual — shows what would be sent
   send_batch.yml               Manual, requires typing SEND — sends, then
