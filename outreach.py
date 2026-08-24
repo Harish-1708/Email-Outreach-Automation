@@ -241,6 +241,70 @@ def discover_campaign_names(templates_root: str = "templates") -> List[str]:
     )
 
 
+# The only fixed, canonical stage order the system knows about. A campaign
+# never needs all five — auto-discovery below stops at the first stage
+# with no template files at all, so 1 stage is just as valid as 5.
+CANONICAL_STAGE_ORDER = ["intro", "followup1", "followup2", "followup3", "followup4"]
+ALL_VARIANT_LETTERS = ["A", "B", "C", "D"]
+
+
+def discover_stages_and_variants(templates_dir: str, stage_wait_days: Dict[str, int]) -> Tuple[List[Dict], List[str]]:
+    """Auto-detects a campaign's stage sequence and variant set purely from
+    which template files exist — no YAML declaration required. Minimum is
+    1 stage + 1 variant (just intro_A.txt); maximum is 5 stages x A-D.
+
+    Two things keep this safe rather than silently permissive:
+    - Stages must be CONTIGUOUS from Intro — a gap (e.g. intro + followup2
+      but no followup1 files) is a configuration error, not "skip a stage".
+    - Every included stage must offer the EXACT SAME variant letters as
+      Intro. A campaign with fewer variants entirely (e.g. just A) is
+      fine; a LATER stage quietly missing ONE variant that an earlier
+      stage has is almost always an accidental missing file, not an
+      intentional design, so it's rejected with a clear message instead
+      of silently shrinking just that stage.
+    """
+    if not os.path.isdir(templates_dir):
+        raise ConfigError(f"Templates directory not found: {templates_dir}")
+
+    stages: List[Dict] = []
+    canonical_variants: Optional[List[str]] = None
+
+    for prefix in CANONICAL_STAGE_ORDER:
+        found_variants = [v for v in ALL_VARIANT_LETTERS
+                           if os.path.exists(os.path.join(templates_dir, f"{prefix}_{v}.txt"))]
+        if not found_variants:
+            break  # first gap — stages must be contiguous, stop here
+
+        if canonical_variants is None:
+            canonical_variants = found_variants
+        elif found_variants != canonical_variants:
+            missing = sorted(set(canonical_variants) - set(found_variants))
+            extra = sorted(set(found_variants) - set(canonical_variants))
+            problems = []
+            if missing:
+                problems.append(f"missing variant(s) {missing} (present in '{stages[0]['name']}')")
+            if extra:
+                problems.append(f"has extra variant(s) {extra} not present in '{stages[0]['name']}'")
+            raise ConfigError(
+                f"Inconsistent variants for stage '{prefix}' in {templates_dir}: {'; '.join(problems)}. "
+                "Every stage must offer the same variant letters — or specify 'stages' and 'variants' "
+                "explicitly together in this campaign's override file if that's genuinely intentional."
+            )
+
+        stages.append({
+            "name": prefix, "template_prefix": prefix,
+            "wait_days_after_previous": stage_wait_days.get(prefix, 0),
+        })
+
+    if not stages:
+        raise ConfigError(
+            f"No template files found in {templates_dir}. Expected at least 'intro_A.txt' "
+            "(or another variant letter)."
+        )
+
+    return stages, canonical_variants
+
+
 def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml",
                   campaigns_dir: str = "config/campaigns", templates_root: str = "templates") -> dict:
     settings = load_settings(settings_path)
@@ -256,15 +320,39 @@ def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml"
             f"Currently available campaigns: {', '.join(discover_campaign_names(templates_root)) or '(none)'}"
         )
 
-    cfg = dict(settings.get("default_campaign_settings", {}))
+    default_settings = dict(settings.get("default_campaign_settings", {}))
+    stage_wait_days = default_settings.pop("stage_wait_days", {})
+    cfg = default_settings  # sending, reply_monitor — genuinely shared defaults
 
+    override = {}
     override_path = os.path.join(campaigns_dir, f"{campaign_name}.yaml")
     if os.path.exists(override_path):
         with open(override_path, "r", encoding="utf-8") as f:
             override = yaml.safe_load(f) or {}
-        cfg = _deep_merge(cfg, override)
+        non_shape_override = {k: v for k, v in override.items() if k not in ("stages", "variants")}
+        cfg = _deep_merge(cfg, non_shape_override)
 
-    cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
+    has_stages = "stages" in override
+    has_variants = "variants" in override
+    if has_stages != has_variants:
+        raise ConfigError(
+            f"Campaign '{campaign_name}' override specifies only one of 'stages'/'variants' — "
+            "specify both together explicitly, or neither to auto-discover from template files."
+        )
+
+    if has_stages and has_variants:
+        # Explicit declaration — the strict path: every implied file MUST exist.
+        cfg["stages"] = override["stages"]
+        cfg["variants"] = override["variants"]
+        cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
+        _validate_templates_exist(campaign_name, cfg)
+    else:
+        # No explicit shape — auto-discover from whatever's actually there.
+        discovered_stages, discovered_variants = discover_stages_and_variants(templates_dir, stage_wait_days)
+        cfg["stages"] = discovered_stages
+        cfg["variants"] = discovered_variants
+        cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
+
     cfg["sheet_id"] = cfg.get("sheet_id") or shared_sheet_id
     cfg["master_tab"] = cfg.get("master_tab") or f"{campaign_name} Master Sheet"
     cfg["responses_tab"] = cfg.get("responses_tab") or f"{campaign_name} Response Sheet"
@@ -275,7 +363,6 @@ def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml"
     cfg["_global_default_account"] = (settings.get("email_accounts") or {}).get("default_account", "")
 
     _validate_campaign(campaign_name, cfg)
-    _validate_templates_exist(campaign_name, cfg)
     return cfg
 
 
