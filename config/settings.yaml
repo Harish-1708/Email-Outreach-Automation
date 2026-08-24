@@ -1,9 +1,13 @@
 # Global settings, shared by every campaign. A campaign does NOT need to be
 # listed anywhere here — it exists purely by having a folder under
-# templates/<campaign_name>/. See config/campaigns/ for optional per-campaign
-# overrides.
+# templates/<campaign_name>/, and its stages/variants are AUTO-DISCOVERED
+# from whichever template files are actually in that folder (1 stage + 1
+# variant is a perfectly valid minimal campaign; 5 stages x A-D is the
+# max). See config/campaigns/ for optional per-campaign overrides, needed
+# only if a campaign wants non-default timing/limits or to force an exact
+# stage/variant shape.
 
-shared_sheet_id: "1beCHJ9dIZV2YW9BR5SmMhnAGv_F8ko0lMjRLtzL5Bzw"
+shared_sheet_id: "PUT_YOUR_GOOGLE_SHEET_ID_HERE"
 
 # Which sending account to use when a lead's own SenderAccount cell is blank
 # and the campaign doesn't set its own default_sender_account. Must match a
@@ -13,29 +17,18 @@ email_accounts:
 
 # Every campaign inherits ALL of this unless its own
 # config/campaigns/<name>.yaml overrides part of it. Most campaigns need no
-# override file at all — these defaults are enough to launch immediately.
+# override file at all.
 default_campaign_settings:
-  variants: ["A", "B", "C", "D"]
-
-  # Order matters: this defines the sequence a lead moves through. 1 to 5
-  # stages. A campaign's override file can replace this entirely with a
-  # shorter/longer sequence if needed.
-  stages:
-    - name: intro
-      template_prefix: intro
-      wait_days_after_previous: 0
-    - name: followup1
-      template_prefix: followup1
-      wait_days_after_previous: 3
-    - name: followup2
-      template_prefix: followup2
-      wait_days_after_previous: 4
-    - name: followup3
-      template_prefix: followup3
-      wait_days_after_previous: 5
-    - name: followup4
-      template_prefix: followup4
-      wait_days_after_previous: 5
+  # Used ONLY as a lookup table when auto-discovering a campaign's stages
+  # from its template files — NOT a requirement that all five must exist.
+  # A campaign with just intro_A.txt is valid; it simply won't use most of
+  # this table. Only consulted for stage names actually found on disk.
+  stage_wait_days:
+    intro: 0
+    followup1: 3
+    followup2: 4
+    followup3: 5
+    followup4: 5
 
   sending:
     timezone: "Asia/Kolkata"
