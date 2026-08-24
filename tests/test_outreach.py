@@ -2,6 +2,7 @@
 
 import email as email_module
 import os
+import pathlib
 import sys
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
@@ -273,11 +274,12 @@ shared_sheet_id: "{shared_sheet_id}"
 email_accounts:
   default_account: "sales1"
 default_campaign_settings:
-  variants: {list(template_variants)!r}
-  stages:
-    - name: intro
-      template_prefix: intro
-      wait_days_after_previous: 0
+  stage_wait_days:
+    intro: 0
+    followup1: 3
+    followup2: 4
+    followup3: 5
+    followup4: 5
   sending:
     timezone: "Asia/Kolkata"
     window_start: "09:00"
@@ -382,20 +384,54 @@ def test_get_campaign_raises_clearly_when_templates_folder_missing(tmp_path):
         assert "test_campaign" in str(exc)
 
 
-def test_get_campaign_raises_when_a_required_template_file_is_missing(tmp_path):
-    # 2 variants configured, but only create the template file for one —
-    # this must fail loudly rather than silently treating the campaign as
-    # single-variant.
+def test_get_campaign_auto_discovers_fewer_variants_without_erroring(tmp_path):
+    # No explicit override: a campaign with just intro_A.txt (missing the
+    # B/C/D that a bigger campaign might have) is a perfectly valid,
+    # smaller campaign — must NOT raise, per the flexible-by-default design.
     settings_path, campaigns_dir, templates_root = _make_config_fixture(
-        tmp_path, template_variants=("A", "B"))
-    # Delete the B file that _make_config_fixture created.
-    os.remove(os.path.join(templates_root, "test_campaign", "intro_B.txt"))
+        tmp_path, template_variants=("A",))
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["variants"] == ["A"]
+    assert len(cfg["stages"]) == 1
+    assert cfg["stages"][0]["name"] == "intro"
+
+
+def test_get_campaign_explicit_override_still_raises_on_missing_file(tmp_path):
+    # Only when stages/variants are EXPLICITLY declared together in an
+    # override file does a missing template file raise an error —
+    # auto-discovery (no override) never requires more than what's there.
+    override = (
+        "stages:\n"
+        "  - name: intro\n"
+        "    template_prefix: intro\n"
+        "    wait_days_after_previous: 0\n"
+        'variants: ["A", "B"]\n'
+    )
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(
+        tmp_path, template_variants=("A",), override_yaml=override)  # only A exists, B declared
     try:
         outreach.get_campaign("test_campaign", settings_path=settings_path,
                                campaigns_dir=campaigns_dir, templates_root=templates_root)
         assert False, "should have raised ConfigError"
     except outreach.ConfigError as exc:
         assert "intro_B.txt" in str(exc)
+
+
+def test_get_campaign_override_specifying_only_stages_not_variants_raises(tmp_path):
+    override = (
+        "stages:\n"
+        "  - name: intro\n"
+        "    template_prefix: intro\n"
+        "    wait_days_after_previous: 0\n"
+    )
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
+    try:
+        outreach.get_campaign("test_campaign", settings_path=settings_path,
+                               campaigns_dir=campaigns_dir, templates_root=templates_root)
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError as exc:
+        assert "only one of" in str(exc)
 
 
 def test_discover_campaign_names_lists_template_subfolders(tmp_path):
@@ -1877,3 +1913,100 @@ def test_message_to_dict_handles_missing_date_header():
     msg["Message-ID"] = "<x@mail.gmail.com>"
     parsed = outreach._parse_email_message(msg.as_bytes())
     assert parsed["date"] is None
+
+
+# =============================================================================
+# discover_stages_and_variants — direct unit tests of the auto-discovery
+# algorithm itself, independent of the full get_campaign() plumbing.
+# =============================================================================
+
+def _write_template(dir_path, filename):
+    (pathlib.Path(dir_path) / filename).write_text("Subject: Hi\n\nBody")
+
+
+def test_discover_minimal_single_file(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    _write_template(d, "intro_A.txt")
+    stages, variants = outreach.discover_stages_and_variants(str(d), {})
+    assert len(stages) == 1
+    assert stages[0]["name"] == "intro"
+    assert stages[0]["template_prefix"] == "intro"
+    assert stages[0]["wait_days_after_previous"] == 0
+    assert variants == ["A"]
+
+
+def test_discover_two_stages_two_variants_uses_stage_wait_days(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    for stage in ["intro", "followup1"]:
+        for v in ["A", "B"]:
+            _write_template(d, f"{stage}_{v}.txt")
+    stages, variants = outreach.discover_stages_and_variants(str(d), {"intro": 0, "followup1": 3})
+    assert [s["name"] for s in stages] == ["intro", "followup1"]
+    assert stages[0]["wait_days_after_previous"] == 0
+    assert stages[1]["wait_days_after_previous"] == 3
+    assert variants == ["A", "B"]
+
+
+def test_discover_missing_stage_wait_days_entry_defaults_to_zero(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    for stage in ["intro", "followup1"]:
+        _write_template(d, f"{stage}_A.txt")
+    stages, variants = outreach.discover_stages_and_variants(str(d), {})  # no wait_days configured at all
+    assert stages[1]["wait_days_after_previous"] == 0
+
+
+def test_discover_stops_at_first_gap(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    _write_template(d, "intro_A.txt")
+    # No followup1 files at all — followup2 existing anyway must be ignored.
+    _write_template(d, "followup2_A.txt")
+    stages, variants = outreach.discover_stages_and_variants(str(d), {})
+    assert [s["name"] for s in stages] == ["intro"]
+
+
+def test_discover_all_five_stages_four_variants(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    for stage in outreach.CANONICAL_STAGE_ORDER:
+        for v in outreach.ALL_VARIANT_LETTERS:
+            _write_template(d, f"{stage}_{v}.txt")
+    stages, variants = outreach.discover_stages_and_variants(str(d), {})
+    assert len(stages) == 5
+    assert variants == ["A", "B", "C", "D"]
+
+
+def test_discover_inconsistent_variants_raises_clear_error(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    for v in ["A", "B", "C", "D"]:
+        _write_template(d, f"intro_{v}.txt")
+    for v in ["A", "B", "C"]:  # D missing for followup1
+        _write_template(d, f"followup1_{v}.txt")
+    try:
+        outreach.discover_stages_and_variants(str(d), {})
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError as exc:
+        assert "followup1" in str(exc)
+        assert "D" in str(exc)
+
+
+def test_discover_no_templates_at_all_raises(tmp_path):
+    d = tmp_path / "templates"
+    d.mkdir()
+    try:
+        outreach.discover_stages_and_variants(str(d), {})
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError:
+        pass
+
+
+def test_discover_nonexistent_directory_raises(tmp_path):
+    try:
+        outreach.discover_stages_and_variants(str(tmp_path / "does_not_exist"), {})
+        assert False, "should have raised ConfigError"
+    except outreach.ConfigError:
+        pass
