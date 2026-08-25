@@ -1,0 +1,20 @@
+"""Shared path/config helpers for the Streamlit control panel.
+
+Deliberately computes absolute paths from this file's location rather than
+trusting the process's current working directory — Streamlit Community
+Cloud's CWD conventions aren't guaranteed, and outreach.py's own functions
+expect explicit paths when not run from the repo root.
+"""
+import os
+
+STREAMLIT_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(STREAMLIT_APP_DIR)
+
+SETTINGS_PATH = os.path.join(REPO_ROOT, "config", "settings.yaml")
+CAMPAIGNS_DIR = os.path.join(REPO_ROOT, "config", "campaigns")
+TEMPLATES_ROOT = os.path.join(REPO_ROOT, "templates")
+
+WORKFLOW_SEND = "send_batch.yml"
+WORKFLOW_PREVIEW = "preview_batch.yml"
+WORKFLOW_CHECK_REPLIES = "check_replies.yml"
+WORKFLOW_DASHBOARD = "dashboard.yml"
