@@ -12,6 +12,7 @@ from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg, run_preview  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector, ReadOnlySheetsError  # noqa: E402
 from send_logic import build_send_inputs, build_check_replies_inputs, confirmation_is_valid  # noqa: E402
+from replies_logic import most_recent_responses  # noqa: E402
 
 st.set_page_config(page_title="Controls", page_icon="🚀", layout="wide")
 
@@ -109,7 +110,7 @@ with send_tab:
         "This will send real emails. Run Preview for this exact batch first if you haven't already."
     )
     confirm_text = st.text_input(
-        f'Type "{"SEND"}" to confirm (this is the same deliberate friction as the GitHub Actions workflow — '
+        'Type "SEND" to confirm (this is the same deliberate friction as the GitHub Actions workflow — '
         "typing it here does not skip anything, it's still required)",
         key="send_confirm_text",
     )
@@ -141,7 +142,7 @@ with send_tab:
     if run_id:
         st.divider()
         st.write(f"**Last triggered run:** [{run_id}]({st.session_state.get('last_send_run_url', '')})")
-        if st.button("🔄 Refresh run status"):
+        if st.button("🔄 Refresh run status", key="send_refresh_status"):
             try:
                 run = _get_github_client().get_run(run_id)
                 status = run.get("status", "unknown")
@@ -154,18 +155,88 @@ with send_tab:
                 st.error(f"Failed to fetch run status: {exc}")
 
 # ---------------------------------------------------------------------------
-# Check Replies — also runs automatically every 30 min; this is a manual
-# trigger for convenience.
+# Check Replies — also runs automatically every 30 min; this button is a
+# manual trigger for convenience. The Response Sheet is already updated the
+# moment the run finishes, so this tab shows those results directly rather
+# than just linking out to the Actions log.
 # ---------------------------------------------------------------------------
 with replies_tab:
     st.caption("This also runs automatically every 30 minutes — use this only if you want it to check right now.")
+
     if st.button("Check Replies Now"):
         try:
             client = _get_github_client()
             inputs = build_check_replies_inputs(campaign)
             run_details = client.dispatch_workflow(WORKFLOW_CHECK_REPLIES, inputs)
+            if run_details is None:
+                time.sleep(2)
+                run_details = client.find_recent_run(WORKFLOW_CHECK_REPLIES)
+            if run_details:
+                st.session_state["last_replies_run_id"] = run_details.get("id") or run_details.get("run_id")
+                st.session_state["last_replies_run_url"] = run_details.get("html_url", "")
             st.success(f"Triggered Check Replies for '{campaign}'.")
-            if run_details and run_details.get("html_url"):
-                st.write(f"[View run]({run_details['html_url']})")
         except GitHubActionsError as exc:
             st.error(f"Failed to trigger Check Replies: {exc}")
+
+    replies_run_id = st.session_state.get("last_replies_run_id")
+    if replies_run_id:
+        st.write(f"**Last triggered run:** [{replies_run_id}]({st.session_state.get('last_replies_run_url', '')})")
+        if st.button("🔄 Refresh run status", key="replies_refresh_status"):
+            try:
+                run = _get_github_client().get_run(replies_run_id)
+                status = run.get("status", "unknown")
+                conclusion = run.get("conclusion")
+                if status == "completed":
+                    st.success(f"Completed — conclusion: {conclusion}. Reply results are below — click "
+                               "'Refresh replies' to pull them in.")
+                else:
+                    st.info(f"Status: {status} (not finished yet — the Response Sheet won't have new rows "
+                            "from this run until it completes)")
+            except GitHubActionsError as exc:
+                st.error(f"Failed to fetch run status: {exc}")
+
+    st.divider()
+    st.subheader("Recent replies")
+    st.caption(
+        "Read directly from this campaign's Response Sheet tab — reflects whatever the most recent "
+        "Check Replies run (scheduled or manual) has already written, whether or not it was triggered here."
+    )
+
+    if st.button("🔄 Refresh replies"):
+        st.session_state["_replies_refresh_nonce"] = st.session_state.get("_replies_refresh_nonce", 0) + 1
+
+    try:
+        connector = _get_sheets_connector()
+        campaign_cfg = get_campaign_cfg(campaign)
+        responses = connector.get_all_responses(campaign_cfg["responses_tab"])
+    except ReadOnlySheetsError as exc:
+        st.warning(str(exc))
+        responses = None
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to read responses: {exc}")
+        responses = None
+
+    if responses is not None:
+        recent = most_recent_responses(responses, limit=20)
+        if not recent:
+            st.info("No replies logged for this campaign yet.")
+        else:
+            for r in recent:
+                action = r.get("ActionTaken", "")
+                classification = r.get("Classification", "")
+                # ActionTaken is what actually happened — a "Logged Only
+                # (...)" outcome means the sequence was NOT stopped, even
+                # if Classification says "Genuine Reply" (that field only
+                # describes the message content, not what the system did
+                # about it). Surfacing both, clearly labeled, is the point
+                # of this view — the raw sheet columns read confusingly
+                # side by side otherwise.
+                stopped = action == "Stopped Sequence"
+                icon = "🛑" if stopped else "📝"
+                label = f"{icon} {r.get('From', '')} — {r.get('Subject', '')} ({r.get('ReceivedAt', '')})"
+                with st.expander(label):
+                    st.write(f"**Classification:** {classification}")
+                    st.write(f"**Action taken:** {action}"
+                             + ("" if stopped else " — sequence was NOT stopped for this lead"))
+                    st.write(f"**Match method:** {r.get('MatchMethod', '')}")
+                    st.text(r.get("Snippet", ""))
