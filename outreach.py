@@ -1001,7 +1001,7 @@ def _message_to_dict(msg) -> Dict:
     return {
         "message_id": message_id, "in_reply_to": in_reply_to, "references": references,
         "subject": subject, "from": from_, "headers": headers, "body": body,
-        "snippet": body[:200], "date": parsed_date,
+        "snippet": body[:500], "date": parsed_date,
     }
 
 
