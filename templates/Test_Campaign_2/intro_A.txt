@@ -1,5 +1,0 @@
-Subject: Testing
-
-Hi {{first_name}}, 
-
-Testing
