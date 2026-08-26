@@ -169,6 +169,22 @@ def test_branch_and_pr_naming_add_stage():
         "Add followup1 to campaign: MyCampaign"
 
 
+def test_branch_name_with_suffix_appends_it():
+    assert branch_name_for_campaign("MyCampaign", "intro", suffix="ab12cd34") == \
+        "add-intro-mycampaign-ab12cd34"
+
+
+def test_branch_name_two_calls_with_different_suffixes_never_collide():
+    # This is the actual regression this covers: a fully deterministic
+    # branch name collides with any leftover branch from a PREVIOUS
+    # attempt (closed PR, abandoned attempt, merge that didn't auto-delete
+    # its branch) and GitHub's create-branch API rejects the duplicate ref
+    # with a 422. Different suffixes must always produce different names.
+    first = branch_name_for_campaign("MyCampaign", "followup1", suffix="aaaaaaaa")
+    second = branch_name_for_campaign("MyCampaign", "followup1", suffix="bbbbbbbb")
+    assert first != second
+
+
 def test_pr_body_mentions_creator_and_variant_count_new_campaign():
     body = pr_body_for_campaign("MyCampaign", "intro", 2, "alice", is_new_campaign=True)
     assert "alice" in body
