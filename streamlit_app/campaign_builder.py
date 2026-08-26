@@ -98,8 +98,16 @@ def get_next_stage_for_campaign(campaign_name: str, templates_root: str) -> Opti
     return None  # all 5 stages already exist
 
 
-def branch_name_for_campaign(campaign_name: str, stage_prefix: str) -> str:
-    return f"add-{stage_prefix}-{campaign_name.lower()}"
+def branch_name_for_campaign(campaign_name: str, stage_prefix: str, suffix: Optional[str] = None) -> str:
+    """suffix=None gives the deterministic base name (used by tests). The
+    page's actual call site always passes a fresh random suffix — see its
+    docstring note below for why: a fully deterministic name collides with
+    any leftover branch from a PREVIOUS attempt (closed PR, abandoned
+    attempt, or a merge that didn't auto-delete its branch), and GitHub's
+    create-branch API rejects a duplicate ref with a 422. A random suffix
+    means every attempt gets its own branch, so this can never collide."""
+    base = f"add-{stage_prefix}-{campaign_name.lower()}"
+    return f"{base}-{suffix}" if suffix else base
 
 
 def pr_title_for_campaign(campaign_name: str, stage_prefix: str, is_new_campaign: bool) -> str:
