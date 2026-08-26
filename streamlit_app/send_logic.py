@@ -57,3 +57,11 @@ def build_preview_inputs(campaign: str, stage: str, batch_size: int, variant: st
 
 def build_check_replies_inputs(campaign: str) -> Dict[str, str]:
     return {"campaign": campaign}
+
+
+def build_backfill_thread_subject_inputs(campaign: str, dry_run: bool = True) -> Dict[str, str]:
+    """dry_run defaults to True here too (matching the workflow's own
+    default) — this writes to the Master Sheet, so the safer default is to
+    require a deliberate second step (unchecking dry_run) before anything
+    is actually written."""
+    return {"campaign": campaign, "dry_run": "true" if dry_run else "false"}
