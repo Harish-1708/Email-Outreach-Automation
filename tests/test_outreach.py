@@ -207,7 +207,7 @@ def test_ignore_wait_days_defaults_to_false_unchanged_behavior():
 
 def test_build_batch_ignore_wait_days_passthrough(monkeypatch):
     monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "S", "body": "B", "missing_variables": []})
+        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
     recent = datetime.now().strftime(FMT)
     campaign_cfg = _base_campaign_cfg()
     lead = make_lead(_row=2, IntroSentAt=recent)
@@ -291,6 +291,92 @@ def test_render_text_blank_first_name_gets_default_not_literal_placeholder():
 def test_render_text_blank_company_gets_default():
     result = outreach.render_text("at {{CompanyName}}", {"Company": ""})
     assert result == "at your team"
+
+
+# =============================================================================
+# render_email — blank Subject means "continue the existing thread"
+# =============================================================================
+
+def test_render_email_blank_subject_continues_thread_with_re_prefix(tmp_path):
+    campaign_dir = tmp_path / "ThreadTest"
+    campaign_dir.mkdir()
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nJust following up, {{FirstName}}.")
+
+    lead = {"FirstName": "Sam", "ThreadSubject": "Quick question for you"}
+    rendered = outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
+
+    assert rendered["subject"] == "Re: Quick question for you"
+    assert rendered["is_continuation"] is True
+    assert rendered["thread_subject"] == "Quick question for you"  # unchanged, still the original
+
+
+def test_render_email_blank_subject_no_double_re_prefix(tmp_path):
+    campaign_dir = tmp_path / "ThreadTest2"
+    campaign_dir.mkdir()
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nBody.")
+
+    lead = {"ThreadSubject": "Re: Already a reply"}
+    rendered = outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
+
+    assert rendered["subject"] == "Re: Already a reply"  # not "Re: Re: Already a reply"
+
+
+def test_render_email_blank_subject_on_first_stage_raises_clearly(tmp_path):
+    campaign_dir = tmp_path / "ThreadTest3"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: \n\nBody.")
+
+    with pytest.raises(outreach.TemplateError, match="no previous thread to continue"):
+        outreach.render_email(str(campaign_dir), "intro", "A", {}, is_first_stage=True)
+
+
+def test_render_email_blank_subject_with_no_stored_thread_subject_raises_clearly(tmp_path):
+    campaign_dir = tmp_path / "ThreadTest4"
+    campaign_dir.mkdir()
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nBody.")
+
+    lead = {"LeadID": "L99", "ThreadSubject": ""}  # never set — e.g. sent before this feature existed
+    with pytest.raises(outreach.TemplateError, match="no ThreadSubject recorded"):
+        outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
+
+
+def test_render_email_non_blank_subject_resets_thread_subject(tmp_path):
+    campaign_dir = tmp_path / "ThreadTest5"
+    campaign_dir.mkdir()
+    (campaign_dir / "followup2_A.txt").write_text("Subject: A brand new angle for {{FirstName}}\n\nBody.")
+
+    lead = {"FirstName": "Sam", "ThreadSubject": "The old subject"}
+    rendered = outreach.render_email(str(campaign_dir), "followup2", "A", lead, is_first_stage=False)
+
+    assert rendered["subject"] == "A brand new angle for Sam"
+    assert rendered["is_continuation"] is False
+    assert rendered["thread_subject"] == "A brand new angle for Sam"  # reset to the new one
+
+
+def test_build_batch_carries_thread_subject_and_continuation_flag(monkeypatch):
+    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
+        "subject": "Re: Original", "body": "B", "missing_variables": [],
+        "thread_subject": "Original", "is_continuation": True,
+    })
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=2)
+    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
+    assert plan[0]["thread_subject"] == "Original"
+    assert plan[0]["is_continuation"] is True
+
+
+def test_send_batch_writes_thread_subject_to_master_sheet(monkeypatch):
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
+        "subject": "Quick question", "body": "B", "missing_variables": [],
+        "thread_subject": "Quick question", "is_continuation": False,
+    })
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+    assert fake_sheets._leads[0]["ThreadSubject"] == "Quick question"
 
 
 def test_all_20_templates_load_and_render_without_leftover_placeholders_even_with_blank_fields():
@@ -1338,6 +1424,7 @@ def test_send_batch_logs_missing_template_variable_after_successful_send(monkeyp
     monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<msg1@mail.gmail.com>"})
     monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
         "subject": "Hi", "body": "Body", "missing_variables": ["Industry"],
+        "thread_subject": "Hi", "is_continuation": False,
     })
 
     results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
