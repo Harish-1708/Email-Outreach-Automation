@@ -38,6 +38,25 @@ def test_validate_variant_content_requires_subject_and_body():
     assert validate_variant_content("subject", "body") is None
 
 
+def test_validate_variant_content_first_stage_requires_subject_by_default():
+    # is_first_stage defaults to True — the "create new campaign" (Intro)
+    # flow's existing calls don't pass it explicitly, so this default
+    # must keep requiring a subject there.
+    assert validate_variant_content("", "body") is not None
+    assert validate_variant_content("", "body", is_first_stage=True) is not None
+
+
+def test_validate_variant_content_non_first_stage_allows_blank_subject():
+    # Blank subject on a later stage is the deliberate "continue the
+    # existing thread" convention — not a validation error.
+    assert validate_variant_content("", "body", is_first_stage=False) is None
+
+
+def test_validate_variant_content_non_first_stage_still_requires_body():
+    assert validate_variant_content("", "", is_first_stage=False) is not None
+    assert validate_variant_content("Subject", "", is_first_stage=False) is not None
+
+
 def test_build_template_file_content_matches_outreach_expected_format():
     content = build_template_file_content("Hi {{FirstName}}", "Body text here")
     text = content.decode("utf-8")
@@ -59,6 +78,28 @@ def test_build_template_file_content_round_trips_with_outreach_load_template(tmp
     tmpl = outreach.load_template(str(campaign_dir), "intro", "A")
     assert tmpl["subject"] == "Quick idea for {{CompanyName}}"
     assert "Hi {{FirstName}}," in tmpl["body"]
+
+
+def test_build_template_file_content_blank_subject_round_trips_as_blank(tmp_path):
+    # Proves the "leave Subject blank in the New Campaign UI" path produces
+    # a file outreach.render_email correctly reads as "continue the
+    # thread" — the same file format outreach.load_template already
+    # parses a bare "Subject:" line as subject="".
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    import outreach
+
+    content = build_template_file_content("", "Just following up, {{FirstName}}.")
+    campaign_dir = tmp_path / "TestCampaign2"
+    campaign_dir.mkdir()
+    (campaign_dir / "followup1_A.txt").write_bytes(content)
+
+    tmpl = outreach.load_template(str(campaign_dir), "followup1", "A")
+    assert tmpl["subject"] == ""
+
+    rendered = outreach.render_email(str(campaign_dir), "followup1", "A",
+                                      {"FirstName": "Sam", "ThreadSubject": "Original"}, is_first_stage=False)
+    assert rendered["subject"] == "Re: Original"
+    assert rendered["is_continuation"] is True
 
 
 def test_build_campaign_files_only_includes_provided_variants():
