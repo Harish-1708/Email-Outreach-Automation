@@ -168,6 +168,70 @@ def test_stopped_status_is_excluded():
 
 
 # =============================================================================
+# get_eligible_leads / find_duplicate_email_leads — same email, two rows
+# =============================================================================
+
+def test_duplicate_email_rows_only_first_row_is_eligible():
+    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
+    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
+    assert len(eligible) == 1
+    assert eligible[0]["LeadID"] == "L1"  # the lower row number wins
+
+
+def test_duplicate_email_rows_email_matching_is_case_insensitive():
+    row1 = make_lead(_row=2, LeadID="L1", Email="Same@ABC.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
+    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
+    assert len(eligible) == 1
+    assert eligible[0]["LeadID"] == "L1"
+
+
+def test_duplicate_email_rows_does_not_affect_leads_with_unique_emails():
+    row1 = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="b@abc.com")
+    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
+    assert len(eligible) == 2
+
+
+def test_duplicate_email_rows_dedup_only_applies_among_leads_that_pass_other_checks():
+    # Row1 fails on Approval and is filtered out BEFORE the dedup step —
+    # it never "claims" the email slot, so row2 (which does pass) is
+    # correctly still eligible. Dedup only applies among leads that
+    # already passed every other check, not globally by row order.
+    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com", Approval="No")
+    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com", Approval="Yes")
+    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
+    assert len(eligible) == 1
+    assert eligible[0]["LeadID"] == "L2"
+
+
+def test_find_duplicate_email_leads_finds_repeated_emails():
+    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
+    unique = make_lead(_row=4, LeadID="L3", Email="unique@abc.com")
+
+    duplicates = outreach.find_duplicate_email_leads([row1, row2, unique])
+    assert list(duplicates.keys()) == ["same@abc.com"]
+    assert len(duplicates["same@abc.com"]) == 2
+
+
+def test_find_duplicate_email_leads_case_insensitive_and_ignores_blank_email():
+    row1 = make_lead(_row=2, LeadID="L1", Email="Same@ABC.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
+    blank = make_lead(_row=4, LeadID="L4", Email="")
+
+    duplicates = outreach.find_duplicate_email_leads([row1, row2, blank])
+    assert list(duplicates.keys()) == ["same@abc.com"]
+
+
+def test_find_duplicate_email_leads_empty_when_all_unique():
+    row1 = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    row2 = make_lead(_row=3, LeadID="L2", Email="b@abc.com")
+    assert outreach.find_duplicate_email_leads([row1, row2]) == {}
+
+
+# =============================================================================
 # get_eligible_leads / build_batch / send_batch — ignore_wait_days override
 # =============================================================================
 
@@ -467,6 +531,67 @@ def test_backfill_skips_when_rerendered_subject_is_itself_blank(tmp_path):
     lead = make_lead(IntroSentAt="2026-08-01 09:00:00", IntroVariant="A", ThreadSubject="")
     results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
     assert results[0]["status"] == "skipped_template_now_blank"
+
+
+def test_backfill_walks_back_past_a_blank_most_recent_stage(tmp_path):
+    # The exact real-world case that motivated this: Intro was sent with a
+    # real subject (before this feature existed), then followup1 was ALSO
+    # already sent — but using the NEW blank-subject-continuation
+    # convention. The most recent sent stage (followup1) has nothing to
+    # extract, but the real subject is still recoverable from Intro.
+    campaign_dir = tmp_path / "HybridCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_C.txt").write_text(
+        "Subject: DudeRobe – Meta Ad Usage Collaboration\n\nHi {{FirstName}},\n\nBody.")
+    (campaign_dir / "followup1_C.txt").write_text("Subject: \n\nJust following up.")
+
+    campaign_cfg = {
+        "templates_dir": str(campaign_dir), "variants": ["C"],
+        "stages": [
+            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
+            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
+        ],
+    }
+    lead = make_lead(_row=5, LeadID="L1", FirstName="Rithik",
+                      IntroSentAt="2026-08-26 05:29:01", IntroVariant="C",
+                      FollowUp1SentAt="2026-08-26 08:47:39", FollowUp1Variant="C", ThreadSubject="")
+
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+
+    assert results[0]["status"] == "backfilled"
+    assert results[0]["stage"] == "intro"  # walked back PAST followup1
+    assert results[0]["thread_subject"] == "DudeRobe – Meta Ad Usage Collaboration"
+
+
+def test_backfill_stops_at_first_non_blank_walking_backward_not_earliest(tmp_path):
+    # Three stages sent: intro (real subject A), followup1 (blank/continued),
+    # followup2 (real subject, deliberately reset). The correct answer is
+    # followup2's — the MOST RECENT real subject — not intro's, even though
+    # intro also has a real one and would be found by walking further back.
+    campaign_dir = tmp_path / "ThreeStageCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: Original intro subject\n\nBody.")
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nContinuing the thread.")
+    (campaign_dir / "followup2_A.txt").write_text("Subject: A completely new angle\n\nBody.")
+
+    campaign_cfg = {
+        "templates_dir": str(campaign_dir), "variants": ["A"],
+        "stages": [
+            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
+            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
+            {"name": "followup2", "template_prefix": "followup2", "wait_days_after_previous": 4},
+        ],
+    }
+    lead = make_lead(_row=2, LeadID="L1",
+                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
+                      FollowUp1SentAt="2026-08-05 09:00:00", FollowUp1Variant="A",
+                      FollowUp2SentAt="2026-08-10 09:00:00", FollowUp2Variant="A", ThreadSubject="")
+
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+
+    assert results[0]["status"] == "backfilled"
+    assert results[0]["stage"] == "followup2"
+    assert results[0]["thread_subject"] == "A completely new angle"
 
 
 def test_backfill_returns_nothing_to_write_for_empty_lead_list():
