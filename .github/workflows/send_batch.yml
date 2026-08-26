@@ -42,6 +42,11 @@ on:
         description: 'Type SEND (in caps) to confirm you have already reviewed a Preview Batch run for this exact batch'
         required: true
         default: ""
+      ignore_wait_days:
+        description: "Send this stage now even if its scheduled wait hasn't elapsed (e.g. followup1's 3-day wait). Every other eligibility rule still applies — the previous stage must actually have been sent, this stage can't already be sent, Approval must be Yes, no reply received."
+        required: false
+        type: boolean
+        default: false
 
 # Without this, two overlapping Send runs for the SAME campaign (e.g. one
 # triggered from Streamlit, another from the GitHub Actions UI, before the
@@ -102,6 +107,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.sender_rotation }}" = "true" ] || [ "${{ github.event.inputs.sender_rotation }}" = "false" ]; then
             CMD+=(--sender-rotation "${{ github.event.inputs.sender_rotation }}")
+          fi
+          if [ "${{ github.event.inputs.ignore_wait_days }}" = "true" ]; then
+            CMD+=(--ignore-wait-days)
           fi
 
           "${CMD[@]}" | tee send_output.txt
