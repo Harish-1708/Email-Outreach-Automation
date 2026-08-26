@@ -88,6 +88,12 @@ class GitHubClient:
         payload = {"ref": f"refs/heads/{new_branch}", "sha": base_sha}
         resp = requests.post(url, json=payload, headers=self._headers, timeout=self.timeout)
         if resp.status_code != 201:
+            if resp.status_code == 422 and "already exists" in resp.text.lower():
+                raise GitHubActionsError(
+                    f"Branch '{new_branch}' already exists — likely a leftover from a previous attempt "
+                    "(a closed/abandoned PR, or a merge whose branch wasn't auto-deleted). Delete it on "
+                    f"GitHub under Branches, then retry. Raw error: {resp.text[:200]}"
+                )
             raise GitHubActionsError(f"Failed to create branch '{new_branch}': {resp.status_code} {resp.text[:300]}")
 
     def create_file(self, path: str, content_bytes: bytes, message: str, branch: str) -> None:
