@@ -379,6 +379,101 @@ def test_send_batch_writes_thread_subject_to_master_sheet(monkeypatch):
     assert fake_sheets._leads[0]["ThreadSubject"] == "Quick question"
 
 
+# =============================================================================
+# backfill_thread_subjects — one-time migration for pre-existing leads
+# =============================================================================
+
+def test_backfill_skips_lead_with_thread_subject_already_set():
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(LeadID="L1", IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
+                      ThreadSubject="Already set")
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+    assert results == [{"lead_id": "L1", "status": "skipped_already_set"}]
+
+
+def test_backfill_skips_lead_never_sent_to():
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(IntroSentAt="", ThreadSubject="")
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+    assert results[0]["status"] == "skipped_not_sent_yet"
+
+
+def test_backfill_skips_lead_with_unknown_variant():
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(IntroSentAt="2026-08-01 09:00:00", IntroVariant="", ThreadSubject="")
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+    assert results[0]["status"] == "skipped_unknown_variant"
+    assert results[0]["stage"] == "intro"
+
+
+def test_backfill_uses_intro_when_only_intro_sent():
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=2, LeadID="L1", FirstName="Sam",
+                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A", ThreadSubject="")
+
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+
+    expected_tmpl = outreach.load_template(TEMPLATES_DIR, "intro", "A")
+    expected_subject = outreach.render_text(expected_tmpl["subject"], lead)
+
+    assert results[0]["status"] == "backfilled"
+    assert results[0]["stage"] == "intro"
+    assert results[0]["thread_subject"] == expected_subject
+    assert results[0]["row"] == 2
+
+
+def test_backfill_uses_most_recently_sent_stage_not_intro():
+    # Lead has BOTH intro and followup1 sent — the correct subject to
+    # backfill from is followup1's (the most recent), not intro's. This is
+    # the core regression this whole function exists to get right.
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=3, LeadID="L2", FirstName="Sam",
+                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
+                      FollowUp1SentAt="2026-08-05 09:00:00", FollowUp1Variant="B", ThreadSubject="")
+
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+
+    expected_tmpl = outreach.load_template(TEMPLATES_DIR, "followup1", "B")
+    expected_subject = outreach.render_text(expected_tmpl["subject"], lead)
+
+    assert results[0]["status"] == "backfilled"
+    assert results[0]["stage"] == "followup1"
+    assert results[0]["thread_subject"] == expected_subject
+
+
+def test_backfill_isolates_per_lead_template_errors(monkeypatch):
+    campaign_cfg = _base_campaign_cfg()
+    good_lead = make_lead(_row=2, LeadID="L1", IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
+                           ThreadSubject="")
+    bad_lead = make_lead(_row=3, LeadID="L2", IntroSentAt="2026-08-01 09:00:00", IntroVariant="Z",
+                          ThreadSubject="")  # variant Z has no template file — must not exist
+
+    results = outreach.backfill_thread_subjects(campaign_cfg, [good_lead, bad_lead])
+
+    statuses = {r["lead_id"]: r["status"] for r in results}
+    assert statuses["L1"] == "backfilled"
+    assert statuses["L2"] == "error"
+
+
+def test_backfill_skips_when_rerendered_subject_is_itself_blank(tmp_path):
+    campaign_dir = tmp_path / "BlankNowCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: \n\nBody.")  # since migrated to blank-subject itself
+
+    campaign_cfg = {
+        "templates_dir": str(campaign_dir), "variants": ["A"],
+        "stages": [{"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0}],
+    }
+    lead = make_lead(IntroSentAt="2026-08-01 09:00:00", IntroVariant="A", ThreadSubject="")
+    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
+    assert results[0]["status"] == "skipped_template_now_blank"
+
+
+def test_backfill_returns_nothing_to_write_for_empty_lead_list():
+    campaign_cfg = _base_campaign_cfg()
+    assert outreach.backfill_thread_subjects(campaign_cfg, []) == []
+
+
 def test_all_20_templates_load_and_render_without_leftover_placeholders_even_with_blank_fields():
     # Deliberately blank FirstName/LastName/Company to prove optional fields
     # never leak "{{...}}" into an outgoing email.
