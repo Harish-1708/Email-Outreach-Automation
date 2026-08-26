@@ -12,6 +12,18 @@ on:
     # looser = fewer Actions minutes used.
     - cron: "*/30 * * * *"
 
+# Without this, the scheduled run and a manual "Check Replies Now" trigger
+# (or two manual clicks close together) can execute at the same time on two
+# separate runners. check_replies() reads "already logged" ONCE at the
+# start of a run and never rechecks mid-run — so two overlapping runs can
+# both see the same unread reply as "new" and both log it, producing exact
+# duplicate rows in the Response Sheet. cancel-in-progress: false means the
+# second run QUEUES and waits its turn instead of being killed mid-IMAP-
+# fetch — we want every run to still happen, just never two at once.
+concurrency:
+  group: check-replies
+  cancel-in-progress: false
+
 jobs:
   check-replies:
     runs-on: ubuntu-latest
