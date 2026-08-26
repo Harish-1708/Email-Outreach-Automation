@@ -1150,6 +1150,72 @@ def _count_sent_today_by_account(send_log: List[Dict]) -> Dict[str, int]:
     return counts
 
 
+def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict]:
+    """One-time migration helper: for every lead whose ThreadSubject is
+    blank but who was already mid-sequence before that column existed,
+    reconstructs it by re-rendering the subject of the MOST RECENTLY SENT
+    stage for that lead (walking stages from last to first) — every
+    template had a real, non-blank subject before the blank-means-
+    continue convention existed, so that stage's subject is exactly what
+    a later blank-subject continuation should be replying to.
+
+    Never overwrites an already-set ThreadSubject, and never writes
+    anything itself — returns a plan the caller writes back (same
+    "compute first, act separately" shape as build_batch), so this is
+    naturally safe to dry-run and to re-run repeatedly.
+
+    IMPORTANT CAVEAT: this assumes that stage's template Subject hasn't
+    been edited since it was actually sent. If you've since changed that
+    wording, the backfilled value will be wrong for leads sent under the
+    old one. There's no historical record of the exact subject actually
+    sent (SendLog doesn't store it) — re-rendering the current template is
+    a practical best effort, not a guarantee. For leads where getting this
+    exactly right matters, set ThreadSubject manually from your actual
+    sent mail instead.
+    """
+    stages = campaign_cfg["stages"]
+    results = []
+    for lead in leads:
+        lead_id = lead.get("LeadID", "")
+        if (lead.get("ThreadSubject") or "").strip():
+            results.append({"lead_id": lead_id, "status": "skipped_already_set"})
+            continue
+
+        sent_idx = None
+        for i in range(len(stages) - 1, -1, -1):
+            if (lead.get(stage_field_names(i)["sent_at"]) or "").strip():
+                sent_idx = i
+                break
+
+        if sent_idx is None:
+            results.append({"lead_id": lead_id, "status": "skipped_not_sent_yet"})
+            continue
+
+        fields = stage_field_names(sent_idx)
+        variant = (lead.get(fields["variant"]) or "").strip()
+        stage_label = stages[sent_idx]["name"]
+        if not variant:
+            results.append({"lead_id": lead_id, "status": "skipped_unknown_variant", "stage": stage_label})
+            continue
+
+        try:
+            tmpl = load_template(campaign_cfg["templates_dir"], stages[sent_idx]["template_prefix"], variant)
+            subject = render_text(tmpl["subject"], lead)
+        except Exception as exc:  # noqa: BLE001 - isolate per-lead template issues
+            results.append({"lead_id": lead_id, "status": "error", "stage": stage_label, "error": str(exc)})
+            continue
+
+        if not subject.strip():
+            # That stage's template has ITSELF since been changed to the
+            # new blank-subject convention — nothing to backfill from.
+            results.append({"lead_id": lead_id, "status": "skipped_template_now_blank", "stage": stage_label})
+            continue
+
+        results.append({"lead_id": lead_id, "status": "backfilled", "thread_subject": subject,
+                         "row": lead["_row"], "stage": stage_label})
+    return results
+
+
 def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_size: int,
                  forced_variant: Optional[str] = None, ignore_wait_days: bool = False) -> List[Dict]:
     """Computes eligible leads + assigns variants + renders emails WITHOUT
@@ -1982,6 +2048,40 @@ def cmd_send(args):
         print(f"  ERROR {r['email']}: [{r['error_type']}] {r['error']}")
 
 
+def cmd_backfill_thread_subject(args):
+    """One-time migration command — see backfill_thread_subjects' docstring
+    for exactly what this does and its accuracy caveat. Defaults to
+    --dry-run in the GitHub Actions workflow (not here in the raw CLI, to
+    match every other command's behavior of doing what you asked)."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    leads = sheets.get_all_leads()
+
+    results = backfill_thread_subjects(campaign_cfg, leads)
+    to_backfill = [r for r in results if r["status"] == "backfilled"]
+    skipped = [r for r in results if r["status"] not in ("backfilled",)]
+
+    action_word = "Would backfill" if args.dry_run else "Backfilling"
+    print(f"{action_word} ThreadSubject for {len(to_backfill)} lead(s).\n")
+    for r in to_backfill:
+        print(f"  Lead {r['lead_id']} (from {r['stage']}): {r['thread_subject']!r}")
+
+    if skipped:
+        print(f"\n{len(skipped)} lead(s) skipped (no action needed/possible):")
+        for r in skipped:
+            detail = f" ({r['stage']})" if r.get("stage") else ""
+            extra = f" — {r['error']}" if r.get("error") else ""
+            print(f"  Lead {r['lead_id']}: {r['status']}{detail}{extra}")
+
+    if args.dry_run:
+        print("\nDRY RUN — nothing was written. Re-run without --dry-run to actually write these.")
+        return
+
+    for r in to_backfill:
+        sheets.update_lead_fields(r["row"], {"ThreadSubject": r["thread_subject"]})
+    print(f"\nWrote ThreadSubject for {len(to_backfill)} lead(s).")
+
+
 def cmd_check_replies(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
@@ -2084,6 +2184,15 @@ def main():
     p_replies = sub.add_parser("check-replies", help="Check all configured inboxes for new replies/bounces")
     p_replies.add_argument("--campaign", required=True)
     p_replies.set_defaults(func=cmd_check_replies)
+
+    p_backfill = sub.add_parser("backfill-thread-subject",
+                                 help="One-time migration: fill in ThreadSubject for leads already mid-sequence "
+                                      "before that feature existed (see backfill_thread_subjects docstring for "
+                                      "exactly how, and its accuracy caveat)")
+    p_backfill.add_argument("--campaign", required=True)
+    p_backfill.add_argument("--dry-run", action="store_true",
+                             help="Show what would be backfilled without writing anything")
+    p_backfill.set_defaults(func=cmd_backfill_thread_subject)
 
     p_dash = sub.add_parser("dashboard", help="Recompute and write the dashboard tab(s)")
     p_dash.add_argument("--campaign", help="Campaign name (omit if using --all)")
