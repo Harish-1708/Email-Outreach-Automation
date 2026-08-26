@@ -74,6 +74,11 @@ MASTER_COLUMNS = [
     "Error",
     "MessageID",
     "ThreadReferences",
+    "ThreadSubject",           # Set automatically whenever a stage sends with a
+                                # non-blank Subject. Leave a template's Subject
+                                # line blank to continue this same thread
+                                # ("Re: <ThreadSubject>") instead of starting a
+                                # new one — see render_email / Section 5.
 ]
 # NOTE: this is the REQUIRED prefix of the Master header row. You may add
 # extra columns of your own AFTER these (e.g. "Industry", "JobTitle") and
@@ -658,11 +663,58 @@ def render_text(text: str, lead: Dict[str, str], missing_out: Optional[List[str]
     return PLACEHOLDER_RE.sub(_replace, text)
 
 
-def render_email(templates_dir: str, template_prefix: str, variant: str, lead: Dict[str, str]) -> Dict:
+def render_email(templates_dir: str, template_prefix: str, variant: str, lead: Dict[str, str],
+                  is_first_stage: bool = False) -> Dict:
+    """Renders subject + body. A template's Subject line can be left BLANK
+    to mean "continue the same thread" instead of starting a new one —
+    mirrors the same convention other outreach tools use. When blank:
+
+    - The outgoing subject becomes "Re: " + the lead's stored
+      ThreadSubject (the most recent NON-blank subject actually sent to
+      this lead), so Gmail/Outlook thread it together with the earlier
+      message instead of starting a new conversation. Already-"Re:"
+      subjects aren't double-prefixed.
+    - ThreadSubject itself is left unchanged (still continuing the same
+      original subject, not resetting it).
+
+    A non-blank Subject always "resets" ThreadSubject going forward to
+    whatever was actually rendered, so a later stage can deliberately
+    start a fresh subject/thread, and any stage after THAT can continue
+    from it with a blank Subject again.
+
+    is_first_stage=True (the very first stage in the sequence) can never
+    use a blank Subject — there's no previous thread to continue from a
+    first message, so this raises immediately rather than sending a blank
+    or guessed subject line.
+    """
     tmpl = load_template(templates_dir, template_prefix, variant)
     missing: List[str] = []
-    subject = render_text(tmpl["subject"], lead, missing_out=missing)
+    rendered_subject = render_text(tmpl["subject"], lead, missing_out=missing)
     body = render_text(tmpl["body"], lead, missing_out=missing)
+
+    is_continuation = False
+    if rendered_subject.strip():
+        subject = rendered_subject
+        thread_subject = rendered_subject
+    else:
+        if is_first_stage:
+            raise TemplateError(
+                f"{template_prefix}_{variant}.txt has a blank Subject line, but this is the FIRST stage "
+                "in the sequence — there's no previous thread to continue. Every first-stage template "
+                "needs a non-blank Subject."
+            )
+        existing_thread_subject = (lead.get("ThreadSubject") or "").strip()
+        if not existing_thread_subject:
+            raise TemplateError(
+                f"{template_prefix}_{variant}.txt has a blank Subject line (continue-the-thread), but "
+                f"lead '{lead.get('LeadID', '?')}' has no ThreadSubject recorded to continue from — this "
+                "usually means the lead was sent to before this feature existed. Either put a Subject in "
+                "this template, or fill in ThreadSubject manually in the Master Sheet for this lead."
+            )
+        subject = existing_thread_subject if existing_thread_subject.lower().startswith("re:") \
+            else f"Re: {existing_thread_subject}"
+        thread_subject = existing_thread_subject
+        is_continuation = True
 
     seen = set()
     deduped_missing = []
@@ -671,7 +723,8 @@ def render_email(templates_dir: str, template_prefix: str, variant: str, lead: D
             seen.add(name)
             deduped_missing.append(name)
 
-    return {"subject": subject, "body": body, "missing_variables": deduped_missing}
+    return {"subject": subject, "body": body, "missing_variables": deduped_missing,
+            "thread_subject": thread_subject, "is_continuation": is_continuation}
 
 
 # =============================================================================
@@ -1128,7 +1181,8 @@ def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_si
         else:
             variant = pick_variant(leads, fields["variant"], variants, batch_counts)
             batch_counts[variant] += 1
-        rendered = render_email(campaign_cfg["templates_dir"], stages[idx]["template_prefix"], variant, lead)
+        rendered = render_email(campaign_cfg["templates_dir"], stages[idx]["template_prefix"], variant, lead,
+                                 is_first_stage=(idx == 0))
 
         prior_message_id = lead.get("MessageID", "") if idx > 0 else ""
         prior_references = lead.get("ThreadReferences", "") if idx > 0 else ""
@@ -1143,6 +1197,7 @@ def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_si
             "subject": rendered["subject"], "body": rendered["body"],
             "missing_variables": rendered["missing_variables"],
             "in_reply_to": in_reply_to, "references": references,
+            "thread_subject": rendered["thread_subject"], "is_continuation": rendered["is_continuation"],
         })
     return plan
 
@@ -1270,6 +1325,7 @@ def _record_send_success(sheets: "SheetsConnector", campaign_name: str, batch_id
             "LastActionAt": now_str,
             "MessageID": sent["message_id"],
             "ThreadReferences": item["references"] or "",
+            "ThreadSubject": item["thread_subject"],
             "SenderAccount": account_name,
             "Error": "",
         })
@@ -1830,7 +1886,8 @@ def cmd_preview(args):
         if not is_valid_email_format(lead.get("Email", "")):
             print("          WARNING: this email address doesn't look correctly formatted.")
         print(f"Variant:  {item['variant']}")
-        print(f"Subject:  {item['subject']}")
+        print(f"Subject:  {item['subject']}"
+              + ("  (continuing existing thread)" if item["is_continuation"] else ""))
         print("-" * 70)
         print(item["body"])
         if item["missing_variables"]:
