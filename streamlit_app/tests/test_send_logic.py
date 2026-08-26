@@ -20,8 +20,18 @@ def test_build_send_inputs_minimal():
     inputs = build_send_inputs(campaign="Foo", stage="intro", batch_size=10)
     assert inputs == {
         "campaign": "Foo", "stage": "intro", "batch_size": "10",
-        "variant": "Auto", "confirm": "SEND",
+        "variant": "Auto", "confirm": "SEND", "ignore_wait_days": "false",
     }
+
+
+def test_build_send_inputs_ignore_wait_days_true():
+    inputs = build_send_inputs(campaign="Foo", stage="followup1", batch_size=10, ignore_wait_days=True)
+    assert inputs["ignore_wait_days"] == "true"
+
+
+def test_build_send_inputs_ignore_wait_days_defaults_false():
+    inputs = build_send_inputs(campaign="Foo", stage="followup1", batch_size=10)
+    assert inputs["ignore_wait_days"] == "false"
 
 
 def test_build_send_inputs_includes_overrides_only_when_set():
@@ -32,7 +42,7 @@ def test_build_send_inputs_includes_overrides_only_when_set():
     assert inputs["sender_rotation"] == "true"
 
 
-def test_build_send_inputs_omits_overrides_when_none():
+def test_build_send_inputs_omits_daily_limit_overrides_when_none():
     inputs = build_send_inputs(campaign="Foo", stage="intro", batch_size=10)
     assert "daily_limit" not in inputs
     assert "per_account_daily_limit" not in inputs
@@ -52,7 +62,13 @@ def test_build_send_inputs_always_includes_literal_send_confirm():
 def test_build_preview_inputs():
     assert build_preview_inputs("Foo", "intro", 5) == {
         "campaign": "Foo", "stage": "intro", "batch_size": "5", "variant": "Auto",
+        "ignore_wait_days": "false",
     }
+
+
+def test_build_preview_inputs_ignore_wait_days_true():
+    inputs = build_preview_inputs("Foo", "followup1", 5, ignore_wait_days=True)
+    assert inputs["ignore_wait_days"] == "true"
 
 
 def test_build_check_replies_inputs():
