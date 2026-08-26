@@ -279,9 +279,15 @@ with maintenance_tab:
         "New leads never need this: it's written automatically at every real send going forward."
     )
     st.caption(
-        "Reconstructs each lead's ThreadSubject from the CURRENT template content of their most "
-        "recently sent stage — accurate as long as that template's Subject line hasn't been edited "
-        "since it was actually sent."
+        "Reconstructs each lead's ThreadSubject from the CURRENT template content of the most recently "
+        "sent stage that actually had a real subject — automatically skipping past any more recent stage "
+        "that was itself sent using the blank-Subject convention. Accurate as long as that stage's "
+        "template hasn't been edited since it was actually sent."
+    )
+    st.warning(
+        "Prefer this over pasting a subject in manually — it's easy to accidentally copy the wrong "
+        "lead's or campaign's subject when they're worded similarly, and a wrong value won't show an "
+        "error, it'll just silently mis-thread that lead's next reply."
     )
 
     dry_run = st.checkbox("Dry run (preview only, don't write anything)", value=True, key="backfill_dry_run")
