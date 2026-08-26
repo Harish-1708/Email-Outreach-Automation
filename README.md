@@ -316,6 +316,22 @@ Best,
 [Your Name]
 ```
 
+**Leaving Subject blank continues the same thread instead of starting a new one** — for any stage after the first:
+
+```
+Subject: 
+
+Just following up on my last note, {{FirstName}} — did you get a chance to look?
+```
+
+When a stage's rendered Subject is blank, the outgoing email uses `Re: <ThreadSubject>` instead — where `ThreadSubject` is whichever subject line this lead was *actually* sent most recently (tracked automatically in the Master Sheet's `ThreadSubject` column, no setup needed). Gmail/Outlook then group it with the earlier message in the same conversation, rather than starting a new one — the same convention tools like Instantly use.
+
+A few things worth knowing:
+- This is entirely your choice, per stage, per variant — leave Subject blank where you want to continue the thread, write a real Subject anywhere you want to deliberately start a fresh one (e.g. a follow-up 3 that intentionally reframes with a new angle). A non-blank Subject "resets" `ThreadSubject` going forward, so anything after *that* stage can continue from the new one with a blank Subject again.
+- The very first stage (Intro) can never have a blank Subject — there's no previous thread to continue from a first message. A blank `intro_<variant>.txt` Subject fails loudly rather than guessing.
+- If a later stage has a blank Subject but a specific lead somehow has no `ThreadSubject` recorded (this can only happen for leads sent to before this feature existed), that lead fails loudly with a clear fix: either put a Subject in the template, or fill in `ThreadSubject` manually for that one row in the Master Sheet.
+- Preview and the CLI both show `(continuing existing thread)` next to any subject computed this way, so you can always see exactly what will go out before sending.
+
 **How variables resolve** — in this order:
 
 1. **Known variables** (`FirstName`, `LastName`, `CompanyName`, `Email`) —
@@ -386,7 +402,7 @@ side-by-side comparison across every campaign, written by `dashboard --all`.
 | `Status` | System | `Intro Sent`, `Stopped - Replied`, `Stopped - Bounced`, `Paused`, etc. |
 | `LastActionAt` | System | Timestamp of the most recent send/reply/bounce |
 | `Error` | System | Last error for this lead, if any |
-| `MessageID`, `ThreadReferences` | System | Email threading headers — see Section 9 |
+| `MessageID`, `ThreadReferences`, `ThreadSubject` | System | Email threading — see Section 6 (Subject continuation) and Section 9 |
 | *(any extra columns you add)* | You | Available as custom template variables — see Section 6 |
 
 ### Response Sheet
