@@ -125,14 +125,19 @@ else:
             variant_inputs = {}
             for letter in required_variants:
                 st.subheader(f"Variant {letter}")
-                subject = st.text_input(f"Subject ({letter})", key=f"stage_subject_{letter}")
+                subject = st.text_input(
+                    f"Subject ({letter}) — leave blank to continue the same thread as this lead's "
+                    "previous email instead of starting a new one",
+                    key=f"stage_subject_{letter}",
+                )
                 body = st.text_area(f"Body ({letter})", key=f"stage_body_{letter}", height=150)
                 variant_inputs[letter] = {"subject": subject, "body": body}
 
             if st.button("Open Pull Request", type="primary", key="add_stage_submit"):
                 errors = []
                 for letter, content in variant_inputs.items():
-                    content_error = validate_variant_content(content["subject"], content["body"])
+                    content_error = validate_variant_content(content["subject"], content["body"],
+                                                               is_first_stage=False)
                     if content_error:
                         errors.append(f"Variant {letter}: {content_error}")
 
