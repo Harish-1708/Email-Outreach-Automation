@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from send_logic import (
     confirmation_is_valid, build_send_inputs, build_preview_inputs, build_check_replies_inputs,
+    build_backfill_thread_subject_inputs,
 )
 
 
@@ -73,3 +74,12 @@ def test_build_preview_inputs_ignore_wait_days_true():
 
 def test_build_check_replies_inputs():
     assert build_check_replies_inputs("Foo") == {"campaign": "Foo"}
+
+
+def test_build_backfill_thread_subject_inputs_defaults_to_dry_run():
+    assert build_backfill_thread_subject_inputs("Foo") == {"campaign": "Foo", "dry_run": "true"}
+
+
+def test_build_backfill_thread_subject_inputs_can_disable_dry_run():
+    inputs = build_backfill_thread_subject_inputs("Foo", dry_run=False)
+    assert inputs["dry_run"] == "false"
