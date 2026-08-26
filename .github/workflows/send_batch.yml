@@ -43,6 +43,18 @@ on:
         required: true
         default: ""
 
+# Without this, two overlapping Send runs for the SAME campaign (e.g. one
+# triggered from Streamlit, another from the GitHub Actions UI, before the
+# first finishes) can both read the Master Sheet's eligibility state before
+# either has written anything back — meaning they could both pick the same
+# "eligible" leads and both actually send to them. Grouping by campaign
+# (not campaign+stage) also protects daily_limit, since that's counted
+# across all of a campaign's stages together. cancel-in-progress: false
+# means the second run QUEUES rather than being killed mid-send.
+concurrency:
+  group: send-batch-${{ github.event.inputs.campaign }}
+  cancel-in-progress: false
+
 jobs:
   guard:
     runs-on: ubuntu-latest
