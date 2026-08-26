@@ -30,6 +30,14 @@ def make_lead(**overrides):
         "IntroSentAt": "", "IntroVariant": "",
         "FollowUp1SentAt": "", "FollowUp1Variant": "",
         "MessageID": "", "ThreadReferences": "", "SenderAccount": "",
+        # Non-blank by default so tests that aren't specifically about the
+        # blank-subject continuation feature don't break if a real sample
+        # template (e.g. templates/Kelson_Creators_Licensing/followup1_*)
+        # is later edited to use a blank Subject — a legitimate, supported
+        # thing to do, and general-purpose tests shouldn't be coupled to
+        # that content staying non-blank. Tests that specifically exercise
+        # the blank-subject path already override this to "" explicitly.
+        "ThreadSubject": "Default Test Thread Subject",
     }
     lead.update(overrides)
     return lead
@@ -486,23 +494,38 @@ def test_backfill_uses_intro_when_only_intro_sent():
     assert results[0]["row"] == 2
 
 
-def test_backfill_uses_most_recently_sent_stage_not_intro():
+def test_backfill_uses_most_recently_sent_stage_not_intro(tmp_path):
     # Lead has BOTH intro and followup1 sent — the correct subject to
     # backfill from is followup1's (the most recent), not intro's. This is
     # the core regression this whole function exists to get right.
-    campaign_cfg = _base_campaign_cfg()
+    #
+    # Deliberately isolated synthetic templates here, NOT the real
+    # templates/Kelson_Creators_Licensing ones — those are meant to be
+    # freely editable (including legitimately using a blank Subject for
+    # continuation), and this test's assertion depends on a SPECIFIC
+    # stage having a SPECIFIC non-blank subject, which the real templates
+    # shouldn't be constrained to guarantee forever.
+    campaign_dir = tmp_path / "BackfillOrderCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: Intro subject\n\nBody.")
+    (campaign_dir / "followup1_B.txt").write_text("Subject: FollowUp1 subject\n\nBody.")
+
+    campaign_cfg = {
+        "templates_dir": str(campaign_dir), "variants": ["A", "B"],
+        "stages": [
+            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
+            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
+        ],
+    }
     lead = make_lead(_row=3, LeadID="L2", FirstName="Sam",
                       IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
                       FollowUp1SentAt="2026-08-05 09:00:00", FollowUp1Variant="B", ThreadSubject="")
 
     results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
 
-    expected_tmpl = outreach.load_template(TEMPLATES_DIR, "followup1", "B")
-    expected_subject = outreach.render_text(expected_tmpl["subject"], lead)
-
     assert results[0]["status"] == "backfilled"
     assert results[0]["stage"] == "followup1"
-    assert results[0]["thread_subject"] == expected_subject
+    assert results[0]["thread_subject"] == "FollowUp1 subject"
 
 
 def test_backfill_isolates_per_lead_template_errors(monkeypatch):
@@ -601,14 +624,21 @@ def test_backfill_returns_nothing_to_write_for_empty_lead_list():
 
 def test_all_20_templates_load_and_render_without_leftover_placeholders_even_with_blank_fields():
     # Deliberately blank FirstName/LastName/Company to prove optional fields
-    # never leak "{{...}}" into an outgoing email.
-    lead = {"FirstName": "", "LastName": "", "Company": "", "Email": "john@abc.com"}
+    # never leak "{{...}}" into an outgoing email. ThreadSubject is
+    # supplied so this test isn't coupled to whether any particular real
+    # template has chosen to use a blank Subject (continue-the-thread) —
+    # that's a legitimate, supported per-template choice, and this test's
+    # job is just "does everything render cleanly", not "does every
+    # template have its own subject".
+    lead = {"FirstName": "", "LastName": "", "Company": "", "Email": "john@abc.com",
+            "ThreadSubject": "Placeholder Original Subject"}
     stages = ["intro", "followup1", "followup2", "followup3", "followup4"]
     variants = ["A", "B", "C", "D"]
     count = 0
     for stage in stages:
         for variant in variants:
-            rendered = outreach.render_email(TEMPLATES_DIR, stage, variant, lead)
+            rendered = outreach.render_email(TEMPLATES_DIR, stage, variant, lead,
+                                               is_first_stage=(stage == "intro"))
             assert rendered["subject"], f"{stage}_{variant}: empty subject"
             assert "{{" not in rendered["subject"], f"{stage}_{variant}: unrendered var in subject"
             assert "{{" not in rendered["body"], f"{stage}_{variant}: unrendered var in body"
