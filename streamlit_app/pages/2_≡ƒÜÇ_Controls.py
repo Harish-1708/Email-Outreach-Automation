@@ -61,13 +61,20 @@ with preview_tab:
     stage = st.selectbox("Stage", STAGES, key="preview_stage")
     batch_size = st.number_input("Batch size", min_value=1, max_value=500, value=10, key="preview_batch_size")
     variant = st.selectbox("Variant", VARIANTS, key="preview_variant")
+    ignore_wait_days_preview = st.checkbox(
+        "Ignore the scheduled wait for this stage (e.g. send followup1 today even if its 3-day wait "
+        "hasn't elapsed)", key="preview_ignore_wait_days",
+        help="Every other rule still applies — the previous stage must actually have been sent, this "
+             "stage can't already be sent, Approval must be Yes, and no reply must have been received.",
+    )
 
     if st.button("Run Preview"):
         try:
             connector = _get_sheets_connector()
             campaign_cfg = get_campaign_cfg(campaign)
             leads = connector.get_all_leads(campaign_cfg["master_tab"])
-            plan = run_preview(campaign, stage, int(batch_size), leads, forced_variant=variant)
+            plan = run_preview(campaign, stage, int(batch_size), leads, forced_variant=variant,
+                                ignore_wait_days=ignore_wait_days_preview)
         except ReadOnlySheetsError as exc:
             st.warning(str(exc))
             plan = None
@@ -105,10 +112,21 @@ with send_tab:
                                                   key="send_per_account", help="0 = use config default")
         rotation_choice = st.selectbox("sender_rotation override", ["(use config default)", "true", "false"],
                                          key="send_rotation")
+        ignore_wait_days_send = st.checkbox(
+            "Ignore the scheduled wait for this stage (send now regardless of schedule)",
+            key="send_ignore_wait_days",
+            help="Every other rule still applies — the previous stage must actually have been sent, this "
+                 "stage can't already be sent, Approval must be Yes, and no reply must have been received.",
+        )
 
     st.warning(
         "This will send real emails. Run Preview for this exact batch first if you haven't already."
     )
+    if ignore_wait_days_send:
+        st.warning(
+            "⏱️ 'Ignore scheduled wait' is checked — leads not normally due for this stage yet will be "
+            "included, as long as every other rule still passes."
+        )
     confirm_text = st.text_input(
         'Type "SEND" to confirm (this is the same deliberate friction as the GitHub Actions workflow — '
         "typing it here does not skip anything, it's still required)",
@@ -124,6 +142,7 @@ with send_tab:
                 daily_limit=int(override_daily_limit) or None,
                 per_account_daily_limit=int(override_per_account) or None,
                 sender_rotation=(None if rotation_choice == "(use config default)" else rotation_choice == "true"),
+                ignore_wait_days=ignore_wait_days_send,
             )
             try:
                 client = _get_github_client()
