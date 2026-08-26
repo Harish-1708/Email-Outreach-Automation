@@ -145,6 +145,31 @@ def test_create_branch_raises_if_ref_lookup_fails(monkeypatch):
         _client().create_branch("add-campaign-foo")
 
 
+def test_create_branch_gives_actionable_message_on_already_exists_422(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get",
+                         lambda *a, **kw: _fake_response(200, {"object": {"sha": "abc123"}}))
+    monkeypatch.setattr(
+        github_client.requests, "post",
+        lambda *a, **kw: _fake_response(422, text='{"message":"Reference already exists"}'),
+    )
+    with pytest.raises(GitHubActionsError, match="leftover from a previous attempt"):
+        _client().create_branch("add-followup1-harish_testing_25aug")
+
+
+def test_create_branch_non_collision_422_uses_generic_message(monkeypatch):
+    # Some OTHER 422 (e.g. malformed ref name) shouldn't get the
+    # "leftover branch" explanation — that's specifically for the
+    # already-exists case, matched on the response text.
+    monkeypatch.setattr(github_client.requests, "get",
+                         lambda *a, **kw: _fake_response(200, {"object": {"sha": "abc123"}}))
+    monkeypatch.setattr(
+        github_client.requests, "post",
+        lambda *a, **kw: _fake_response(422, text='{"message":"Invalid ref name"}'),
+    )
+    with pytest.raises(GitHubActionsError, match="Failed to create branch"):
+        _client().create_branch("bad ref name")
+
+
 def test_create_file_encodes_content_as_base64(monkeypatch):
     captured = {}
 
