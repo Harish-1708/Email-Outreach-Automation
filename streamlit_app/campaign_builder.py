@@ -44,9 +44,15 @@ def validate_campaign_name(name: str, existing_campaigns: List[str]) -> Optional
     return None
 
 
-def validate_variant_content(subject: str, body: str) -> Optional[str]:
-    if not subject or not subject.strip():
-        return "Subject is required."
+def validate_variant_content(subject: str, body: str, is_first_stage: bool = True) -> Optional[str]:
+    """Subject is required for the FIRST stage only — outreach.py's own
+    render_email raises if a first-stage template has a blank Subject
+    (there's no previous thread to continue from a first message). For any
+    later stage, a blank Subject is a legitimate, deliberate choice: it
+    means "continue the existing thread" (Re: <previous subject>) instead
+    of starting a new one — see render_email's docstring in outreach.py."""
+    if is_first_stage and (not subject or not subject.strip()):
+        return "Subject is required for the first stage (there's no previous thread to continue from)."
     if not body or not body.strip():
         return "Body is required."
     return None
