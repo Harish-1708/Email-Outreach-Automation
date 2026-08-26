@@ -769,6 +769,23 @@ def is_valid_email_format(value: str) -> bool:
     return bool(EMAIL_FORMAT_RE.match((value or "").strip()))
 
 
+def find_duplicate_email_leads(leads: List[Dict]) -> Dict[str, List[Dict]]:
+    """{email: [lead, lead, ...]} for every email address appearing in MORE
+    THAN ONE Master Sheet row — always a data-entry mistake within a single
+    campaign (a copy-paste, or re-adding a lead under a new LeadID), never
+    a legitimate case. get_eligible_leads already protects against
+    actually sending to more than one of them regardless of whether this
+    warning is surfaced — this is purely for visibility, so the mistake
+    gets noticed and cleaned up rather than silently persisting."""
+    by_email: Dict[str, List[Dict]] = {}
+    for lead in leads:
+        email = (lead.get("Email") or "").strip().lower()
+        if not email:
+            continue
+        by_email.setdefault(email, []).append(lead)
+    return {email: rows for email, rows in by_email.items() if len(rows) > 1}
+
+
 def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
                         ignore_wait_days: bool = False) -> List[Dict]:
     this_sent_field = stage_field_names(stage_index)["sent_at"]
@@ -816,7 +833,23 @@ def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
         if now >= prev_sent_dt + timedelta(days=wait_days):
             eligible.append(lead)
 
-    return eligible
+    # De-duplicate by EMAIL ADDRESS, not row — the checks above only ever
+    # protect a single row against being sent to twice. If the same email
+    # exists as two separate rows (a copy-paste mistake, or re-adding a
+    # lead under a new LeadID), both rows independently pass every check
+    # and this would otherwise send the same person the same stage twice
+    # in the same run. Keeps the first (lowest row number) occurrence —
+    # see find_duplicate_email_leads for surfacing this as a warning
+    # rather than silently dropping it.
+    deduped = []
+    seen_emails = set()
+    for lead in eligible:
+        email = (lead.get("Email") or "").strip().lower()
+        if email in seen_emails:
+            continue
+        seen_emails.add(email)
+        deduped.append(lead)
+    return deduped
 
 
 # =============================================================================
@@ -1152,26 +1185,37 @@ def _count_sent_today_by_account(send_log: List[Dict]) -> Dict[str, int]:
 
 def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict]:
     """One-time migration helper: for every lead whose ThreadSubject is
-    blank but who was already mid-sequence before that column existed,
-    reconstructs it by re-rendering the subject of the MOST RECENTLY SENT
-    stage for that lead (walking stages from last to first) — every
-    template had a real, non-blank subject before the blank-means-
-    continue convention existed, so that stage's subject is exactly what
-    a later blank-subject continuation should be replying to.
+    blank, reconstructs it by re-rendering the subject of the most
+    recently sent stage that actually HAD a non-blank subject — walking
+    backward through sent stages (last to first) and skipping over any
+    that themselves used the blank-means-continue convention, since
+    there's nothing to extract from those. This handles both:
+
+    - Leads sent entirely before ThreadSubject existed (every stage had a
+      real subject — the very first one checked always works).
+    - Leads with a MIX of old real-subject stages and newer
+      blank-subject-continuation stages (e.g. Intro had a real subject,
+      but a later followup already used a blank Subject to continue it) —
+      those newer blank stages are skipped over rather than causing the
+      whole lookup to give up, since the real subject is still recoverable
+      from the stage before them.
 
     Never overwrites an already-set ThreadSubject, and never writes
     anything itself — returns a plan the caller writes back (same
     "compute first, act separately" shape as build_batch), so this is
     naturally safe to dry-run and to re-run repeatedly.
 
-    IMPORTANT CAVEAT: this assumes that stage's template Subject hasn't
-    been edited since it was actually sent. If you've since changed that
-    wording, the backfilled value will be wrong for leads sent under the
-    old one. There's no historical record of the exact subject actually
-    sent (SendLog doesn't store it) — re-rendering the current template is
-    a practical best effort, not a guarantee. For leads where getting this
-    exactly right matters, set ThreadSubject manually from your actual
-    sent mail instead.
+    IMPORTANT CAVEAT: this assumes the stage it ultimately finds hasn't
+    had its template Subject edited since it was actually sent. If you've
+    since changed that wording, the backfilled value will be wrong for
+    leads sent under the old one. There's no historical record of the
+    exact subject actually sent (SendLog doesn't store it) — re-rendering
+    the current template is a practical best effort, not a guarantee. For
+    leads where getting this exactly right matters, set ThreadSubject
+    manually from your actual sent mail instead — carefully: a
+    copy-pasted subject from the WRONG lead/campaign will "work" (no
+    error) but silently produce a mis-threaded reply, since nothing here
+    can verify a manually-entered value against what was really sent.
     """
     stages = campaign_cfg["stages"]
     results = []
@@ -1181,38 +1225,46 @@ def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict
             results.append({"lead_id": lead_id, "status": "skipped_already_set"})
             continue
 
-        sent_idx = None
-        for i in range(len(stages) - 1, -1, -1):
-            if (lead.get(stage_field_names(i)["sent_at"]) or "").strip():
-                sent_idx = i
-                break
+        sent_indices = [i for i in range(len(stages) - 1, -1, -1)
+                         if (lead.get(stage_field_names(i)["sent_at"]) or "").strip()]
 
-        if sent_idx is None:
+        if not sent_indices:
             results.append({"lead_id": lead_id, "status": "skipped_not_sent_yet"})
             continue
 
-        fields = stage_field_names(sent_idx)
-        variant = (lead.get(fields["variant"]) or "").strip()
-        stage_label = stages[sent_idx]["name"]
-        if not variant:
-            results.append({"lead_id": lead_id, "status": "skipped_unknown_variant", "stage": stage_label})
-            continue
+        found = None
+        skipped_blank_stages = []
+        last_error = None
+        last_error_stage = None
+        for idx in sent_indices:
+            fields = stage_field_names(idx)
+            variant = (lead.get(fields["variant"]) or "").strip()
+            stage_label = stages[idx]["name"]
+            if not variant:
+                continue  # try an earlier stage rather than giving up entirely
+            try:
+                tmpl = load_template(campaign_cfg["templates_dir"], stages[idx]["template_prefix"], variant)
+                subject = render_text(tmpl["subject"], lead)
+            except Exception as exc:  # noqa: BLE001 - isolate per-lead template issues, keep trying earlier stages
+                last_error, last_error_stage = str(exc), stage_label
+                continue
+            if not subject.strip():
+                skipped_blank_stages.append(stage_label)  # this one also used blank-continuation — try earlier
+                continue
+            found = {"subject": subject, "stage": stage_label, "row": lead["_row"]}
+            break
 
-        try:
-            tmpl = load_template(campaign_cfg["templates_dir"], stages[sent_idx]["template_prefix"], variant)
-            subject = render_text(tmpl["subject"], lead)
-        except Exception as exc:  # noqa: BLE001 - isolate per-lead template issues
-            results.append({"lead_id": lead_id, "status": "error", "stage": stage_label, "error": str(exc)})
-            continue
-
-        if not subject.strip():
-            # That stage's template has ITSELF since been changed to the
-            # new blank-subject convention — nothing to backfill from.
-            results.append({"lead_id": lead_id, "status": "skipped_template_now_blank", "stage": stage_label})
-            continue
-
-        results.append({"lead_id": lead_id, "status": "backfilled", "thread_subject": subject,
-                         "row": lead["_row"], "stage": stage_label})
+        if found is not None:
+            results.append({"lead_id": lead_id, "status": "backfilled", "thread_subject": found["subject"],
+                             "row": found["row"], "stage": found["stage"]})
+        elif last_error is not None:
+            results.append({"lead_id": lead_id, "status": "error", "stage": last_error_stage, "error": last_error})
+        elif skipped_blank_stages:
+            results.append({"lead_id": lead_id, "status": "skipped_template_now_blank",
+                             "stage": skipped_blank_stages[0]})
+        else:
+            results.append({"lead_id": lead_id, "status": "skipped_unknown_variant",
+                             "stage": stages[sent_indices[0]]["name"]})
     return results
 
 
@@ -1931,6 +1983,17 @@ def cmd_preview(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
     leads = sheets.get_all_leads()
+
+    duplicates = find_duplicate_email_leads(leads)
+    if duplicates:
+        print(f"WARNING: {len(duplicates)} email address(es) appear on more than one Master Sheet row — "
+              "only the first (lowest row number) of each is ever eligible; the rest are silently excluded "
+              "from sending, but should be cleaned up:")
+        for email_addr, rows in duplicates.items():
+            lead_ids = ", ".join(str(r.get("LeadID", "?")) for r in rows)
+            print(f"  {email_addr} — rows {[r['_row'] for r in rows]} (LeadIDs: {lead_ids})")
+        print()
+
     forced_variant = None if args.variant in (None, "Auto") else args.variant
     plan = build_batch(campaign_cfg, leads, args.stage, args.batch_size, forced_variant=forced_variant,
                         ignore_wait_days=args.ignore_wait_days)
@@ -1998,6 +2061,16 @@ def cmd_send(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
     accounts = load_email_accounts()
+
+    duplicates = find_duplicate_email_leads(sheets.get_all_leads())
+    if duplicates:
+        print(f"WARNING: {len(duplicates)} email address(es) appear on more than one Master Sheet row — "
+              "only the first (lowest row number) of each is ever eligible; the rest are silently excluded "
+              "from sending, but should be cleaned up:")
+        for email_addr, rows in duplicates.items():
+            lead_ids = ", ".join(str(r.get("LeadID", "?")) for r in rows)
+            print(f"  {email_addr} — rows {[r['_row'] for r in rows]} (LeadIDs: {lead_ids})")
+        print()
 
     try:
         overridden = apply_sending_overrides(campaign_cfg, args.daily_limit,
