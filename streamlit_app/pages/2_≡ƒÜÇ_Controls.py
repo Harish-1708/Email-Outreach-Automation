@@ -7,11 +7,13 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
-from config import WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES  # noqa: E402
+from config import WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg, run_preview  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector, ReadOnlySheetsError  # noqa: E402
-from send_logic import build_send_inputs, build_check_replies_inputs, confirmation_is_valid  # noqa: E402
+from send_logic import (  # noqa: E402
+    build_send_inputs, build_check_replies_inputs, build_backfill_thread_subject_inputs, confirmation_is_valid,
+)
 from replies_logic import most_recent_responses  # noqa: E402
 
 st.set_page_config(page_title="Controls", page_icon="🚀", layout="wide")
@@ -50,7 +52,8 @@ VARIANTS = ["Auto", "A", "B", "C", "D"]
 
 campaign = st.selectbox("Campaign", campaigns, key="controls_campaign")
 
-preview_tab, send_tab, replies_tab = st.tabs(["👀 Preview", "📤 Send", "📥 Check Replies"])
+preview_tab, send_tab, replies_tab, maintenance_tab = st.tabs(
+    ["👀 Preview", "📤 Send", "📥 Check Replies", "🔧 Maintenance"])
 
 # ---------------------------------------------------------------------------
 # Preview — runs directly in Streamlit. No GitHub Actions round trip, no
@@ -260,3 +263,56 @@ with replies_tab:
                              + ("" if stopped else " — sequence was NOT stopped for this lead"))
                     st.write(f"**Match method:** {r.get('MatchMethod', '')}")
                     st.text(r.get("Snippet", ""))
+
+# ---------------------------------------------------------------------------
+# Maintenance — one-time/occasional migration tools. Currently just the
+# ThreadSubject backfill, but this is where any future "fix up old data"
+# tool belongs, kept separate from the day-to-day Preview/Send/Check
+# Replies tabs.
+# ---------------------------------------------------------------------------
+with maintenance_tab:
+    st.subheader("Backfill ThreadSubject")
+    st.caption(
+        "For leads already mid-sequence before ThreadSubject existed — needed so a later stage's blank "
+        "Subject (\"continue the thread\") has something to continue from. Never overwrites an "
+        "already-set ThreadSubject, so this is safe to run more than once — it only fills gaps. "
+        "New leads never need this: it's written automatically at every real send going forward."
+    )
+    st.caption(
+        "Reconstructs each lead's ThreadSubject from the CURRENT template content of their most "
+        "recently sent stage — accurate as long as that template's Subject line hasn't been edited "
+        "since it was actually sent."
+    )
+
+    dry_run = st.checkbox("Dry run (preview only, don't write anything)", value=True, key="backfill_dry_run")
+
+    if st.button("Run Backfill"):
+        try:
+            client = _get_github_client()
+            inputs = build_backfill_thread_subject_inputs(campaign, dry_run=dry_run)
+            run_details = client.dispatch_workflow(WORKFLOW_BACKFILL_THREAD_SUBJECT, inputs)
+            if run_details is None:
+                time.sleep(2)
+                run_details = client.find_recent_run(WORKFLOW_BACKFILL_THREAD_SUBJECT)
+            if run_details:
+                st.session_state["last_backfill_run_id"] = run_details.get("id") or run_details.get("run_id")
+                st.session_state["last_backfill_run_url"] = run_details.get("html_url", "")
+            st.success(f"Triggered backfill for '{campaign}'" + (" (dry run)" if dry_run else "") + ".")
+        except GitHubActionsError as exc:
+            st.error(f"Failed to trigger backfill: {exc}")
+
+    backfill_run_id = st.session_state.get("last_backfill_run_id")
+    if backfill_run_id:
+        st.write(f"**Last triggered run:** [{backfill_run_id}]({st.session_state.get('last_backfill_run_url', '')})")
+        if st.button("🔄 Refresh run status", key="backfill_refresh_status"):
+            try:
+                run = _get_github_client().get_run(backfill_run_id)
+                status = run.get("status", "unknown")
+                conclusion = run.get("conclusion")
+                if status == "completed":
+                    st.success(f"Completed — conclusion: {conclusion}. Check the run's job summary on "
+                               "GitHub for exactly which leads were backfilled or skipped.")
+                else:
+                    st.info(f"Status: {status}")
+            except GitHubActionsError as exc:
+                st.error(f"Failed to fetch run status: {exc}")
