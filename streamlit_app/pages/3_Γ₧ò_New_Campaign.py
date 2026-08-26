@@ -1,4 +1,5 @@
 import os
+import secrets
 import sys
 
 import streamlit as st
@@ -80,7 +81,7 @@ if mode == "Create a new campaign (Intro)":
             try:
                 files = build_campaign_files(campaign_name, "intro", variant_inputs)
                 client = _get_github_client()
-                branch = branch_name_for_campaign(campaign_name, "intro")
+                branch = branch_name_for_campaign(campaign_name, "intro", suffix=secrets.token_hex(4))
                 pr = client.open_campaign_pull_request(
                     branch_name=branch,
                     files=files,
@@ -148,7 +149,7 @@ else:
                     try:
                         files = build_campaign_files(selected_campaign, stage_prefix, variant_inputs)
                         client = _get_github_client()
-                        branch = branch_name_for_campaign(selected_campaign, stage_prefix)
+                        branch = branch_name_for_campaign(selected_campaign, stage_prefix, suffix=secrets.token_hex(4))
                         pr = client.open_campaign_pull_request(
                             branch_name=branch,
                             files=files,
