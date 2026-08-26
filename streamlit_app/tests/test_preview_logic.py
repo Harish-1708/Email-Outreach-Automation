@@ -50,3 +50,19 @@ def test_run_preview_respects_forced_variant():
     }]
     plan = run_preview("Kelson_Creators_Licensing", "intro", 10, leads, forced_variant="C")
     assert plan[0]["variant"] == "C"
+
+
+def test_run_preview_ignore_wait_days_makes_not_yet_due_followup_visible():
+    from datetime import datetime
+
+    recent = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    leads = [{
+        "_row": 2, "LeadID": "L1", "Email": "jordan@example.com", "Approval": "Yes",
+        "IntroSentAt": recent, "IntroVariant": "A",
+    }]
+
+    plan_default = run_preview("Kelson_Creators_Licensing", "followup1", 10, leads)
+    assert plan_default == []  # not due yet under the campaign's normal wait_days
+
+    plan_override = run_preview("Kelson_Creators_Licensing", "followup1", 10, leads, ignore_wait_days=True)
+    assert len(plan_override) == 1
