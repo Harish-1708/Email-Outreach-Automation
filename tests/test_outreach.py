@@ -168,6 +168,74 @@ def test_stopped_status_is_excluded():
 
 
 # =============================================================================
+# get_eligible_leads / build_batch / send_batch — ignore_wait_days override
+# =============================================================================
+
+def test_ignore_wait_days_makes_not_yet_due_lead_eligible():
+    recent = datetime.now().strftime(FMT)  # intro sent moments ago — normally NOT due for 3 more days
+    not_yet_waited = make_lead(IntroSentAt=recent)
+    eligible = outreach.get_eligible_leads([not_yet_waited], STAGES, 1, ignore_wait_days=True)
+    assert eligible == [not_yet_waited]
+
+
+def test_ignore_wait_days_still_requires_previous_stage_actually_sent():
+    # The override skips the WAIT, never the requirement that the stage
+    # before it actually happened — stage order is never skippable.
+    never_sent_intro = make_lead(IntroSentAt="")
+    eligible = outreach.get_eligible_leads([never_sent_intro], STAGES, 1, ignore_wait_days=True)
+    assert eligible == []
+
+
+def test_ignore_wait_days_still_respects_every_other_eligibility_rule():
+    recent = datetime.now().strftime(FMT)
+    already_sent_this_stage = make_lead(IntroSentAt=recent, FollowUp1SentAt=recent)
+    replied = make_lead(IntroSentAt=recent, ReplyStatus="Replied")
+    stopped = make_lead(IntroSentAt=recent, Status="Stopped - Bounced")
+    not_approved = make_lead(IntroSentAt=recent, Approval="No")
+
+    eligible = outreach.get_eligible_leads(
+        [already_sent_this_stage, replied, stopped, not_approved], STAGES, 1, ignore_wait_days=True)
+    assert eligible == []
+
+
+def test_ignore_wait_days_defaults_to_false_unchanged_behavior():
+    recent = datetime.now().strftime(FMT)
+    not_yet_waited = make_lead(IntroSentAt=recent)
+    eligible = outreach.get_eligible_leads([not_yet_waited], STAGES, 1)  # no ignore_wait_days passed at all
+    assert eligible == []
+
+
+def test_build_batch_ignore_wait_days_passthrough(monkeypatch):
+    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
+        "subject": "S", "body": "B", "missing_variables": []})
+    recent = datetime.now().strftime(FMT)
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=2, IntroSentAt=recent)
+
+    plan_default = outreach.build_batch(campaign_cfg, [lead], "followup1", 10)
+    assert plan_default == []
+
+    plan_override = outreach.build_batch(campaign_cfg, [lead], "followup1", 10, ignore_wait_days=True)
+    assert len(plan_override) == 1
+
+
+def test_send_batch_ignore_wait_days_passthrough(monkeypatch):
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    recent = datetime.now().strftime(FMT)
+    campaign_cfg = _base_campaign_cfg()
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com", IntroSentAt=recent)
+    fake_sheets = FakeSheets([lead])
+
+    results_default = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "followup1", 10)
+    assert results_default == []
+
+    results_override = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "followup1", 10,
+                                            ignore_wait_days=True)
+    assert len(results_override) == 1
+    assert results_override[0]["status"] == "sent"
+
+
+# =============================================================================
 # Template rendering — optional fields get graceful defaults
 # =============================================================================
 
