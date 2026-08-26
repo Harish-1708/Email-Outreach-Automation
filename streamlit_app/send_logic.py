@@ -18,7 +18,8 @@ def confirmation_is_valid(typed_text: str) -> bool:
 def build_send_inputs(campaign: str, stage: str, batch_size: int, variant: str = "Auto",
                        daily_limit: Optional[int] = None,
                        per_account_daily_limit: Optional[int] = None,
-                       sender_rotation: Optional[bool] = None) -> Dict[str, str]:
+                       sender_rotation: Optional[bool] = None,
+                       ignore_wait_days: bool = False) -> Dict[str, str]:
     """Builds the exact input dict send_batch.yml's workflow_dispatch
     expects. All values are strings — GitHub Actions inputs are always
     strings regardless of the underlying type."""
@@ -28,6 +29,7 @@ def build_send_inputs(campaign: str, stage: str, batch_size: int, variant: str =
         "batch_size": str(batch_size),
         "variant": variant or "Auto",
         "confirm": REQUIRED_CONFIRM_TEXT,
+        "ignore_wait_days": "true" if ignore_wait_days else "false",
     }
     if daily_limit is not None:
         inputs["daily_limit"] = str(daily_limit)
@@ -38,7 +40,8 @@ def build_send_inputs(campaign: str, stage: str, batch_size: int, variant: str =
     return inputs
 
 
-def build_preview_inputs(campaign: str, stage: str, batch_size: int, variant: str = "Auto") -> Dict[str, str]:
+def build_preview_inputs(campaign: str, stage: str, batch_size: int, variant: str = "Auto",
+                          ignore_wait_days: bool = False) -> Dict[str, str]:
     """For triggering preview_batch.yml itself (optional — Streamlit's own
     in-app Preview via preview_logic.py is faster and doesn't need this,
     but some setups may still want the GitHub-run version as an audit
@@ -48,6 +51,7 @@ def build_preview_inputs(campaign: str, stage: str, batch_size: int, variant: st
         "stage": stage,
         "batch_size": str(batch_size),
         "variant": variant or "Auto",
+        "ignore_wait_days": "true" if ignore_wait_days else "false",
     }
 
 
