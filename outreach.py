@@ -716,7 +716,8 @@ def is_valid_email_format(value: str) -> bool:
     return bool(EMAIL_FORMAT_RE.match((value or "").strip()))
 
 
-def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int) -> List[Dict]:
+def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
+                        ignore_wait_days: bool = False) -> List[Dict]:
     this_sent_field = stage_field_names(stage_index)["sent_at"]
 
     prev_sent_field = None
@@ -746,6 +747,13 @@ def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int) 
 
         prev_sent_raw = lead.get(prev_sent_field, "")
         if not prev_sent_raw:
+            continue  # the PREVIOUS stage must actually have been sent — this
+                       # is stage ORDER, never skippable, unaffected by
+                       # ignore_wait_days (that only overrides the WAIT, not
+                       # the requirement that the previous stage happened)
+
+        if ignore_wait_days:
+            eligible.append(lead)
             continue
 
         prev_sent_dt = _parse_dt(prev_sent_raw)
@@ -1090,9 +1098,18 @@ def _count_sent_today_by_account(send_log: List[Dict]) -> Dict[str, int]:
 
 
 def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_size: int,
-                 forced_variant: Optional[str] = None) -> List[Dict]:
+                 forced_variant: Optional[str] = None, ignore_wait_days: bool = False) -> List[Dict]:
     """Computes eligible leads + assigns variants + renders emails WITHOUT
-    sending or writing anything. Safe to call repeatedly for preview."""
+    sending or writing anything. Safe to call repeatedly for preview.
+
+    ignore_wait_days=True skips ONLY the wait_days_after_previous timing
+    check for stages after the first — every other eligibility rule still
+    applies unchanged: Approval must be Yes, the lead can't be in a
+    terminal/replied state, this stage can't already be sent, and the
+    PREVIOUS stage must actually have been sent (stage order is never
+    skippable, only the wait between stages is overridable). This is the
+    "send this follow-up now regardless of schedule" override.
+    """
     stages = campaign_cfg["stages"]
     variants = campaign_cfg["variants"]
     idx = _stage_index(stages, stage_name)
@@ -1101,7 +1118,7 @@ def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_si
     if forced_variant is not None and forced_variant not in variants:
         raise ValueError(f"Variant '{forced_variant}' is not in campaign variants: {variants}")
 
-    eligible = get_eligible_leads(leads, stages, idx)[:batch_size]
+    eligible = get_eligible_leads(leads, stages, idx, ignore_wait_days=ignore_wait_days)[:batch_size]
 
     batch_counts = {v: 0 for v in variants}
     plan = []
@@ -1282,7 +1299,8 @@ def _record_send_success(sheets: "SheetsConnector", campaign_name: str, batch_id
 
 
 def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]],
-               stage_name: str, batch_size: int, forced_variant: Optional[str] = None) -> List[Dict]:
+               stage_name: str, batch_size: int, forced_variant: Optional[str] = None,
+               ignore_wait_days: bool = False) -> List[Dict]:
     """Sends the batch in CONCURRENT ROUNDS instead of one email at a time.
 
     Each round is built greedily so that no two jobs in it share a sender
@@ -1307,6 +1325,10 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     Log. Failures are isolated per lead and never abort the batch. A lead
     that can never be sent this run (unknown account, genuinely at
     capacity) is recorded immediately, without waiting for a round.
+
+    ignore_wait_days=True overrides ONLY the scheduled wait between stages
+    (e.g. send followup1 today even though it's not due for 3 more days) —
+    see build_batch's docstring for exactly what is and isn't skipped.
     """
     stages = campaign_cfg["stages"]
     sending_cfg = campaign_cfg["sending"]
@@ -1323,7 +1345,8 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     if effective_batch_size <= 0:
         return []
 
-    plan = build_batch(campaign_cfg, leads, stage_name, effective_batch_size, forced_variant=forced_variant)
+    plan = build_batch(campaign_cfg, leads, stage_name, effective_batch_size, forced_variant=forced_variant,
+                        ignore_wait_days=ignore_wait_days)
     if not plan:
         return []
 
@@ -1787,12 +1810,17 @@ def cmd_preview(args):
     sheets = _connect_sheets(campaign_cfg)
     leads = sheets.get_all_leads()
     forced_variant = None if args.variant in (None, "Auto") else args.variant
-    plan = build_batch(campaign_cfg, leads, args.stage, args.batch_size, forced_variant=forced_variant)
+    plan = build_batch(campaign_cfg, leads, args.stage, args.batch_size, forced_variant=forced_variant,
+                        ignore_wait_days=args.ignore_wait_days)
 
     if not plan:
         print(f"No eligible leads found for stage '{args.stage}'.")
         return
 
+    if args.ignore_wait_days:
+        print(f"NOTE: --ignore-wait-days is set — the scheduled wait for stage '{args.stage}' was skipped "
+              "for this preview. Every other eligibility rule (Approval, not already sent, previous stage "
+              "actually sent, no reply) still applied normally.\n")
     print(f"{len(plan)} eligible lead(s) for stage '{args.stage}':\n")
     for item in plan:
         lead = item["lead"]
@@ -1866,7 +1894,12 @@ def cmd_send(args):
     )
 
     forced_variant = None if args.variant in (None, "Auto") else args.variant
-    results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size, forced_variant=forced_variant)
+    if args.ignore_wait_days:
+        print(f"NOTE: --ignore-wait-days is set — the scheduled wait for stage '{args.stage}' will be "
+              "skipped for this run. Every other eligibility rule (Approval, not already sent, previous "
+              "stage actually sent, no reply) still applies normally.\n")
+    results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size, forced_variant=forced_variant,
+                          ignore_wait_days=args.ignore_wait_days)
 
     if not results:
         print(f"No eligible leads to send for stage '{args.stage}' "
@@ -1962,6 +1995,11 @@ def main():
     p_preview.add_argument("--batch-size", type=int, required=True)
     p_preview.add_argument("--variant", default="Auto",
                             help="Force a specific variant letter for the whole batch. Default: Auto")
+    p_preview.add_argument("--ignore-wait-days", action="store_true",
+                            help="Skip the scheduled wait for this stage (e.g. followup1's 3-day wait) "
+                                 "for THIS RUN ONLY. Every other eligibility rule still applies — the "
+                                 "previous stage must actually have been sent, this stage can't already "
+                                 "be sent, Approval must be Yes, and no reply must have been received.")
     p_preview.set_defaults(func=cmd_preview)
 
     p_send = sub.add_parser("send", help="Actually send a batch")
@@ -1970,6 +2008,11 @@ def main():
     p_send.add_argument("--batch-size", type=int, required=True)
     p_send.add_argument("--variant", default="Auto",
                          help="Force a specific variant letter for the whole batch. Default: Auto")
+    p_send.add_argument("--ignore-wait-days", action="store_true",
+                         help="Skip the scheduled wait for this stage (e.g. followup1's 3-day wait) "
+                              "for THIS RUN ONLY. Every other eligibility rule still applies — the "
+                              "previous stage must actually have been sent, this stage can't already "
+                              "be sent, Approval must be Yes, and no reply must have been received.")
     p_send.add_argument("--daily-limit", type=int, default=None,
                          help="Override sending.daily_limit for THIS RUN ONLY — never written to "
                               "campaigns.yaml. Omit to use the value from config.")
