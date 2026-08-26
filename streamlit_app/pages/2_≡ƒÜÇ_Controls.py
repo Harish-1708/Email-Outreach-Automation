@@ -90,7 +90,8 @@ with preview_tab:
                 for item in plan:
                     lead = item["lead"]
                     with st.expander(f"{lead.get('FirstName', '')} {lead.get('LastName', '')} <{lead.get('Email')}> — variant {item['variant']}"):
-                        st.write(f"**Subject:** {item['subject']}")
+                        st.write(f"**Subject:** {item['subject']}"
+                                 + (" _(continuing existing thread)_" if item["is_continuation"] else ""))
                         st.text(item["body"])
                         if item["missing_variables"]:
                             st.warning(f"Unrecognized template variable(s): {', '.join(item['missing_variables'])}")
