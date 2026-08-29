@@ -7,7 +7,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
-from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, TEMPLATES_ROOT  # noqa: E402
+from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, TEMPLATES_ROOT, CAMPAIGNS_DIR  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
@@ -28,6 +28,9 @@ from sequences_logic import (  # noqa: E402
 )
 from campaign_builder import (  # noqa: E402
     get_next_stage_for_campaign, build_campaign_files, validate_variant_content,
+)
+from settings_logic import (  # noqa: E402
+    load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -475,6 +478,66 @@ def _render_sequences_tab(campaign_cfg, leads):
                         st.error(f"Failed to add stage: {exc}")
 
 
+def _render_settings_tab(campaign_cfg):
+    campaign_name = campaign_cfg["_campaign_name"]
+    sending = campaign_cfg.get("sending", {})
+
+    account_directory = dict(st.secrets.get("email_accounts_directory", {}))
+    available_accounts = list(account_directory.keys())
+
+    st.subheader("Sender accounts")
+    if not available_accounts:
+        st.info(
+            "No accounts configured in Streamlit Secrets yet — add [email_accounts_directory] "
+            "(see the Email Accounts page) to pick specific accounts here. Sending will still use "
+            "whatever's configured directly in EMAIL_ACCOUNTS_JSON either way."
+        )
+        rotation_accounts = list(sending.get("rotation_accounts") or [])
+    else:
+        current_selection = [a for a in (sending.get("rotation_accounts") or []) if a in available_accounts]
+        rotation_accounts = st.multiselect(
+            "🔍 Search sender accounts", available_accounts, default=current_selection,
+            help="Leave empty to use every configured account for rotation.",
+        )
+        if st.button("Select all accounts"):
+            rotation_accounts = available_accounts
+
+    sender_rotation = st.checkbox("Rotate across multiple sender accounts", value=bool(sending.get("sender_rotation")))
+
+    st.divider()
+    st.subheader("Sending limits")
+    daily_limit = st.number_input("Daily limit (across all accounts)", min_value=1,
+                                   value=int(sending.get("daily_limit", 100)))
+    has_per_account_limit = st.checkbox("Set a per-account daily limit",
+                                         value=sending.get("per_account_daily_limit") is not None)
+    per_account_daily_limit = None
+    if has_per_account_limit:
+        per_account_daily_limit = st.number_input(
+            "Per-account daily limit", min_value=1,
+            value=int(sending.get("per_account_daily_limit") or 20),
+        )
+
+    st.divider()
+    if st.button("💾 Save Settings", type="primary"):
+        errors = validate_settings(daily_limit, per_account_daily_limit)
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            try:
+                raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+                updated = build_updated_override(raw_override, daily_limit, per_account_daily_limit,
+                                                  sender_rotation, rotation_accounts)
+                client = _get_github_client()
+                client.create_file(
+                    override_file_path(campaign_name), override_to_yaml_bytes(updated),
+                    message=f"Update settings for {campaign_name} (via Streamlit, by {current_user()})",
+                )
+                st.success("Settings saved.")
+            except GitHubActionsError as exc:
+                st.error(f"Save failed: {exc}")
+
+
 def _render_stub_tab(tab_name: str, phase_letter: str):
     st.info(
         f"**{tab_name} isn't built yet.** This is planned as Phase {phase_letter} — see the Campaigns Hub "
@@ -522,7 +585,7 @@ def _render_campaign_detail(campaign_name: str):
     with tabs[3]:
         _render_stub_tab("Schedule (timezone, window, days)", "E")
     with tabs[4]:
-        _render_stub_tab("Settings (senders, limits)", "F")
+        _render_settings_tab(campaign_cfg)
     with tabs[5]:
         _render_stub_tab("Responses (inbox, reply-from-app)", "H")
 
