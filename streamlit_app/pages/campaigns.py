@@ -49,7 +49,7 @@ from responses_reply_logic import (  # noqa: E402
 )
 from campaign_status_logic import (  # noqa: E402
     compute_campaign_status, compute_campaign_readiness, status_label,
-    STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_ATTENTION,
+    STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_ATTENTION, STATUS_COMPLETED,
 )
 from send_logic import (  # noqa: E402
     build_send_inputs, build_check_replies_inputs, build_backfill_thread_subject_inputs, confirmation_is_valid,
@@ -629,7 +629,7 @@ def _render_sequences_tab(campaign_cfg, leads):
     _render_maintenance_section_in_sequences(campaign_cfg)
 
 
-def _render_settings_tab(campaign_cfg):
+def _render_settings_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
     sending = campaign_cfg.get("sending", {})
 
@@ -703,7 +703,7 @@ def _render_settings_tab(campaign_cfg):
             except GitHubActionsError as exc:
                 st.error(f"Save failed: {exc}")
 
-    _render_send_section_in_settings(campaign_cfg)
+    _render_send_section_in_settings(campaign_cfg, leads)
 
 
 def _render_schedule_tab(campaign_cfg):
@@ -776,13 +776,22 @@ def _render_responses_tab(campaign_cfg, leads, responses):
     for response in sorted_responses:
         lead = find_lead_for_response(response, leads)
         label = f"{response.get('From', '(unknown sender)')} — {response.get('Subject', '(no subject)')}"
+        # ActionTaken is what actually happened — a "Logged Only (...)"
+        # outcome means the sequence was NOT stopped, even if
+        # Classification says "Genuine Reply" (that field only describes
+        # the message content, not what the system did about it).
+        # Surfacing both, clearly labeled, resolves an ambiguity the raw
+        # Sheet columns read confusingly side by side otherwise.
+        action = response.get("ActionTaken", "")
+        stopped = action == "Stopped Sequence"
+        icon = "🛑" if stopped else "📝"
         with st.container(border=True):
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.markdown(f"**{label}**")
+                st.markdown(f"{icon} **{label}**")
                 st.caption(f"{response.get('ReceivedAt', '')} · {response.get('Classification', '')}")
             with col2:
-                st.caption(response.get("ActionTaken", ""))
+                st.caption(action + ("" if stopped else " — sequence NOT stopped"))
             st.write(response.get("Snippet", ""))
 
             reply_key_suffix = response.get("ResponseID") or response.get("MessageID") or label
@@ -950,33 +959,49 @@ def _render_preview_tab(campaign_cfg, leads):
                                        f"{', '.join(item['missing_variables'])}")
 
 
-def _render_send_section_in_settings(campaign_cfg):
+def _render_send_section_in_settings(campaign_cfg, leads):
     """Called from the END of _render_settings_tab — sending config
     (limits, rotation) already lives there, so the actual Send action
-    belongs alongside it rather than in its own separate place."""
+    belongs alongside it rather than in its own separate place. Daily
+    limit, per-account limit, and sender rotation are NOT repeated here
+    as a separate "override" — Send always uses whatever's actually
+    configured just above; a second, parallel set of the same fields
+    would just invite them to drift out of sync with each other.
+
+    Only usable while the campaign is actually Running — matches
+    outreach.send_batch's own status guard (which blocks Draft and
+    Paused at the source, regardless of what this UI shows), so a
+    Completed or Attention-needed campaign is never even offered a Send
+    button that would just fail or no-op."""
     campaign_name = campaign_cfg["_campaign_name"]
     STAGES = ["intro", "followup1", "followup2", "followup3", "followup4"]
     VARIANTS = ["Auto", "A", "B", "C", "D"]
 
     st.divider()
     st.subheader("Send")
-    st.caption("Triggers the real `send_batch.yml` workflow — same safety checks, same typed confirmation.")
-    stage_s = st.selectbox("Stage", STAGES, key="campaigns_send_stage")
-    batch_size_s = st.number_input("Batch size", min_value=1, max_value=500, value=10,
-                                    key="campaigns_send_batch_size")
-    variant_s = st.selectbox("Variant", VARIANTS, key="campaigns_send_variant")
 
-    with st.expander("Advanced overrides (optional, this run only)"):
-        override_daily_limit = st.number_input("Override daily_limit", min_value=0, value=0,
-                                                 key="campaigns_send_daily_limit", help="0 = use config default")
-        override_per_account = st.number_input("Override per_account_daily_limit", min_value=0, value=0,
-                                                 key="campaigns_send_per_account", help="0 = use config default")
-        rotation_choice = st.selectbox("sender_rotation override", ["(use config default)", "true", "false"],
-                                        key="campaigns_send_rotation")
-        ignore_wait_days_send = st.checkbox(
-            "Ignore the scheduled wait for this stage (send now regardless of schedule)",
-            key="campaigns_send_ignore_wait_days",
-        )
+    status, _ = compute_campaign_status(campaign_cfg, leads)
+    if status != STATUS_RUNNING:
+        reason = {
+            STATUS_DRAFT: "Launch it above (in the header) to enable sending.",
+            STATUS_PAUSED: "Resume it above (in the header) to enable sending.",
+            STATUS_COMPLETED: "Every approved lead has already finished — there's nothing left to send.",
+            STATUS_ATTENTION: "Fix the issue shown above the tabs, then this switches to Running automatically.",
+        }.get(status, "")
+        st.info(f"Sending is only available while a campaign is {status_label(STATUS_RUNNING)} — this one "
+                f"is currently {status_label(status)}. {reason}")
+        return
+
+    st.caption(
+        "Triggers the real `send_batch.yml` workflow — same safety checks, same typed confirmation. Uses "
+        "the daily limit, per-account limit, and sender rotation set above, not a separate override."
+    )
+    stage_s = st.selectbox("Stage", STAGES, key="campaigns_send_stage")
+    variant_s = st.selectbox("Variant", VARIANTS, key="campaigns_send_variant")
+    ignore_wait_days_send = st.checkbox(
+        "Ignore the scheduled wait for this stage (send now regardless of schedule)",
+        key="campaigns_send_ignore_wait_days",
+    )
 
     st.warning("This will send real emails. Run Preview for this exact batch first if you haven't already.")
     confirm_text = st.text_input('Type "SEND" to confirm', key="campaigns_send_confirm_text")
@@ -985,12 +1010,14 @@ def _render_send_section_in_settings(campaign_cfg):
         if not confirmation_is_valid(confirm_text):
             st.error('You must type "SEND" (exact match) to confirm.')
         else:
+            # batch_size = "how many to attempt this run" — with no separate
+            # UI field for it anymore, defaulting to the campaign's own
+            # configured daily limit means one Send click naturally
+            # attempts up to the full day's allowance in one go, which is
+            # what "just send it" almost always means in practice.
+            batch_size = int(campaign_cfg.get("sending", {}).get("daily_limit", 100))
             inputs = build_send_inputs(
-                campaign=campaign_name, stage=stage_s, batch_size=int(batch_size_s), variant=variant_s,
-                daily_limit=int(override_daily_limit) or None,
-                per_account_daily_limit=int(override_per_account) or None,
-                sender_rotation=(None if rotation_choice == "(use config default)"
-                                  else rotation_choice == "true"),
+                campaign=campaign_name, stage=stage_s, batch_size=batch_size, variant=variant_s,
                 ignore_wait_days=ignore_wait_days_send,
             )
             try:
@@ -1151,7 +1178,7 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     with tabs[4]:
         _render_schedule_tab(campaign_cfg)
     with tabs[5]:
-        _render_settings_tab(campaign_cfg)
+        _render_settings_tab(campaign_cfg, leads)
     with tabs[6]:
         _render_responses_tab(campaign_cfg, leads, responses)
 
