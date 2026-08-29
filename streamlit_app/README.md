@@ -9,15 +9,13 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phase A + B of the Campaigns Hub
-  plan). Search, see every campaign's status at a glance, open one for a
-  detailed Analytics tab (per-stage, per-variant, per-sender breakdowns).
-  Status is one of: 📝 Draft, 🟢 Running, ⏸ Paused, ✅ Completed, ⚠️
-  Attention needed (readiness problems — no sender, no templates, or no
-  approved leads) — see the plan doc for exact definitions. The other
-  five tabs inside a campaign (Data, Sequences, Schedule, Settings,
-  Responses) are honest placeholders for now, not fake UI — each says
-  plainly which phase it's planned for.
+- **🗂️ Campaigns** — the everyday view (Phases A, B, and C of the Campaigns
+  Hub plan). Search, see every campaign's status at a glance, open one
+  for Analytics (per-stage, per-variant, per-sender breakdowns) and Data
+  (CSV upload with column mapping, a searchable/filterable lead table,
+  and soft-remove — never a hard delete). Sequences, Schedule, Settings,
+  and Responses are still honest placeholders — each says plainly which
+  phase it's planned for.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -94,6 +92,20 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **Leads are imported/removed via a commit-then-trigger-workflow
+  pattern**, same as template creation — Streamlit commits a JSON payload
+  file (`imports/<campaign>/...` or `removals/<campaign>/...`), then
+  triggers `import_leads.yml` / `remove_leads.yml`, which does the actual
+  Sheet write with the Editor-scoped credential and deletes the payload
+  file afterward. Streamlit itself never gets Sheets write access, here
+  or anywhere else in this app.
+- **Removing a lead never deletes anything.** It sets `Status = Removed`
+  — the row, and everything ever sent to that lead, stays intact. A
+  removed lead is simply excluded from all future eligibility checks.
+- **New leads always start as Pending approval**, even if your CSV had an
+  "Approval" column you didn't map — approve them in the Data tab (or the
+  Master Sheet directly) before they're eligible to send.
 
 - **The Campaigns Hub's Data/Sequences/Schedule/Settings/Responses tabs
   are placeholders.** Only Analytics is real. Use Controls/New Campaign
