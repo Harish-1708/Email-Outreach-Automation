@@ -443,6 +443,59 @@ def test_email_accounts_page_warns_when_no_directory_configured():
     assert "No accounts configured" in warning_texts
 
 
+def test_email_accounts_page_shows_connection_status_when_health_data_exists():
+    fake_ws = {
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Email Accounts Health": FakeWorksheet([
+            {"AccountName": "sales1", "Address": "sales1@example.com", "Status": "Connected",
+             "Detail": "", "CheckedAt": "2026-08-29 12:00:00"},
+            {"AccountName": "sales2", "Address": "sales2@example.com", "Status": "Disconnected",
+             "Detail": "AUTHENTICATIONFAILED", "CheckedAt": "2026-08-29 12:00:00"},
+        ]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    secrets = _dashboard_secrets()
+    secrets["email_accounts_directory"] = {"sales1": "sales1@example.com", "sales2": "sales2@example.com"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+    assert list(at.exception) == [], f"Email Accounts page raised: {list(at.exception)}"
+    assert list(at.error) == []
+    caption_texts = " ".join(c.value for c in at.caption)
+    assert "🟢 Connected" in caption_texts
+    assert "🔴 Disconnected" in caption_texts
+    assert "AUTHENTICATIONFAILED" in caption_texts  # the disconnection reason shown, plainly
+
+
+def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
+    """A brand new deployment, before check_account_health.yml has ever
+    run — must show 'Unknown', not an error, and explain why."""
+    fake_ws = {"Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([])}  # no health tab at all
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    secrets = _dashboard_secrets()
+    secrets["email_accounts_directory"] = {"sales1": "sales1@example.com"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    caption_texts = " ".join(c.value for c in at.caption)
+    assert "⚪ Unknown" in caption_texts
+    assert "runs automatically every 2 hours" in caption_texts
+
+
 def _campaigns_page_fake_ws():
     return {
         "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
