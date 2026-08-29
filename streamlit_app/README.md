@@ -9,14 +9,12 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phases A–D of the Campaigns Hub
-  plan). Search, see every campaign's status at a glance, open one for
-  Analytics (per-stage/variant/sender breakdowns), Data (CSV import with
-  mapping, lead table, soft-remove), and Sequences (edit existing
-  templates — locked by default, one batched Save commit for everything
-  changed; add a new variant across every stage at once, since variants
-  are campaign-wide not per-stage; add a follow-up stage). Schedule,
-  Settings, and Responses are still honest placeholders.
+- **🗂️ Campaigns** — the everyday view (Phases A–D and F of the Campaigns
+  Hub plan). Search, see every campaign's status at a glance, open one
+  for Analytics, Data, Sequences, and Settings (sender selection, daily
+  limits — saved to the campaign's config file, preserving everything
+  else already in it). Schedule and Responses are still honest
+  placeholders.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -93,6 +91,15 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **`create_file` now correctly handles updating files that already
+  exist** (fetches the current SHA first, as GitHub's API requires) —
+  this was a latent bug from Phase D that Phase F's settings-file
+  overwrites would have hit immediately; fixed retroactively for both.
+- **Settings are saved to the campaign's config override file**
+  (`config/campaigns/<name>.yaml`), touching only the `sending` key —
+  `status`, `schedule`, and anything else already in that file survive a
+  Settings save untouched.
 
 - **Variants are campaign-wide, not per-stage.** Every stage must offer
   the exact same variant letters (a hard rule in `outreach.py` itself —
