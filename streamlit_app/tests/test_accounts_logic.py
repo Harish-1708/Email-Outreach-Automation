@@ -3,7 +3,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from accounts_logic import aggregate_sent_today_by_account, build_account_rows, build_health_lookup
+from accounts_logic import (
+    aggregate_sent_today_by_account, build_account_rows, build_health_lookup, merge_account_directories,
+)
 from datetime import datetime
 
 TODAY = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -118,3 +120,36 @@ def test_build_account_rows_shows_disconnected_detail():
     rows = build_account_rows(directory, {}, default_account="sales1", health_lookup=health_lookup)
     assert rows[0]["status"] == "Disconnected"
     assert rows[0]["status_detail"] == "AUTHENTICATIONFAILED"
+
+
+def test_merge_account_directories_combines_both_sources():
+    streamlit_secret = {"legacy_account": "legacy@x.com"}
+    slot_mapping = {"new_account": {"slot": 1, "address": "new@x.com"}}
+    merged = merge_account_directories(streamlit_secret, slot_mapping)
+    assert merged == {"legacy_account": "legacy@x.com", "new_account": "new@x.com"}
+
+
+def test_merge_account_directories_slot_mapping_wins_on_collision():
+    """The real invariant: an account edited via the app (only ever
+    touches the slot mapping) must show its CURRENT address, not a stale
+    one Streamlit's own secret still has because nothing keeps it synced."""
+    streamlit_secret = {"sales1": "old_address@x.com"}
+    slot_mapping = {"sales1": {"slot": 1, "address": "new_address@x.com"}}
+    merged = merge_account_directories(streamlit_secret, slot_mapping)
+    assert merged["sales1"] == "new_address@x.com"
+
+
+def test_merge_account_directories_empty_slot_mapping_unchanged():
+    streamlit_secret = {"sales1": "a@x.com"}
+    merged = merge_account_directories(streamlit_secret, {})
+    assert merged == {"sales1": "a@x.com"}
+
+
+def test_merge_account_directories_empty_streamlit_secret():
+    slot_mapping = {"sales1": {"slot": 1, "address": "a@x.com"}}
+    merged = merge_account_directories({}, slot_mapping)
+    assert merged == {"sales1": "a@x.com"}
+
+
+def test_merge_account_directories_both_empty():
+    assert merge_account_directories({}, {}) == {}
