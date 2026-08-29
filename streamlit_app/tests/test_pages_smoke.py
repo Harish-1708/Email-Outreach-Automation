@@ -502,7 +502,10 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
     assert "1" in metric_values  # Total Leads == 1
 
 
-def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
+def test_campaigns_detail_view_has_no_remaining_stub_tabs():
+    """All six tabs are real now (A through H complete) — this replaces
+    the earlier per-phase 'is this tab honestly still a stub' check,
+    which no longer applies once nothing is a stub."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -516,8 +519,7 @@ def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
 
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
-    assert "isn't built yet" in info_texts
-    assert "Phase H" in info_texts  # Responses — the only one left as a stub now
+    assert "isn't built yet" not in info_texts
 
 
 def test_campaigns_back_button_clears_selected_campaign():
@@ -1446,6 +1448,170 @@ def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_aw
 
     assert list(at.exception) == []
     assert not any(b.label == "Confirm Launch" for b in at.button)
+
+
+def _responses_tab_fake_ws():
+    return {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [{"LeadID": "5", "Email": "lead@abc.com", "Approval": "Yes", "SenderAccount": "sales1",
+              "ThreadReferences": "<our1@mail.gmail.com>", "Status": "Stopped - Replied"}]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet(
+            [{"ResponseID": "r1", "LeadID": "5", "From": "lead@abc.com", "Subject": "Re: Hi there",
+              "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
+              "MessageID": "<inbound1@mail.gmail.com>", "ReceivedAt": "2026-08-28 18:07:00",
+              "ActionTaken": "Stopped Sequence"}]
+        ),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+
+
+def test_responses_tab_shows_response_with_prefilled_reply_form():
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Responses tab raised: {list(at.exception)}"
+    assert list(at.error) == []
+    reply_inputs = {ti.label: ti.value for ti in at.text_input if ti.key and "reply_" in ti.key}
+    assert reply_inputs["To"] == "lead@abc.com"
+    assert reply_inputs["Subject"] == "Re: Hi there"
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "lead@abc.com" in markdown_text
+
+
+def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow():
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
+        body_input.set_value("Thanks for your interest! Here is more info.")
+        at.run(timeout=15)
+
+        send_button = next(b for b in at.button if b.key and "send_reply" in b.key)
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Send reply raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["workflow"] == "send_reply.yml"
+    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    commit = captured["commits"][0]
+    assert commit["path"].startswith("replies/Kelson_Creators_Licensing/")
+
+    import json
+    payload = json.loads(commit["content"].decode("utf-8"))
+    assert payload["to"] == "lead@abc.com"
+    assert payload["sender_account"] == "sales1"
+    assert payload["in_reply_to"] == "<inbound1@mail.gmail.com>"
+    assert payload["references"] == "<our1@mail.gmail.com> <inbound1@mail.gmail.com>"
+    assert payload["body"] == "Thanks for your interest! Here is more info."
+
+
+def test_responses_tab_send_reply_rejects_blank_body_without_committing():
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        # Leave body blank entirely — click Send Reply as-is.
+        send_button = next(b for b in at.button if b.key and "send_reply" in b.key)
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert captured.get("commits") is None
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Body is required" in error_texts
+
+
+def test_responses_tab_send_reply_with_cc_and_bcc():
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        cc_input = next(ti for ti in at.text_input if ti.key and "reply_cc" in ti.key)
+        cc_input.set_value("manager@abc.com")
+        bcc_input = next(ti for ti in at.text_input if ti.key and "reply_bcc" in ti.key)
+        bcc_input.set_value("audit@abc.com")
+        body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
+        body_input.set_value("Looping you in.")
+        at.run(timeout=15)
+
+        send_button = next(b for b in at.button if b.key and "send_reply" in b.key)
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    import json
+    payload = json.loads(captured["commits"][0]["content"].decode("utf-8"))
+    assert payload["cc"] == ["manager@abc.com"]
+    assert payload["bcc"] == ["audit@abc.com"]
+
+
+def test_responses_tab_shows_info_when_no_responses_yet():
+    fake_ws = _responses_tab_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    info_texts = " ".join(i.value for i in at.info)
+    assert "No responses yet" in info_texts
 
 
 def test_login_lockout_after_repeated_failures():
