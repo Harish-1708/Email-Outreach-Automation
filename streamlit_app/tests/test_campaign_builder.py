@@ -6,8 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from campaign_builder import (
     validate_campaign_name, validate_variant_content, build_template_file_content,
-    build_campaign_files, get_next_stage_for_campaign, branch_name_for_campaign,
-    pr_title_for_campaign, pr_body_for_campaign,
+    build_campaign_files, get_next_stage_for_campaign, commit_message_for_campaign,
 )
 
 TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
@@ -158,41 +157,22 @@ def test_get_next_stage_requires_exact_variant_match_downstream(tmp_path):
         outreach.discover_stages_and_variants(str(campaign_dir), stage_wait_days={})
 
 
-def test_branch_and_pr_naming_new_campaign():
-    assert branch_name_for_campaign("MyCampaign", "intro") == "add-intro-mycampaign"
-    assert pr_title_for_campaign("MyCampaign", "intro", is_new_campaign=True) == "Add campaign: MyCampaign"
+def test_commit_message_for_new_campaign_mentions_campaign_variant_count_and_creator():
+    msg = commit_message_for_campaign("MyCampaign", "intro", 2, "alice", is_new_campaign=True)
+    assert "MyCampaign" in msg
+    assert "2 Intro variant" in msg
+    assert "alice" in msg
 
 
-def test_branch_and_pr_naming_add_stage():
-    assert branch_name_for_campaign("MyCampaign", "followup1") == "add-followup1-mycampaign"
-    assert pr_title_for_campaign("MyCampaign", "followup1", is_new_campaign=False) == \
-        "Add followup1 to campaign: MyCampaign"
+def test_commit_message_for_add_stage_mentions_stage_not_campaign_wording():
+    msg = commit_message_for_campaign("MyCampaign", "followup1", 2, "alice", is_new_campaign=False)
+    assert "followup1" in msg
+    assert "MyCampaign" in msg
+    assert "alice" in msg
+    assert "Add campaign:" not in msg  # distinct wording from the new-campaign case
 
 
-def test_branch_name_with_suffix_appends_it():
-    assert branch_name_for_campaign("MyCampaign", "intro", suffix="ab12cd34") == \
-        "add-intro-mycampaign-ab12cd34"
-
-
-def test_branch_name_two_calls_with_different_suffixes_never_collide():
-    # This is the actual regression this covers: a fully deterministic
-    # branch name collides with any leftover branch from a PREVIOUS
-    # attempt (closed PR, abandoned attempt, merge that didn't auto-delete
-    # its branch) and GitHub's create-branch API rejects the duplicate ref
-    # with a 422. Different suffixes must always produce different names.
-    first = branch_name_for_campaign("MyCampaign", "followup1", suffix="aaaaaaaa")
-    second = branch_name_for_campaign("MyCampaign", "followup1", suffix="bbbbbbbb")
-    assert first != second
-
-
-def test_pr_body_mentions_creator_and_variant_count_new_campaign():
-    body = pr_body_for_campaign("MyCampaign", "intro", 2, "alice", is_new_campaign=True)
-    assert "alice" in body
-    assert "2 Intro variant" in body
-
-
-def test_pr_body_mentions_stage_for_add_stage():
-    body = pr_body_for_campaign("MyCampaign", "followup1", 2, "alice", is_new_campaign=False)
-    assert "followup1" in body
-    assert "existing" in body
-    assert "alice" in body
+def test_commit_message_new_campaign_and_add_stage_are_distinguishable():
+    new_msg = commit_message_for_campaign("Foo", "intro", 1, "bob", is_new_campaign=True)
+    stage_msg = commit_message_for_campaign("Foo", "followup1", 1, "bob", is_new_campaign=False)
+    assert new_msg != stage_msg
