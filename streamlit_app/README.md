@@ -9,12 +9,13 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phases A–G of the Campaigns Hub
-  plan). Search, create a new campaign inline, see every campaign's
-  status at a glance, open one for Analytics, Data, Sequences, Schedule,
-  and Settings, and control its lifecycle directly: Launch a Draft
-  (with a confirmation step), Pause a Running campaign, Resume a Paused
-  one. Only Responses is still a placeholder.
+- **🗂️ Campaigns** — the everyday view. Every phase (A–H) is now real:
+  search, create a campaign inline, see status at a glance, Launch/Pause/
+  Resume, and inside a campaign: Analytics, Data, Sequences, Schedule,
+  Settings, and Responses (reply directly from the app — plain text with
+  Cc/Bcc, correctly threaded into the same conversation). Images in a
+  reply, a fuller quoted-thread view, and scheduling a reply for later
+  are deliberately not built yet — see below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -91,6 +92,24 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **Replying is plain text only for now.** Images and a fuller quoted
+  email-thread view (like a real inbox shows) aren't built — this only
+  shows the response's snippet and lets you send a plain-text reply. Cc,
+  Bcc, and correct threading (the lead's client shows your reply in the
+  same conversation) all work today.
+- **No "schedule a reply for later."** Every reply sends within a minute
+  or two of clicking Send — there's no deferred/scheduled send yet. That
+  would need a genuinely new subsystem (a pending-sends store plus a
+  periodic checker), deliberately left for later rather than bolted on.
+- **Every GitHub Actions workflow that pipes its output through `tee`
+  now uses `set -o pipefail` first.** Without it, `command | tee file`
+  reports the exit code of `tee` (which almost always succeeds), not
+  `command` — meaning a real crash or failure inside `outreach.py` could
+  previously show as a green checkmark in the Actions tab. Found while
+  building the reply-send workflow (which specifically needed a correct
+  non-zero exit on failure) and fixed retroactively across every
+  existing workflow, including `send_batch.yml`.
 
 - **Launch/Pause/Resume are never gated by campaign readiness.** The
   readiness check (no sender configured, no templates, no approved
