@@ -2338,6 +2338,113 @@ def test_load_email_accounts_rejects_incomplete_entry(monkeypatch):
 
 
 # =============================================================================
+# Email account slots — the safe per-account secret model. Every test
+# explicitly clears all slot env vars first/via monkeypatch's own
+# isolation, so these never depend on what's left over from another test.
+# =============================================================================
+
+def _clear_all_slots(monkeypatch):
+    for i in range(1, outreach.EMAIL_ACCOUNT_SLOT_COUNT + 1):
+        monkeypatch.delenv(f"EMAIL_ACCOUNT_SLOT_{i}", raising=False)
+
+
+def test_load_accounts_from_slots_empty_when_none_set(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    assert outreach._load_email_accounts_from_slots() == {}
+
+
+def test_load_accounts_from_slots_single_slot(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
+                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
+    accounts = outreach._load_email_accounts_from_slots()
+    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
+
+
+def test_load_accounts_from_slots_multiple_slots(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
+                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_3",
+                        '{"name": "sales2", "address": "sales2@gmail.com", "app_password": "yyyy"}')
+    accounts = outreach._load_email_accounts_from_slots()
+    assert set(accounts.keys()) == {"sales1", "sales2"}
+
+
+def test_load_accounts_from_slots_skips_empty_string_slots(monkeypatch):
+    """A slot set to an empty string (as opposed to fully unset) — e.g.
+    a secret that was cleared but the env var mechanism still defines it
+    as "" — must be silently skipped, not treated as a populated account."""
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", "")
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_2",
+                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
+    accounts = outreach._load_email_accounts_from_slots()
+    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
+
+
+def test_load_accounts_from_slots_invalid_json_raises_clear_error(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", "not valid json{{{")
+    with pytest.raises(RuntimeError, match="EMAIL_ACCOUNT_SLOT_1"):
+        outreach._load_email_accounts_from_slots()
+
+
+def test_load_accounts_from_slots_missing_field_raises(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", '{"name": "sales1", "address": "sales1@gmail.com"}')  # no app_password
+    with pytest.raises(RuntimeError, match="missing 'app_password'"):
+        outreach._load_email_accounts_from_slots()
+
+
+def test_load_email_accounts_slots_only_no_json_blob(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.delenv("EMAIL_ACCOUNTS_JSON", raising=False)
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
+                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
+    accounts = outreach.load_email_accounts()
+    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
+
+
+def test_load_email_accounts_json_only_no_slots_unchanged_behavior(monkeypatch):
+    """The exact backward-compat guarantee — zero slots set, only the
+    legacy blob, must behave identically to before this feature existed."""
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON", '{"sales1": {"address": "a@b.com", "app_password": "xxxx"}}')
+    accounts = outreach.load_email_accounts()
+    assert accounts == {"sales1": {"address": "a@b.com", "app_password": "xxxx"}}
+
+
+def test_load_email_accounts_merges_slots_and_json_blob(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON", '{"sales_legacy": {"address": "legacy@b.com", "app_password": "old"}}')
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
+                        '{"name": "sales_new", "address": "new@gmail.com", "app_password": "new_pass"}')
+    accounts = outreach.load_email_accounts()
+    assert set(accounts.keys()) == {"sales_legacy", "sales_new"}
+
+
+def test_load_email_accounts_slot_wins_over_same_named_json_entry(monkeypatch):
+    """The migration invariant that matters most: editing an account via
+    a slot must take effect immediately, even while the same account name
+    still lingers (stale) in EMAIL_ACCOUNTS_JSON during the transition."""
+    _clear_all_slots(monkeypatch)
+    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON",
+                        '{"sales1": {"address": "sales1@gmail.com", "app_password": "OLD_PASSWORD"}}')
+    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
+                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "NEW_PASSWORD"}')
+    accounts = outreach.load_email_accounts()
+    assert accounts["sales1"]["app_password"] == "NEW_PASSWORD"
+
+
+def test_load_email_accounts_raises_when_neither_slots_nor_json_set(monkeypatch):
+    _clear_all_slots(monkeypatch)
+    monkeypatch.delenv("EMAIL_ACCOUNTS_JSON", raising=False)
+    with pytest.raises(RuntimeError, match="No email accounts configured"):
+        outreach.load_email_accounts()
+
+
+# =============================================================================
 # is_valid_email_format
 # =============================================================================
 
