@@ -16,6 +16,7 @@ See README.md for full setup (Google Sheet + service account + App Passwords).
 """
 
 import argparse
+import base64
 import concurrent.futures
 import email
 import imaplib
@@ -31,6 +32,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.header import decode_header
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from email.utils import make_msgid, formatdate, parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -193,6 +197,15 @@ class SenderCapacityReachedError(ValueError):
     chosen manually, via rotation, or via the single default) has already
     hit its per-account daily limit. Not a fault — the lead is deferred to
     a later run, not treated as failed."""
+    pass
+
+
+class AttachmentTooLargeError(ValueError):
+    """Raised by send_manual_reply when the combined size of every
+    attachment exceeds MAX_TOTAL_ATTACHMENT_BYTES — a safety cap well
+    under what mainstream mail providers reject outright, chosen partly
+    to keep the committed base64-encoded payload file (roughly 1.33x the
+    raw size) a reasonable size for a single git commit."""
     pass
 
 
@@ -1119,8 +1132,25 @@ def resolve_sender_account_for_send(lead: Dict, campaign_cfg: Dict, accounts: Di
 
 def _build_outbound_message(sender_address: str, to: str, subject: str, body_text: str,
                              in_reply_to: Optional[str] = None, references: Optional[str] = None,
-                             cc: Optional[List[str]] = None):
-    msg = MIMEText(body_text)
+                             cc: Optional[List[str]] = None, attachments: Optional[List[Dict]] = None):
+    """attachments: [{"filename": str, "content": bytes}, ...] — sent as
+    regular email attachments (not inline/embedded HTML images; that
+    would need a whole HTML-body path this codebase doesn't have). When
+    empty/None, builds the exact same plain MIMEText message as before
+    this feature existed — every existing caller (every automated
+    send) never passes attachments, so their message shape is completely
+    unchanged."""
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body_text))
+        for att in attachments:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(att["content"])
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{att["filename"]}"')
+            msg.attach(part)
+    else:
+        msg = MIMEText(body_text)
     msg["Subject"] = subject
     msg["From"] = sender_address
     msg["To"] = to
@@ -1141,8 +1171,10 @@ def _build_outbound_message(sender_address: str, to: str, subject: str, body_tex
 
 def smtp_send(address: str, app_password: str, to: str, subject: str, body_text: str,
               in_reply_to: Optional[str] = None, references: Optional[str] = None,
-              cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None) -> Dict[str, str]:
-    msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references, cc=cc)
+              cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None,
+              attachments: Optional[List[Dict]] = None) -> Dict[str, str]:
+    msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references,
+                                               cc=cc, attachments=attachments)
     envelope_recipients = [to] + list(cc or []) + list(bcc or [])
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
@@ -1151,10 +1183,13 @@ def smtp_send(address: str, app_password: str, to: str, subject: str, body_text:
     return {"message_id": message_id}
 
 
+MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB, see AttachmentTooLargeError's docstring
+
+
 def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, to_email: str,
                        subject: str, body: str, in_reply_to: Optional[str] = None,
                        references: Optional[str] = None, cc: Optional[List[str]] = None,
-                       bcc: Optional[List[str]] = None) -> Dict[str, str]:
+                       bcc: Optional[List[str]] = None, attachments: Optional[List[Dict]] = None) -> Dict[str, str]:
     """Sends a one-off manual reply from inside the app — NOT part of the
     automated batch sequence, and never called with data Streamlit
     computed insecurely: the caller (Streamlit's Responses tab) is
@@ -1163,6 +1198,10 @@ def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, 
     header-based threading every automated follow-up already relies on —
     this function just sends what it's given, it doesn't look anything up
     itself.
+
+    attachments (optional): [{"filename": str, "content": bytes}, ...].
+    Raises AttachmentTooLargeError if their combined size exceeds
+    MAX_TOTAL_ATTACHMENT_BYTES — checked BEFORE anything is sent.
 
     Raises MissingSenderAccountError / InvalidEmailFormatError the same
     way the rest of this file does, so classify_send_exception and the
@@ -1176,10 +1215,18 @@ def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, 
     for extra in list(cc or []) + list(bcc or []):
         if not is_valid_email_format(extra):
             raise InvalidEmailFormatError(f"'{extra}' (Cc/Bcc) is not a valid email address format")
+    if attachments:
+        total_size = sum(len(att["content"]) for att in attachments)
+        if total_size > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise AttachmentTooLargeError(
+                f"Attachments total {total_size / (1024*1024):.1f} MB, over the "
+                f"{MAX_TOTAL_ATTACHMENT_BYTES / (1024*1024):.0f} MB limit."
+            )
 
     account = accounts[sender_account]
     return smtp_send(account["address"], account["app_password"], to=to_email, subject=subject,
-                      body_text=body, in_reply_to=in_reply_to, references=references, cc=cc, bcc=bcc)
+                      body_text=body, in_reply_to=in_reply_to, references=references, cc=cc, bcc=bcc,
+                      attachments=attachments)
 
 
 def classify_send_exception(exc: Exception) -> str:
@@ -2455,8 +2502,12 @@ def cmd_send_reply(args):
         {"sender_account": "sales1", "to": "lead@abc.com",
          "subject": "Re: ...", "body": "...", "in_reply_to": "<...>",
          "references": "<...> <...>", "cc": [...], "bcc": [...],
-         "lead_id": "5"}
-    cc/bcc/lead_id are optional.
+         "lead_id": "5",
+         "attachments": [{"filename": "photo.png", "content_base64": "..."}]}
+    cc/bcc/lead_id/attachments are optional. Attachment content travels
+    as base64 in the JSON payload (the payload file itself is already the
+    "big binary data over a size-limited channel" workaround — see
+    campaigns.py's Responses tab for how it's built).
     """
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
@@ -2466,12 +2517,18 @@ def cmd_send_reply(args):
 
     lead_id = payload.get("lead_id", "")
     to_email = payload.get("to", "")
+    attachments = None
+    if payload.get("attachments"):
+        attachments = [
+            {"filename": att["filename"], "content": base64.b64decode(att["content_base64"])}
+            for att in payload["attachments"]
+        ]
 
     try:
         sent = send_manual_reply(
             accounts, payload["sender_account"], to_email, payload["subject"], payload["body"],
             in_reply_to=payload.get("in_reply_to"), references=payload.get("references"),
-            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None,
+            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None, attachments=attachments,
         )
     except Exception as exc:  # noqa: BLE001 - classify and log exactly like every other send path
         error_type = classify_send_exception(exc)
