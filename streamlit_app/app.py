@@ -28,6 +28,9 @@ typed `SEND` confirmation gate.
 
 Use the sidebar to navigate:
 
+- **🗂️ Campaigns** — the everyday view. Search, see every campaign's
+  status (Draft/Running/Paused/Completed/Attention needed) at a glance,
+  open one for its Analytics. Start here.
 - **📈 Overview** — every campaign at a glance: sent, pending, replies.
 - **📊 Dashboard** — deep-dive into one campaign's leads, sends, replies,
   and errors.
@@ -46,12 +49,13 @@ Use the sidebar to navigate:
 # characters for some people (a filesystem/encoding issue, not a Streamlit
 # bug). Page files themselves now have plain ASCII names.
 home_page = st.Page(_home, title="Home", icon="📬", default=True)
+campaigns_page = st.Page("pages/campaigns.py", title="Campaigns", icon="🗂️")
 overview_page = st.Page("pages/overview.py", title="Overview", icon="📈")
 dashboard_page = st.Page("pages/dashboard.py", title="Dashboard", icon="📊")
 controls_page = st.Page("pages/controls.py", title="Controls", icon="🚀")
 email_accounts_page = st.Page("pages/email_accounts.py", title="Email Accounts", icon="📧")
 new_campaign_page = st.Page("pages/new_campaign.py", title="New Campaign", icon="➕")
 
-nav = st.navigation([home_page, overview_page, dashboard_page, controls_page,
+nav = st.navigation([home_page, campaigns_page, overview_page, dashboard_page, controls_page,
                      email_accounts_page, new_campaign_page])
 nav.run()
