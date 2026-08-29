@@ -622,6 +622,91 @@ def test_backfill_returns_nothing_to_write_for_empty_lead_list():
     assert outreach.backfill_thread_subjects(campaign_cfg, []) == []
 
 
+# =============================================================================
+# import_leads / remove_leads — Data tab backend (soft-remove only, never
+# a hard delete; see remove_leads' docstring)
+# =============================================================================
+
+def test_import_leads_appends_with_sequential_ids_continuing_from_max():
+    existing = [make_lead(_row=2, LeadID="3", Email="existing@abc.com")]
+    fake_sheets = FakeSheets(existing)
+    new_leads = [{"FirstName": "Sam", "Email": "sam@abc.com"}, {"FirstName": "Alex", "Email": "alex@abc.com"}]
+
+    summary = outreach.import_leads(fake_sheets, "TestCampaign", new_leads)
+
+    assert summary == {"imported": 2, "skipped_duplicate": 0, "skipped_no_email": 0}
+    imported = [l for l in fake_sheets._leads if l.get("FirstName") in ("Sam", "Alex")]
+    assert {l["LeadID"] for l in imported} == {"4", "5"}  # continues from existing max (3)
+
+
+def test_import_leads_sets_campaign_and_blank_approval_by_default():
+    fake_sheets = FakeSheets([])
+    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
+    imported = fake_sheets._leads[0]
+    assert imported["Campaign"] == "TestCampaign"
+    assert imported["Approval"] == ""  # Pending — never defaults to eligible-to-send
+
+
+def test_import_leads_respects_explicit_approval_if_caller_set_it():
+    fake_sheets = FakeSheets([])
+    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com", "Approval": "Yes"}])
+    assert fake_sheets._leads[0]["Approval"] == "Yes"
+
+
+def test_import_leads_skips_rows_with_no_email():
+    fake_sheets = FakeSheets([])
+    summary = outreach.import_leads(fake_sheets, "TestCampaign", [{"FirstName": "NoEmail"}])
+    assert summary == {"imported": 0, "skipped_duplicate": 0, "skipped_no_email": 1}
+    assert fake_sheets._leads == []
+
+
+def test_import_leads_skips_duplicate_emails_case_insensitive():
+    existing = [make_lead(_row=2, LeadID="1", Email="Sam@Abc.com")]
+    fake_sheets = FakeSheets(existing)
+    summary = outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
+    assert summary == {"imported": 0, "skipped_duplicate": 1, "skipped_no_email": 0}
+
+
+def test_import_leads_skips_duplicates_within_the_same_import_batch_too():
+    fake_sheets = FakeSheets([])
+    new_leads = [{"Email": "sam@abc.com"}, {"Email": "SAM@ABC.COM"}]
+    summary = outreach.import_leads(fake_sheets, "TestCampaign", new_leads)
+    assert summary == {"imported": 1, "skipped_duplicate": 1, "skipped_no_email": 0}
+
+
+def test_import_leads_first_id_is_one_when_no_existing_leads():
+    fake_sheets = FakeSheets([])
+    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
+    assert fake_sheets._leads[0]["LeadID"] == "1"
+
+
+def test_remove_leads_sets_status_removed_not_hard_delete():
+    leads = [make_lead(_row=2, LeadID="5", Email="a@abc.com"), make_lead(_row=3, LeadID="8", Email="b@abc.com")]
+    fake_sheets = FakeSheets(leads)
+
+    summary = outreach.remove_leads(fake_sheets, ["5"])
+
+    assert summary == {"removed": 1, "not_found": 0}
+    assert len(fake_sheets._leads) == 2  # row still exists — soft remove, not delete
+    removed = next(l for l in fake_sheets._leads if l["LeadID"] == "5")
+    assert removed["Status"] == outreach.STATUS_REMOVED
+    kept = next(l for l in fake_sheets._leads if l["LeadID"] == "8")
+    assert kept["Status"] != outreach.STATUS_REMOVED
+
+
+def test_remove_leads_reports_not_found_ids():
+    leads = [make_lead(_row=2, LeadID="5", Email="a@abc.com")]
+    fake_sheets = FakeSheets(leads)
+    summary = outreach.remove_leads(fake_sheets, ["5", "999"])
+    assert summary == {"removed": 1, "not_found": 1}
+
+
+def test_removed_status_excludes_lead_from_eligibility():
+    lead = make_lead(Status=outreach.STATUS_REMOVED)
+    eligible = outreach.get_eligible_leads([lead], STAGES, 0)
+    assert eligible == []
+
+
 def test_all_20_templates_load_and_render_without_leftover_placeholders_even_with_blank_fields():
     # Deliberately blank FirstName/LastName/Company to prove optional fields
     # never leak "{{...}}" into an outgoing email. ThreadSubject is
@@ -1110,6 +1195,18 @@ class FakeSheets:
         for lead in self._leads:
             if lead["_row"] == row_number:
                 lead.update(fields)
+
+    def append_lead(self, fields):
+        next_row = max((l["_row"] for l in self._leads), default=1) + 1
+        new_lead = dict(fields)
+        new_lead["_row"] = next_row
+        self._leads.append(new_lead)
+
+    def update_lead_statuses(self, row_numbers_to_status):
+        for lead in self._leads:
+            if lead["_row"] in row_numbers_to_status:
+                lead["Status"] = row_numbers_to_status[lead["_row"]]
+                lead["LastActionAt"] = "2026-08-01 09:00:00"  # fixed stub — tests don't assert this value
 
     def append_send_log(self, fields):
         self.send_log.append(fields)
