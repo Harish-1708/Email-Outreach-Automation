@@ -93,6 +93,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           EMAIL_ACCOUNTS_JSON: ${{ secrets.EMAIL_ACCOUNTS_JSON }}
         run: |
+          set -o pipefail
           CMD=(python outreach.py send
             --campaign "${{ github.event.inputs.campaign }}"
             --stage "${{ github.event.inputs.stage }}"
