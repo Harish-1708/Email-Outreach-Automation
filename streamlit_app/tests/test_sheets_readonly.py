@@ -9,11 +9,17 @@ from sheets_readonly import ReadOnlySheetsConnector, ReadOnlySheetsError
 
 
 class FakeWorksheet:
-    def __init__(self, records):
+    def __init__(self, records, header=None):
         self._records = records
+        self._header = header or (list(records[0].keys()) if records else [])
 
     def get_all_records(self):
         return [dict(r) for r in self._records]
+
+    def row_values(self, row_number):
+        if row_number == 1:
+            return list(self._header)
+        raise NotImplementedError("Fake only supports reading the header row (row 1)")
 
 
 class FakeSpreadsheet:
@@ -69,6 +75,28 @@ def test_connector_has_no_write_methods():
     # Explicit guard against accidental future write-method additions —
     # this connector must remain read-only by construction.
     write_like = {"update_lead_fields", "append_response", "append_send_log",
-                  "append_error_log", "clear", "update", "batch_update"}
+                  "append_error_log", "clear", "update", "batch_update",
+                  "append_lead", "update_lead_statuses"}
     connector_methods = {m for m in dir(ReadOnlySheetsConnector) if not m.startswith("_")}
     assert connector_methods.isdisjoint(write_like)
+
+
+def test_get_header_returns_header_row_explicitly():
+    ws = FakeWorksheet([], header=["LeadID", "FirstName", "Email", "Title", "Website"])
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({"Master": ws}))
+    assert connector.get_header("Master") == ["LeadID", "FirstName", "Email", "Title", "Website"]
+
+
+def test_get_header_works_even_with_zero_data_rows():
+    # The exact case get_all_records() alone can't handle — a brand new
+    # sheet with a header but no leads yet would lose custom-column
+    # visibility if we only ever inferred columns from record dict keys.
+    ws = FakeWorksheet([], header=["LeadID", "Email", "CustomField"])
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({"Master": ws}))
+    assert "CustomField" in connector.get_header("Master")
+
+
+def test_get_header_missing_tab_raises_readonly_sheets_error():
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({}))
+    with pytest.raises(ReadOnlySheetsError, match="doesn't exist yet"):
+        connector.get_header("Nonexistent Tab")
