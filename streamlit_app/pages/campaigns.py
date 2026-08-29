@@ -52,10 +52,29 @@ def _fetch_sheet_data(campaign_cfg):
     return leads, responses, send_log
 
 
-def _fetch_full_campaign_data(campaign_cfg):
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_full_campaign_data_cached(campaign_name: str):
+    """Cached by campaign_name (a plain string — hashable, a clean cache
+    key), NOT by campaign_cfg (a dict — unhashable, and re-fetching per
+    rerun regardless of ttl was exactly the Sheets-quota bug this fixes).
+    Streamlit reruns the ENTIRE script on almost every widget interaction
+    — every mapping dropdown touched while setting up a CSV import, every
+    filter change, every keystroke in search — so without this cache, a
+    few minutes of ordinary use on this page alone can comfortably exceed
+    Google's 60-reads/minute/user quota and return a 429."""
+    campaign_cfg = get_campaign_cfg(campaign_name)
     leads, responses, send_log = _fetch_sheet_data(campaign_cfg)
     error_log = _get_connector().get_all_error_log(campaign_cfg["error_log_tab"])
     return leads, responses, send_log, error_log
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _get_master_header_cached(campaign_name: str):
+    """Same fix, same reason — this was being re-fetched on every single
+    mapping-dropdown adjustment during CSV import, which is precisely the
+    highest-interaction-density moment on this whole page."""
+    campaign_cfg = get_campaign_cfg(campaign_name)
+    return _get_connector().get_header(campaign_cfg["master_tab"])
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -206,8 +225,7 @@ def _render_data_tab(campaign_cfg, leads):
                 st.error("Couldn't read any columns from that file — is it a valid CSV?")
             else:
                 try:
-                    connector = _get_connector()
-                    header = connector.get_header(campaign_cfg["master_tab"])
+                    header = _get_master_header_cached(campaign_cfg["_campaign_name"])
                     custom_columns = [c for c in header if c not in outreach.MASTER_COLUMNS]
                 except Exception:  # noqa: BLE001 - tab may not exist yet for a brand new campaign
                     custom_columns = []
@@ -310,9 +328,15 @@ def _render_stub_tab(tab_name: str, phase_letter: str):
 
 
 def _render_campaign_detail(campaign_name: str):
-    if st.button("← Back to Campaigns"):
-        del st.session_state["selected_campaign"]
-        st.rerun()
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        if st.button("← Back to Campaigns"):
+            del st.session_state["selected_campaign"]
+            st.rerun()
+    with col2:
+        if st.button("🔄 Refresh data"):
+            _fetch_full_campaign_data_cached.clear()
+            _get_master_header_cached.clear()
 
     try:
         campaign_cfg = get_campaign_cfg(campaign_name)
@@ -328,7 +352,7 @@ def _render_campaign_detail(campaign_name: str):
         leads, responses, send_log, error_log = [], [], [], []
     else:
         try:
-            leads, responses, send_log, error_log = _fetch_full_campaign_data(campaign_cfg)
+            leads, responses, send_log, error_log = _fetch_full_campaign_data_cached(campaign_name)
         except Exception as exc:  # noqa: BLE001
             st.warning(f"Couldn't load Sheet data yet: {exc}")
             leads, responses, send_log, error_log = [], [], [], []
