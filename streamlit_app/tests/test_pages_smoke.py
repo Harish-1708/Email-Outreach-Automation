@@ -107,61 +107,6 @@ def test_dashboard_page_renders_without_exceptions():
     assert "1" in metric_values  # Total Leads == 1 from the fake Master Sheet row above
 
 
-def test_controls_page_renders_without_exceptions():
-    fake_ws = {
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([
-            {"ResponseID": "<m1>", "LeadID": "1", "Campaign": "Kelson_Creators_Licensing",
-             "ReceivedAt": "2026-08-20 10:00:00", "From": "Jane <jane@abc.com>", "Subject": "Re: Hi",
-             "Snippet": "Sounds good", "Classification": "Genuine Reply", "MatchMethod": "Header",
-             "MessageID": "<m1>", "InReplyTo": "<orig1>", "ActionTaken": "Stopped Sequence"},
-        ]),
-    }
-    fake_spreadsheet = FakeSpreadsheet(fake_ws)
-
-    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
-         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "controls.py"))
-        at.secrets.update(_dashboard_secrets())
-        for k, v in _authed_session().items():
-            at.session_state[k] = v
-        at.run()
-
-    assert list(at.exception) == [], f"Controls page raised: {list(at.exception)}"
-    assert list(at.error) == [], f"Controls page showed an error: {[e.value for e in at.error]}"
-    assert len(at.tabs) >= 1
-    # The "recent replies" section should have actually rendered the fake
-    # reply above, in the Check Replies tab, without any button click.
-    expander_labels = [e.label for e in at.expander]
-    assert any("jane@abc.com" in label for label in expander_labels)
-
-
-def test_controls_check_replies_labels_stopped_vs_logged_only_correctly():
-    """A predates-contact / unverified-match reply must be clearly labeled
-    as NOT having stopped the sequence — this is the exact confusion this
-    section exists to resolve (Classification alone reads ambiguously)."""
-    fake_ws = {
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([
-            {"ResponseID": "<m2>", "LeadID": "2", "Campaign": "Kelson_Creators_Licensing",
-             "ReceivedAt": "2026-08-20 10:00:00", "From": "Old <old@abc.com>", "Subject": "Re: Old thread",
-             "Snippet": "Okay", "Classification": "Genuine Reply", "MatchMethod": "Email",
-             "MessageID": "<m2>", "InReplyTo": "<unrelated>", "ActionTaken": "Logged Only (Predates Contact)"},
-        ]),
-    }
-    fake_spreadsheet = FakeSpreadsheet(fake_ws)
-
-    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
-         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "controls.py"))
-        at.secrets.update(_dashboard_secrets())
-        for k, v in _authed_session().items():
-            at.session_state[k] = v
-        at.run()
-
-    assert list(at.exception) == []
-    markdown_texts = " ".join(m.value for m in at.markdown)
-    assert "NOT stopped" in markdown_texts
-
-
 def test_new_campaign_dialog_disabled_until_confirmation_checked():
     """The confirm checkbox is the ONLY remaining safety net now that
     there's no GitHub trip — this must actually gate the button, not just
@@ -1918,6 +1863,97 @@ def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed():
     assert at.session_state["last_send_run_id"] == 42
 
 
+def test_send_section_hidden_when_campaign_is_draft():
+    """The real safety fix this locks in: Send must not even be offered
+    for a Draft campaign — matching outreach.send_batch's own backend
+    guard, which blocks Draft the same way it blocks Paused."""
+    fake_spreadsheet = FakeSpreadsheet({})
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("draft")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "DraftCampaign"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert not any(b.key == "campaigns_send_batch_button" for b in at.button)  # never even offered
+    info_texts = " ".join(i.value for i in at.info)
+    assert "only available while a campaign is" in info_texts
+    assert "Launch it above" in info_texts
+    assert "workflow" not in captured  # nothing was ever triggered
+
+
+def test_send_section_hidden_when_campaign_is_paused():
+    fake_spreadsheet = FakeSpreadsheet({})
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("paused")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "PausedCampaign"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert not any(b.key == "campaigns_send_batch_button" for b in at.button)
+    info_texts = " ".join(i.value for i in at.info)
+    assert "Resume it above" in info_texts
+
+
+def test_send_section_visible_when_campaign_is_running():
+    """The positive case — confirms the gate isn't accidentally hiding
+    Send for the one status it should actually be available for."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert any(b.key == "campaigns_send_batch_button" for b in at.button)
+
+
+def test_send_section_no_longer_shows_duplicate_limit_overrides():
+    """The specific cleanup requested: daily_limit / per_account_daily_limit
+    / sender_rotation overrides and the manual batch size input are gone
+    from Send — those are already set once, above, in the same tab."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert not any(ni.key == "campaigns_send_daily_limit" for ni in at.number_input)
+    assert not any(ni.key == "campaigns_send_per_account" for ni in at.number_input)
+    assert not any(ni.key == "campaigns_send_batch_size" for ni in at.number_input)
+    assert not any(sb.key == "campaigns_send_rotation" for sb in at.selectbox)
+    # Stage/Variant/ignore-wait-days survive — those are genuinely per-run choices.
+    assert any(b.key == "campaigns_send_ignore_wait_days" for b in at.checkbox)
+
+
 def test_send_tab_check_replies_dispatches_correct_workflow():
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured = {}
@@ -2162,6 +2198,36 @@ def test_responses_tab_check_replies_button_shows_even_with_zero_responses():
     assert any(b.key == "campaigns_check_replies_button" for b in at.button)
     info_texts = " ".join(i.value for i in at.info)
     assert "No responses yet" in info_texts  # both present together
+
+
+def test_responses_tab_labels_stopped_vs_logged_only_correctly():
+    """A predates-contact / unverified-match reply must be clearly
+    labeled as NOT having stopped the sequence — this is the exact
+    confusion this labeling exists to resolve (Classification alone reads
+    ambiguously). Ported from the removed Controls page, since Responses
+    is now the only place replies are shown."""
+    fake_ws = _responses_tab_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
+        {"ResponseID": "<m2>", "LeadID": "5", "Campaign": "Kelson_Creators_Licensing",
+         "ReceivedAt": "2026-08-20 10:00:00", "From": "Old <old@abc.com>", "Subject": "Re: Old thread",
+         "Snippet": "Okay", "Classification": "Genuine Reply", "MatchMethod": "Email",
+         "MessageID": "<m2>", "InReplyTo": "<unrelated>", "ActionTaken": "Logged Only (Predates Contact)"},
+    ])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    caption_texts = " ".join(c.value for c in at.caption)
+    assert "NOT stopped" in caption_texts
 
 
 def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
