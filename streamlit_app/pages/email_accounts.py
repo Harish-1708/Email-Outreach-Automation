@@ -10,7 +10,7 @@ from auth import login_gate  # noqa: E402
 from config import REPO_ROOT, SETTINGS_PATH  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector, ReadOnlySheetsError  # noqa: E402
-from accounts_logic import aggregate_sent_today_by_account, build_account_rows  # noqa: E402
+from accounts_logic import aggregate_sent_today_by_account, build_account_rows, build_health_lookup  # noqa: E402
 
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -75,25 +75,47 @@ def _load_send_logs(campaign_names):
 
 send_logs_by_campaign, unavailable_campaigns = _load_send_logs(tuple(campaigns))
 sent_today_by_account = aggregate_sent_today_by_account(send_logs_by_campaign)
-rows = build_account_rows(account_directory, sent_today_by_account, default_account)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_account_health():
+    return _get_connector().get_account_health()
+
+
+health_records = _load_account_health()
+health_lookup = build_health_lookup(health_records)
+rows = build_account_rows(account_directory, sent_today_by_account, default_account, health_lookup=health_lookup)
+
+_STATUS_ICONS = {"Connected": "🟢", "Disconnected": "🔴", "Unknown": "⚪"}
 
 cols = st.columns(len(rows)) if rows else []
 for col, row in zip(cols, rows):
     label = row["name"] + (" ⭐ default" if row["is_default"] else "")
+    icon = _STATUS_ICONS.get(row["status"], "⚪")
     col.metric(label, f"{row['sent_today']} sent today")
-    col.caption(row["address"])
+    col.caption(f"{row['address']}  ·  {icon} {row['status']}")
+    if row["status"] == "Disconnected" and row["status_detail"]:
+        col.caption(f"⚠️ {row['status_detail']}")
 
 st.divider()
 st.dataframe(
     {
         "Account": [r["name"] for r in rows],
         "Address": [r["address"] for r in rows],
+        "Status": [f"{_STATUS_ICONS.get(r['status'], '⚪')} {r['status']}" for r in rows],
+        "Last Checked": [r["checked_at"] or "—" for r in rows],
         "Sent Today (all campaigns)": [r["sent_today"] for r in rows],
         "Default": ["Yes" if r["is_default"] else "" for r in rows],
     },
     width="stretch",
     hide_index=True,
 )
+
+if not health_records:
+    st.caption(
+        "No connection status yet — the 'Check Account Health' workflow runs automatically every 2 "
+        "hours, or trigger it manually from the GitHub Actions tab to check now."
+    )
 
 if unavailable_campaigns:
     st.caption(
