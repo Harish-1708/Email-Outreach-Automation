@@ -1,6 +1,7 @@
 """Unit tests for outreach.py (SMTP/IMAP edition)."""
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -1498,6 +1499,219 @@ def test_smtp_send_no_attachments_backward_compatible():
     assert sig.parameters["attachments"].default is None
 
 
+# =============================================================================
+# Account health check — connection status without ever exposing passwords
+# =============================================================================
+
+def test_check_single_account_health_success(monkeypatch):
+    class FakeIMAP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def login(self, address, password):
+            pass
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
+    status, detail = outreach.check_single_account_health("sales1@gmail.com", "app-pass")
+    assert status == "Connected"
+    assert detail == ""
+
+
+def test_check_single_account_health_failure_never_includes_password(monkeypatch):
+    class FakeIMAP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def login(self, address, password):
+            raise outreach.imaplib.IMAP4.error("AUTHENTICATIONFAILED Invalid credentials")
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
+    status, detail = outreach.check_single_account_health("sales1@gmail.com", "super-secret-app-password")
+    assert status == "Disconnected"
+    assert "super-secret-app-password" not in detail
+    assert "super-secret-app-password" not in status
+
+
+def test_check_single_account_health_logs_out_even_on_failure(monkeypatch):
+    logout_called = []
+
+    class FakeIMAP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def login(self, address, password):
+            raise RuntimeError("connection refused")
+
+        def logout(self):
+            logout_called.append(1)
+
+    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
+    outreach.check_single_account_health("sales1@gmail.com", "app-pass")
+    assert logout_called == [1]
+
+
+def test_check_single_account_health_logout_failure_does_not_mask_result(monkeypatch):
+    class FakeIMAP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def login(self, address, password):
+            pass
+
+        def logout(self):
+            raise RuntimeError("logout also broken")
+
+    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
+    status, detail = outreach.check_single_account_health("sales1@gmail.com", "app-pass")
+    assert status == "Connected"  # the real result, not swallowed by the logout failure
+
+
+def test_check_account_health_isolates_broken_account_from_working_ones(monkeypatch):
+    accounts = {
+        "sales1": {"address": "sales1@gmail.com", "app_password": "good-pass"},
+        "sales2": {"address": "sales2@gmail.com", "app_password": "bad-pass"},
+    }
+
+    def fake_check(address, app_password):
+        if app_password == "bad-pass":
+            return "Disconnected", "auth failed"
+        return "Connected", ""
+
+    monkeypatch.setattr(outreach, "check_single_account_health", fake_check)
+    results = outreach.check_account_health(accounts)
+
+    assert len(results) == 2
+    by_name = {r["AccountName"]: r for r in results}
+    assert by_name["sales1"]["Status"] == "Connected"
+    assert by_name["sales2"]["Status"] == "Disconnected"
+
+
+def test_check_account_health_never_includes_app_password_field(monkeypatch):
+    accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "super-secret"}}
+    monkeypatch.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
+    results = outreach.check_account_health(accounts)
+    assert "app_password" not in results[0]
+    assert "super-secret" not in json.dumps(results[0])
+
+
+def test_check_account_health_matches_column_schema():
+    accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "x"}}
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
+        results = outreach.check_account_health(accounts)
+    assert set(results[0].keys()) == set(outreach.ACCOUNT_HEALTH_COLUMNS)
+
+
+def test_check_account_health_empty_accounts_dict():
+    assert outreach.check_account_health({}) == []
+
+
+def test_write_account_health_clears_existing_rows_before_writing(monkeypatch):
+    class FakeWorksheet:
+        def __init__(self):
+            self.cleared_ranges = []
+            self.appended_rows = []
+            self._values = [outreach.ACCOUNT_HEALTH_COLUMNS, ["old_account", "old@x.com", "Connected", "", "t"]]
+
+        def get_all_values(self):
+            return self._values
+
+        def row_values(self, n):
+            return self._values[n - 1] if n <= len(self._values) else []
+
+        def batch_clear(self, ranges):
+            self.cleared_ranges.extend(ranges)
+
+        def append_rows(self, rows):
+            self.appended_rows.extend(rows)
+
+    fake_ws = FakeWorksheet()
+
+    class FakeSpreadsheet:
+        def worksheet(self, title):
+            return fake_ws
+
+    class FakeGspreadModule:
+        class exceptions:
+            class WorksheetNotFound(Exception):
+                pass
+
+    monkeypatch.setattr(outreach, "_build_gspread_client",
+                         lambda: (type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet()})(),
+                                  FakeGspreadModule))
+
+    results = [{"AccountName": "sales1", "Address": "sales1@x.com", "Status": "Connected",
+                "Detail": "", "CheckedAt": "2026-08-29 09:00:00"}]
+    outreach.write_account_health("fake-sheet-id", results)
+
+    assert fake_ws.cleared_ranges == ["A2:E2"]
+    assert fake_ws.appended_rows == [["sales1", "sales1@x.com", "Connected", "", "2026-08-29 09:00:00"]]
+
+
+def test_write_account_health_skips_clear_when_tab_was_empty(monkeypatch):
+    class FakeWorksheet:
+        def __init__(self):
+            self.cleared_ranges = []
+            self.appended_rows = []
+            self._values = [outreach.ACCOUNT_HEALTH_COLUMNS]  # header only, no data rows yet
+
+        def get_all_values(self):
+            return self._values
+
+        def row_values(self, n):
+            return self._values[n - 1] if n <= len(self._values) else []
+
+        def batch_clear(self, ranges):
+            self.cleared_ranges.extend(ranges)
+
+        def append_rows(self, rows):
+            self.appended_rows.extend(rows)
+
+    fake_ws = FakeWorksheet()
+
+    class FakeSpreadsheet:
+        def worksheet(self, title):
+            return fake_ws
+
+    class FakeGspreadModule:
+        class exceptions:
+            class WorksheetNotFound(Exception):
+                pass
+
+    monkeypatch.setattr(outreach, "_build_gspread_client",
+                         lambda: (type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet()})(),
+                                  FakeGspreadModule))
+
+    outreach.write_account_health("fake-sheet-id", [{"AccountName": "sales1", "Address": "a@x.com",
+                                                       "Status": "Connected", "Detail": "", "CheckedAt": "t"}])
+    assert fake_ws.cleared_ranges == []  # nothing to clear
+
+
+def test_cmd_check_account_health_writes_and_prints(monkeypatch, capsys):
+    monkeypatch.setattr(outreach, "load_email_accounts",
+                         lambda: {"sales1": {"address": "sales1@gmail.com", "app_password": "x"}})
+    monkeypatch.setattr(outreach, "load_settings", lambda: {"shared_sheet_id": "fake-id"})
+    monkeypatch.setattr(outreach, "check_account_health",
+                         lambda accounts: [{"AccountName": "sales1", "Address": "sales1@gmail.com",
+                                             "Status": "Connected", "Detail": "", "CheckedAt": "t"}])
+    write_calls = []
+    monkeypatch.setattr(outreach, "write_account_health", lambda sheet_id, results: write_calls.append((sheet_id, results)))
+
+    outreach.cmd_check_account_health(argparse.Namespace())
+
+    assert write_calls[0][0] == "fake-id"
+    out = capsys.readouterr().out
+    assert "sales1" in out
+    assert "Connected" in out
+
+
+# =============================================================================
 # cmd_send_reply — the CLI/workflow entry point
 # =============================================================================
 
