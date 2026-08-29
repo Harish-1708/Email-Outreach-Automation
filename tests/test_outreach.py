@@ -1,3665 +1,2837 @@
-"""Unit tests for outreach.py (SMTP/IMAP edition)."""
+#!/usr/bin/env python3
+"""
+Outreach Automation — single-file version, SMTP/IMAP edition.
+
+Runs entirely on GitHub Actions. Authentication is Gmail App Passwords
+(generated once on a Google webpage, pasted into a GitHub secret) — no
+OAuth, no client_secret.json, no browser code flow, no local execution.
+
+Usage:
+    python outreach.py preview        --campaign NAME --stage NAME --batch-size N [--variant A]
+    python outreach.py send           --campaign NAME --stage NAME --batch-size N [--variant A]
+    python outreach.py check-replies  --campaign NAME
+    python outreach.py dashboard      --campaign NAME | --all
+
+See README.md for full setup (Google Sheet + service account + App Passwords).
+"""
 
 import argparse
+import base64
+import concurrent.futures
+import email
+import imaplib
 import json
 import os
-import pathlib
+import random
+import re
+import smtplib
+import ssl
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from email.header import decode_header
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.utils import make_msgid, formatdate, parsedate_to_datetime
+from typing import Dict, List, Optional, Tuple
 
-import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-import outreach  # noqa: E402
+import yaml
+from dateutil import parser as dateparser
 
 
-TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "templates", "Kelson_Creators_Licensing")
+# =============================================================================
+# SECTION 1: Constants — sheet column names and tab-name conventions
+# =============================================================================
 
-STAGES = [
-    {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
-    {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
+MASTER_COLUMNS = [
+    "LeadID",
+    "FirstName",          # Optional — blank renders as "there" in templates
+    "LastName",             # Optional
+    "Email",                 # MANDATORY — the only required field per lead
+    "Company",                # Optional — blank renders as "your team"
+    "Campaign",
+    "Approval",               # Pending | Yes | No | Paused (blank behaves as Pending)
+    "SenderAccount",          # Optional — which account to send from. Locked in
+                                # after first send so later stages match.
+    "RequestedAction",        # Free-text, NOT read by the system.
+    "CurrentStage",
+    "ScheduledAt",
+    "IntroSentAt",
+    "IntroVariant",
+    "FollowUp1SentAt",
+    "FollowUp1Variant",
+    "FollowUp2SentAt",
+    "FollowUp2Variant",
+    "FollowUp3SentAt",
+    "FollowUp3Variant",
+    "FollowUp4SentAt",
+    "FollowUp4Variant",
+    "NextEligibleAt",
+    "ReplyStatus",             # "" | Replied
+    "ReplyAt",
+    "LastInboundClassification",
+    "LastInboundAt",
+    "Status",                   # Doubles as "Last Action"
+    "LastActionAt",
+    "Error",
+    "MessageID",
+    "ThreadReferences",
+    "ThreadSubject",           # Set automatically whenever a stage sends with a
+                                # non-blank Subject. Leave a template's Subject
+                                # line blank to continue this same thread
+                                # ("Re: <ThreadSubject>") instead of starting a
+                                # new one — see render_email / Section 5.
 ]
-FMT = "%Y-%m-%d %H:%M:%S"
+# NOTE: this is the REQUIRED prefix of the Master header row. You may add
+# extra columns of your own AFTER these (e.g. "Industry", "JobTitle") and
+# reference them directly in templates as {{Industry}} — see Section 4.
+
+RESPONSES_COLUMNS = [
+    "ResponseID",
+    "LeadID",
+    "Campaign",
+    "ReceivedAt",
+    "From",
+    "Subject",
+    "Snippet",
+    "Classification",
+    "MatchMethod",
+    "MessageID",
+    "InReplyTo",
+    "ActionTaken",       # Stopped Sequence | Logged Only |
+                         # Logged Only (Unverified Match) | Logged Only (Predates Contact)
+                         # — only a Header-matched message can produce "Stopped Sequence"
+]
+
+SEND_LOG_COLUMNS = [
+    "BatchID",
+    "Timestamp",
+    "LeadID",
+    "Email",
+    "Campaign",
+    "Stage",
+    "Variant",
+    "SenderAccount",
+    "Status",            # sent | error | skipped
+    "MessageID",
+    "Error",
+]
+
+ERROR_LOG_COLUMNS = [
+    "Timestamp",
+    "Campaign",
+    "ErrorType",
+    "LeadID",
+    "Email",
+    "Stage",
+    "BatchID",
+    "Message",
+]
+
+DASHBOARD_COLUMNS = ["Section", "Metric", "Value"]
+
+ACCOUNT_HEALTH_TAB = "Email Accounts Health"
+ACCOUNT_HEALTH_COLUMNS = ["AccountName", "Address", "Status", "Detail", "CheckedAt"]
+
+ALL_CAMPAIGNS_DASHBOARD_COLUMNS = [
+    "Campaign", "Total Leads", "Unique Contacted", "Total Sent",
+    "Delivered (est.)", "Bounced (Hard)", "Bounced (Soft)", "Replies",
+    "Reply Rate", "Sequence Completion",
+]
+
+APPROVAL_YES = "Yes"
+
+STATUS_STOPPED_REPLIED = "Stopped - Replied"
+STATUS_STOPPED_BOUNCED = "Stopped - Bounced"
+STATUS_STOPPED_REJECTED = "Stopped - Rejected"
+STATUS_PAUSED = "Paused"
+STATUS_COMPLETED = "Completed"
+STATUS_REMOVED = "Removed"  # soft-remove from the Data tab — never a hard delete,
+                            # see import_leads/update_lead_statuses docstrings
+
+TERMINAL_STATUSES = {
+    STATUS_STOPPED_REPLIED,
+    STATUS_STOPPED_BOUNCED,
+    STATUS_STOPPED_REJECTED,
+    STATUS_PAUSED,
+    STATUS_COMPLETED,
+    STATUS_REMOVED,
+}
+
+CLASSIFICATION_GENUINE = "Genuine Reply"
+CLASSIFICATION_AUTOREPLY = "Auto-Reply"
+CLASSIFICATION_OOO = "Out of Office"
+CLASSIFICATION_BOUNCE_HARD = "Bounce (Hard)"
+CLASSIFICATION_BOUNCE_SOFT = "Bounce (Soft)"
+
+# Error monitoring categories.
+ERR_SEND_FAILURE = "Send Failure"
+ERR_AUTH_FAILURE = "Authentication Failure"
+ERR_INVALID_EMAIL = "Invalid Email Address"
+ERR_SHEETS_API = "Sheets API Error"
+ERR_RATE_LIMIT = "Rate-Limit Error"
+ERR_MISSING_VARIABLE = "Missing Template Variable"
+ERR_MISSING_SENDER_ACCOUNT = "Missing Sender Account"
+ERR_REPLY_CHECK = "Reply Check Failure"
+ERR_SENDER_CAPACITY = "Sender Capacity Reached"
+
+DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 
-def make_lead(**overrides):
-    lead = {
-        "_row": 2, "Approval": "Yes", "Status": "", "ReplyStatus": "",
-        "Email": "john@abc.com",
-        "IntroSentAt": "", "IntroVariant": "",
-        "FollowUp1SentAt": "", "FollowUp1Variant": "",
-        "MessageID": "", "ThreadReferences": "", "SenderAccount": "",
-        # Non-blank by default so tests that aren't specifically about the
-        # blank-subject continuation feature don't break if a real sample
-        # template (e.g. templates/Kelson_Creators_Licensing/followup1_*)
-        # is later edited to use a blank Subject — a legitimate, supported
-        # thing to do, and general-purpose tests shouldn't be coupled to
-        # that content staying non-blank. Tests that specifically exercise
-        # the blank-subject path already override this to "" explicitly.
-        "ThreadSubject": "Default Test Thread Subject",
-    }
-    lead.update(overrides)
-    return lead
+def stage_field_names(index: int) -> dict:
+    """index 0 -> Intro fields, index 1 -> FollowUp1 fields, etc."""
+    prefix = "Intro" if index == 0 else f"FollowUp{index}"
+    return {"sent_at": f"{prefix}SentAt", "variant": f"{prefix}Variant"}
+
+
+class MissingSenderAccountError(ValueError):
+    pass
+
+
+class InvalidEmailFormatError(ValueError):
+    pass
+
+
+class SenderCapacityReachedError(ValueError):
+    """Raised when every account eligible to send to a given lead (whether
+    chosen manually, via rotation, or via the single default) has already
+    hit its per-account daily limit. Not a fault — the lead is deferred to
+    a later run, not treated as failed."""
+    pass
+
+
+class AttachmentTooLargeError(ValueError):
+    """Raised by send_manual_reply when the combined size of every
+    attachment exceeds MAX_TOTAL_ATTACHMENT_BYTES — a safety cap well
+    under what mainstream mail providers reject outright, chosen partly
+    to keep the committed base64-encoded payload file (roughly 1.33x the
+    raw size) a reasonable size for a single git commit."""
+    pass
 
 
 # =============================================================================
-# classify_message (unchanged logic, transport-independent)
+# SECTION 2: Config loading — template-folder discovery, no central list
+#
+# A campaign "exists" the moment templates/<name>/ exists — nothing needs
+# to be registered anywhere just to make a campaign name recognized. Global
+# settings (shared sheet, default account, and the DEFAULT campaign
+# settings every campaign inherits) live in config/settings.yaml. A
+# campaign only needs its own config/campaigns/<name>.yaml if it wants to
+# override something from the defaults — most campaigns need nothing there
+# at all.
 # =============================================================================
 
-def test_genuine_reply():
-    result = outreach.classify_message({}, "Re: Quick idea", "Sure, let's talk next week.", "john@abc.com")
-    assert result == outreach.CLASSIFICATION_GENUINE
+class ConfigError(Exception):
+    pass
 
 
-def test_auto_submitted_header():
-    result = outreach.classify_message({"auto-submitted": "auto-replied"}, "Away", "I'm away", "john@abc.com")
-    assert result == outreach.CLASSIFICATION_AUTOREPLY
+class CampaignPausedError(RuntimeError):
+    """Raised by send_batch when campaign_cfg["status"] == "paused" —
+    never raised by build_batch/preview, which stay usable regardless of
+    pause state so a paused campaign can still be reviewed."""
+    pass
 
 
-def test_ooo_keyword_fallback():
-    result = outreach.classify_message({}, "Out of Office", "I am out of office until Monday.", "john@abc.com")
-    assert result == outreach.CLASSIFICATION_OOO
+class OutsideSendingWindowError(RuntimeError):
+    """Raised by send_batch when campaign_cfg["schedule"] restricts
+    sending to specific days/hours and right now doesn't qualify — like
+    CampaignPausedError, never raised by build_batch/preview, so a
+    schedule-restricted campaign can still be reviewed any time."""
+    pass
 
 
-def test_hard_bounce_status_code():
-    result = outreach.classify_message(
-        {"content-type": "multipart/report; report-type=delivery-status"},
-        "Delivery Status Notification (Failure)",
-        "550 5.1.1 The email account does not exist.",
-        "mailer-daemon@abc.com",
+def load_settings(path: str = "config/settings.yaml") -> dict:
+    if not os.path.exists(path):
+        raise ConfigError(f"Settings file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if "shared_sheet_id" not in data:
+        raise ConfigError(f"{path} is missing 'shared_sheet_id'.")
+    if "default_campaign_settings" not in data:
+        raise ConfigError(f"{path} is missing 'default_campaign_settings'.")
+    return data
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merges override into a COPY of base. Nested dicts merge
+    key by key (so e.g. an override can set just sending.daily_limit
+    without redefining the whole sending block); anything else — including
+    lists like stages/variants — is replaced wholesale by the override,
+    since merging a list element-by-element isn't meaningful here."""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def discover_campaign_names(templates_root: str = "templates") -> List[str]:
+    """Every campaign that currently exists, full stop — determined purely
+    by having a subfolder under templates/. This is what dashboard --all
+    iterates over; there is no other list of "configured campaigns"."""
+    if not os.path.isdir(templates_root):
+        return []
+    return sorted(
+        name for name in os.listdir(templates_root)
+        if os.path.isdir(os.path.join(templates_root, name)) and not name.startswith(".")
     )
-    assert result == outreach.CLASSIFICATION_BOUNCE_HARD
 
 
-def test_soft_bounce_status_code():
-    result = outreach.classify_message(
-        {"content-type": "multipart/report; report-type=delivery-status"},
-        "Delivery delayed",
-        "451 4.2.1 mailbox temporarily full",
-        "mailer-daemon@abc.com",
-    )
-    assert result == outreach.CLASSIFICATION_BOUNCE_SOFT
-
-
-def test_precedence_bulk():
-    result = outreach.classify_message({"precedence": "bulk"}, "Newsletter", "content", "list@abc.com")
-    assert result == outreach.CLASSIFICATION_AUTOREPLY
-
-
-def test_bounce_sender_without_status_code_defaults_hard():
-    result = outreach.classify_message({}, "Mail delivery failed", "delivery has failed", "mailer-daemon@abc.com")
-    assert result == outreach.CLASSIFICATION_BOUNCE_HARD
-
-
-# =============================================================================
-# pick_variant
-# =============================================================================
-
-def test_picks_least_used_variant():
-    leads = [{"IntroVariant": "A"}, {"IntroVariant": "A"}, {"IntroVariant": "B"}, {"IntroVariant": ""}]
-    variant = outreach.pick_variant(leads, "IntroVariant", ["A", "B", "C", "D"])
-    assert variant in ("C", "D")
-
-
-def test_respects_in_batch_counts():
-    leads = [{"IntroVariant": ""} for _ in range(4)]
-    batch_counts = {"A": 5, "B": 0, "C": 0, "D": 0}
-    variant = outreach.pick_variant(leads, "IntroVariant", ["A", "B", "C", "D"], batch_counts)
-    assert variant in ("B", "C", "D")
-
-
-def test_variant_selection_stays_balanced_over_many_picks():
-    variants = ["A", "B", "C", "D"]
-    leads = []
-    for _ in range(40):
-        v = outreach.pick_variant(leads, "IntroVariant", variants)
-        leads.append({"IntroVariant": v})
-    counts = {v: sum(1 for l in leads if l["IntroVariant"] == v) for v in variants}
-    assert max(counts.values()) - min(counts.values()) <= 1
-
-
-# =============================================================================
-# get_eligible_leads — Email is the only mandatory field
-# =============================================================================
-
-def test_intro_stage_new_lead_is_eligible():
-    eligible = outreach.get_eligible_leads([make_lead()], STAGES, 0)
-    assert len(eligible) == 1
-
-
-def test_lead_without_email_is_never_eligible():
-    eligible = outreach.get_eligible_leads([make_lead(Email="")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-def test_lead_with_only_email_filled_is_eligible():
-    # FirstName, LastName, Company all blank — only Email present.
-    lead = make_lead(FirstName="", LastName="", Company="")
-    eligible = outreach.get_eligible_leads([lead], STAGES, 0)
-    assert len(eligible) == 1
-
-
-def test_intro_stage_already_sent_is_excluded():
-    eligible = outreach.get_eligible_leads([make_lead(IntroSentAt="2026-08-01 10:00:00")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-def test_pending_approval_is_excluded():
-    eligible = outreach.get_eligible_leads([make_lead(Approval="Pending")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-def test_blank_approval_behaves_as_not_approved():
-    eligible = outreach.get_eligible_leads([make_lead(Approval="")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-def test_followup1_requires_intro_sent_and_wait_period():
-    recent = datetime.now().strftime(FMT)
-    old = (datetime.now() - timedelta(days=5)).strftime(FMT)
-    not_yet_waited = make_lead(IntroSentAt=recent)
-    waited_enough = make_lead(IntroSentAt=old)
-    never_sent_intro = make_lead(IntroSentAt="")
-    eligible = outreach.get_eligible_leads([not_yet_waited, waited_enough, never_sent_intro], STAGES, 1)
-    assert eligible == [waited_enough]
-
-
-def test_replied_lead_is_excluded():
-    eligible = outreach.get_eligible_leads([make_lead(ReplyStatus="Replied")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-def test_stopped_status_is_excluded():
-    eligible = outreach.get_eligible_leads([make_lead(Status="Stopped - Bounced")], STAGES, 0)
-    assert len(eligible) == 0
-
-
-# =============================================================================
-# get_eligible_leads / find_duplicate_email_leads — same email, two rows
-# =============================================================================
-
-def test_duplicate_email_rows_only_first_row_is_eligible():
-    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
-    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
-    assert len(eligible) == 1
-    assert eligible[0]["LeadID"] == "L1"  # the lower row number wins
-
-
-def test_duplicate_email_rows_email_matching_is_case_insensitive():
-    row1 = make_lead(_row=2, LeadID="L1", Email="Same@ABC.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
-    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
-    assert len(eligible) == 1
-    assert eligible[0]["LeadID"] == "L1"
-
-
-def test_duplicate_email_rows_does_not_affect_leads_with_unique_emails():
-    row1 = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="b@abc.com")
-    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
-    assert len(eligible) == 2
-
-
-def test_duplicate_email_rows_dedup_only_applies_among_leads_that_pass_other_checks():
-    # Row1 fails on Approval and is filtered out BEFORE the dedup step —
-    # it never "claims" the email slot, so row2 (which does pass) is
-    # correctly still eligible. Dedup only applies among leads that
-    # already passed every other check, not globally by row order.
-    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com", Approval="No")
-    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com", Approval="Yes")
-    eligible = outreach.get_eligible_leads([row1, row2], STAGES, 0)
-    assert len(eligible) == 1
-    assert eligible[0]["LeadID"] == "L2"
-
-
-def test_find_duplicate_email_leads_finds_repeated_emails():
-    row1 = make_lead(_row=2, LeadID="L1", Email="same@abc.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
-    unique = make_lead(_row=4, LeadID="L3", Email="unique@abc.com")
-
-    duplicates = outreach.find_duplicate_email_leads([row1, row2, unique])
-    assert list(duplicates.keys()) == ["same@abc.com"]
-    assert len(duplicates["same@abc.com"]) == 2
-
-
-def test_find_duplicate_email_leads_case_insensitive_and_ignores_blank_email():
-    row1 = make_lead(_row=2, LeadID="L1", Email="Same@ABC.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="same@abc.com")
-    blank = make_lead(_row=4, LeadID="L4", Email="")
-
-    duplicates = outreach.find_duplicate_email_leads([row1, row2, blank])
-    assert list(duplicates.keys()) == ["same@abc.com"]
-
-
-def test_find_duplicate_email_leads_empty_when_all_unique():
-    row1 = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    row2 = make_lead(_row=3, LeadID="L2", Email="b@abc.com")
-    assert outreach.find_duplicate_email_leads([row1, row2]) == {}
-
-
-# =============================================================================
-# get_eligible_leads / build_batch / send_batch — ignore_wait_days override
-# =============================================================================
-
-def test_ignore_wait_days_makes_not_yet_due_lead_eligible():
-    recent = datetime.now().strftime(FMT)  # intro sent moments ago — normally NOT due for 3 more days
-    not_yet_waited = make_lead(IntroSentAt=recent)
-    eligible = outreach.get_eligible_leads([not_yet_waited], STAGES, 1, ignore_wait_days=True)
-    assert eligible == [not_yet_waited]
-
-
-def test_ignore_wait_days_still_requires_previous_stage_actually_sent():
-    # The override skips the WAIT, never the requirement that the stage
-    # before it actually happened — stage order is never skippable.
-    never_sent_intro = make_lead(IntroSentAt="")
-    eligible = outreach.get_eligible_leads([never_sent_intro], STAGES, 1, ignore_wait_days=True)
-    assert eligible == []
-
-
-def test_ignore_wait_days_still_respects_every_other_eligibility_rule():
-    recent = datetime.now().strftime(FMT)
-    already_sent_this_stage = make_lead(IntroSentAt=recent, FollowUp1SentAt=recent)
-    replied = make_lead(IntroSentAt=recent, ReplyStatus="Replied")
-    stopped = make_lead(IntroSentAt=recent, Status="Stopped - Bounced")
-    not_approved = make_lead(IntroSentAt=recent, Approval="No")
-
-    eligible = outreach.get_eligible_leads(
-        [already_sent_this_stage, replied, stopped, not_approved], STAGES, 1, ignore_wait_days=True)
-    assert eligible == []
-
-
-def test_ignore_wait_days_defaults_to_false_unchanged_behavior():
-    recent = datetime.now().strftime(FMT)
-    not_yet_waited = make_lead(IntroSentAt=recent)
-    eligible = outreach.get_eligible_leads([not_yet_waited], STAGES, 1)  # no ignore_wait_days passed at all
-    assert eligible == []
-
-
-def test_build_batch_ignore_wait_days_passthrough(monkeypatch):
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
-    recent = datetime.now().strftime(FMT)
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(_row=2, IntroSentAt=recent)
-
-    plan_default = outreach.build_batch(campaign_cfg, [lead], "followup1", 10)
-    assert plan_default == []
-
-    plan_override = outreach.build_batch(campaign_cfg, [lead], "followup1", 10, ignore_wait_days=True)
-    assert len(plan_override) == 1
-
-
-def test_send_batch_ignore_wait_days_passthrough(monkeypatch):
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    recent = datetime.now().strftime(FMT)
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com", IntroSentAt=recent)
-    fake_sheets = FakeSheets([lead])
-
-    results_default = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "followup1", 10)
-    assert results_default == []
-
-    results_override = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "followup1", 10,
-                                            ignore_wait_days=True)
-    assert len(results_override) == 1
-    assert results_override[0]["status"] == "sent"
-
-
-# =============================================================================
-# Template rendering — optional fields get graceful defaults
-# =============================================================================
-
-def test_render_text_substitutes_known_variables():
-    lead = {"FirstName": "John", "Company": "ABC Events"}
-    result = outreach.render_text("Hi {{FirstName}} from {{CompanyName}}", lead)
-    assert result == "Hi John from ABC Events"
-
-
-def test_render_text_unknown_variable_renders_empty_not_literal_placeholder():
-    result = outreach.render_text("Hi {{NotARealVar}}", {})
-    assert result == "Hi "
-    assert "{{" not in result
-
-
-def test_render_text_tracks_unknown_variable_as_missing():
+# The only fixed, canonical stage order the system knows about. A campaign
+# never needs all five — auto-discovery below stops at the first stage
+# with no template files at all, so 1 stage is just as valid as 5.
+CANONICAL_STAGE_ORDER = ["intro", "followup1", "followup2", "followup3", "followup4"]
+ALL_VARIANT_LETTERS = ["A", "B", "C", "D"]
+
+
+def discover_stages_and_variants(templates_dir: str, stage_wait_days: Dict[str, int]) -> Tuple[List[Dict], List[str]]:
+    """Auto-detects a campaign's stage sequence and variant set purely from
+    which template files exist — no YAML declaration required. Minimum is
+    1 stage + 1 variant (just intro_A.txt); maximum is 5 stages x A-D.
+
+    Two things keep this safe rather than silently permissive:
+    - Stages must be CONTIGUOUS from Intro — a gap (e.g. intro + followup2
+      but no followup1 files) is a configuration error, not "skip a stage".
+    - Every included stage must offer the EXACT SAME variant letters as
+      Intro. A campaign with fewer variants entirely (e.g. just A) is
+      fine; a LATER stage quietly missing ONE variant that an earlier
+      stage has is almost always an accidental missing file, not an
+      intentional design, so it's rejected with a clear message instead
+      of silently shrinking just that stage.
+    """
+    if not os.path.isdir(templates_dir):
+        raise ConfigError(f"Templates directory not found: {templates_dir}")
+
+    stages: List[Dict] = []
+    canonical_variants: Optional[List[str]] = None
+
+    for prefix in CANONICAL_STAGE_ORDER:
+        found_variants = [v for v in ALL_VARIANT_LETTERS
+                           if os.path.exists(os.path.join(templates_dir, f"{prefix}_{v}.txt"))]
+        if not found_variants:
+            break  # first gap — stages must be contiguous, stop here
+
+        if canonical_variants is None:
+            canonical_variants = found_variants
+        elif found_variants != canonical_variants:
+            missing = sorted(set(canonical_variants) - set(found_variants))
+            extra = sorted(set(found_variants) - set(canonical_variants))
+            problems = []
+            if missing:
+                problems.append(f"missing variant(s) {missing} (present in '{stages[0]['name']}')")
+            if extra:
+                problems.append(f"has extra variant(s) {extra} not present in '{stages[0]['name']}'")
+            raise ConfigError(
+                f"Inconsistent variants for stage '{prefix}' in {templates_dir}: {'; '.join(problems)}. "
+                "Every stage must offer the same variant letters — or specify 'stages' and 'variants' "
+                "explicitly together in this campaign's override file if that's genuinely intentional."
+            )
+
+        stages.append({
+            "name": prefix, "template_prefix": prefix,
+            "wait_days_after_previous": stage_wait_days.get(prefix, 0),
+        })
+
+    if not stages:
+        raise ConfigError(
+            f"No template files found in {templates_dir}. Expected at least 'intro_A.txt' "
+            "(or another variant letter)."
+        )
+
+    return stages, canonical_variants
+
+
+def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml",
+                  campaigns_dir: str = "config/campaigns", templates_root: str = "templates") -> dict:
+    settings = load_settings(settings_path)
+    shared_sheet_id = settings.get("shared_sheet_id", "")
+
+    # The actual safety gate: no templates folder, no campaign — regardless
+    # of what name was typed into a workflow input.
+    templates_dir = os.path.join(templates_root, campaign_name)
+    if not os.path.isdir(templates_dir):
+        raise ConfigError(
+            f"No templates found for campaign '{campaign_name}' — expected a folder at "
+            f"'{templates_dir}'. Create it with your template files before running this campaign. "
+            f"Currently available campaigns: {', '.join(discover_campaign_names(templates_root)) or '(none)'}"
+        )
+
+    default_settings = dict(settings.get("default_campaign_settings", {}))
+    stage_wait_days = default_settings.pop("stage_wait_days", {})
+    cfg = default_settings  # sending, reply_monitor — genuinely shared defaults
+
+    override = {}
+    override_path = os.path.join(campaigns_dir, f"{campaign_name}.yaml")
+    if os.path.exists(override_path):
+        with open(override_path, "r", encoding="utf-8") as f:
+            override = yaml.safe_load(f) or {}
+        non_shape_override = {k: v for k, v in override.items() if k not in ("stages", "variants")}
+        cfg = _deep_merge(cfg, non_shape_override)
+
+    has_stages = "stages" in override
+    has_variants = "variants" in override
+    if has_stages != has_variants:
+        raise ConfigError(
+            f"Campaign '{campaign_name}' override specifies only one of 'stages'/'variants' — "
+            "specify both together explicitly, or neither to auto-discover from template files."
+        )
+
+    if has_stages and has_variants:
+        # Explicit declaration — the strict path: every implied file MUST exist.
+        cfg["stages"] = override["stages"]
+        cfg["variants"] = override["variants"]
+        cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
+        _validate_templates_exist(campaign_name, cfg)
+    else:
+        # No explicit shape — auto-discover from whatever's actually there.
+        discovered_stages, discovered_variants = discover_stages_and_variants(templates_dir, stage_wait_days)
+        cfg["stages"] = discovered_stages
+        cfg["variants"] = discovered_variants
+        cfg["templates_dir"] = cfg.get("templates_dir") or templates_dir
+
+    cfg["sheet_id"] = cfg.get("sheet_id") or shared_sheet_id
+    cfg["master_tab"] = cfg.get("master_tab") or f"{campaign_name} Master Sheet"
+    cfg["responses_tab"] = cfg.get("responses_tab") or f"{campaign_name} Response Sheet"
+    cfg["send_log_tab"] = cfg.get("send_log_tab") or f"{campaign_name} Custom Log Sheet"
+    cfg["error_log_tab"] = cfg.get("error_log_tab") or f"{campaign_name} Error Log"
+    cfg["dashboard_tab"] = cfg.get("dashboard_tab") or f"{campaign_name} Dashboard"
+    # "active" preserves every campaign's actual current behavior before
+    # this field existed — only a NEW campaign explicitly created as
+    # "draft" (via the Streamlit New Campaign flow) should ever start
+    # anywhere other than active. Never default to "draft" here; that
+    # would silently pause every pre-existing campaign the moment this
+    # ships.
+    cfg["status"] = cfg.get("status") or "active"
+    cfg["_campaign_name"] = campaign_name
+    cfg["_global_default_account"] = (settings.get("email_accounts") or {}).get("default_account", "")
+
+    _validate_campaign(campaign_name, cfg)
+    return cfg
+
+
+def _validate_campaign(name: str, cfg: dict) -> None:
+    required = ["templates_dir", "stages", "variants", "sending"]
+    for key in required:
+        if key not in cfg:
+            raise ConfigError(f"Campaign '{name}' is missing required key '{key}'")
+
+    if not cfg.get("sheet_id") or str(cfg["sheet_id"]).startswith("PUT_YOUR"):
+        raise ConfigError(
+            f"Campaign '{name}': no sheet_id resolved. Set 'shared_sheet_id' in "
+            "config/settings.yaml (or 'sheet_id' in this campaign's override file)."
+        )
+    if len(cfg["stages"]) == 0:
+        raise ConfigError(f"Campaign '{name}' has no stages defined.")
+    if len(cfg["stages"]) > 5:
+        raise ConfigError(
+            f"Campaign '{name}' defines {len(cfg['stages'])} stages, but the Master "
+            "sheet schema only reserves columns for Intro + 4 follow-ups (5 max)."
+        )
+    if len(cfg["variants"]) < 1:
+        raise ConfigError(f"Campaign '{name}' must define at least one variant.")
+
+    sending = cfg.get("sending", {})
+    for key in ["timezone", "window_start", "window_end", "delay_min_minutes", "delay_max_minutes", "daily_limit"]:
+        if key not in sending:
+            raise ConfigError(f"Campaign '{name}' sending config missing '{key}'")
+
+    if "per_account_daily_limit" in sending and sending["per_account_daily_limit"] is not None:
+        limit = sending["per_account_daily_limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ConfigError(
+                f"Campaign '{name}': sending.per_account_daily_limit must be a positive integer, "
+                f"got {limit!r}."
+            )
+    if "sender_rotation" in sending and not isinstance(sending["sender_rotation"], bool):
+        raise ConfigError(f"Campaign '{name}': sending.sender_rotation must be true or false.")
+    if "rotation_accounts" in sending and sending["rotation_accounts"] is not None:
+        if not isinstance(sending["rotation_accounts"], list) or not sending["rotation_accounts"]:
+            raise ConfigError(
+                f"Campaign '{name}': sending.rotation_accounts must be a non-empty list of account "
+                "names, or omitted entirely to rotate across all EMAIL_ACCOUNTS_JSON accounts."
+            )
+
+
+def _validate_templates_exist(name: str, cfg: dict) -> None:
+    """Deliberately does NOT infer stages/variants from whatever template
+    files happen to exist — that would let a silently-missing file quietly
+    shrink a campaign's sequence. Instead: the configured stages/variants
+    are the source of truth, and every file they imply must actually be
+    present, or this fails loudly before any send is attempted."""
     missing = []
-    outreach.render_text("Hi {{TotallyUnknownField}}", {}, missing_out=missing)
-    assert missing == ["TotallyUnknownField"]
+    for stage in cfg["stages"]:
+        for variant in cfg["variants"]:
+            path = os.path.join(cfg["templates_dir"], f"{stage['template_prefix']}_{variant}.txt")
+            if not os.path.exists(path):
+                missing.append(path)
+    if missing:
+        listing = "\n".join(f"  - {p}" for p in missing)
+        raise ConfigError(
+            f"Campaign '{name}' is missing {len(missing)} template file(s):\n{listing}\n"
+            "Add these files, or adjust this campaign's stages/variants."
+        )
 
 
-def test_render_text_custom_column_resolves_directly():
-    lead = {"Industry": "Healthcare"}
-    result = outreach.render_text("Sector: {{Industry}}", lead)
-    assert result == "Sector: Healthcare"
-
-
-def test_render_text_blank_custom_column_renders_empty_without_flagging_missing():
-    lead = {"Industry": ""}
-    missing = []
-    result = outreach.render_text("Sector: {{Industry}}", lead, missing_out=missing)
-    assert result == "Sector: "
-    assert missing == []  # blank DATA for a real column is not an error
-
-
-def test_render_email_missing_variables_deduped():
-    # Two different templates referencing the same unknown variable twice
-    # within one file would only need de-duplication at render_email level;
-    # simulate via two render_text calls sharing one missing_out list.
-    missing = []
-    outreach.render_text("{{Ghost}} and {{Ghost}} again", {}, missing_out=missing)
-    seen = set()
-    deduped = [m for m in missing if not (m in seen or seen.add(m))]
-    assert deduped == ["Ghost"]
-
-
-def test_render_text_blank_first_name_gets_default_not_literal_placeholder():
-    result = outreach.render_text("Hi {{FirstName}},", {"FirstName": ""})
-    assert result == "Hi there,"
-    assert "{{" not in result
-
-
-def test_render_text_blank_company_gets_default():
-    result = outreach.render_text("at {{CompanyName}}", {"Company": ""})
-    assert result == "at your team"
+def _stage_index(stages: List[Dict], stage_name: str) -> int:
+    for i, s in enumerate(stages):
+        if s["name"] == stage_name:
+            return i
+    raise ValueError(f"Stage '{stage_name}' not found in campaign config.")
 
 
 # =============================================================================
-# render_email — blank Subject means "continue the existing thread"
+# SECTION 3: Google Sheets connector
+#
+# Each campaign gets 5 tabs: Master Sheet, Response Sheet, Custom Log Sheet,
+# Error Log, Dashboard — all auto-created on first connection. Header
+# validation only requires the REQUIRED columns to be present as a prefix,
+# in order; you're free to add extra trailing columns of your own (e.g. for
+# custom template variables) without breaking anything.
 # =============================================================================
 
-def test_render_email_blank_subject_continues_thread_with_re_prefix(tmp_path):
-    campaign_dir = tmp_path / "ThreadTest"
-    campaign_dir.mkdir()
-    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nJust following up, {{FirstName}}.")
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    lead = {"FirstName": "Sam", "ThreadSubject": "Quick question for you"}
-    rendered = outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
 
-    assert rendered["subject"] == "Re: Quick question for you"
-    assert rendered["is_continuation"] is True
-    assert rendered["thread_subject"] == "Quick question for you"  # unchanged, still the original
+def _build_gspread_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
 
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON env var is not set. "
+            "Put the full service account key JSON there (as a GitHub secret)."
+        )
+    info = json.loads(raw)
+    creds = Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
+    return gspread.authorize(creds), gspread
 
-def test_render_email_blank_subject_no_double_re_prefix(tmp_path):
-    campaign_dir = tmp_path / "ThreadTest2"
-    campaign_dir.mkdir()
-    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nBody.")
 
-    lead = {"ThreadSubject": "Re: Already a reply"}
-    rendered = outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
-
-    assert rendered["subject"] == "Re: Already a reply"  # not "Re: Re: Already a reply"
-
-
-def test_render_email_blank_subject_on_first_stage_raises_clearly(tmp_path):
-    campaign_dir = tmp_path / "ThreadTest3"
-    campaign_dir.mkdir()
-    (campaign_dir / "intro_A.txt").write_text("Subject: \n\nBody.")
-
-    with pytest.raises(outreach.TemplateError, match="no previous thread to continue"):
-        outreach.render_email(str(campaign_dir), "intro", "A", {}, is_first_stage=True)
-
-
-def test_render_email_blank_subject_with_no_stored_thread_subject_raises_clearly(tmp_path):
-    campaign_dir = tmp_path / "ThreadTest4"
-    campaign_dir.mkdir()
-    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nBody.")
-
-    lead = {"LeadID": "L99", "ThreadSubject": ""}  # never set — e.g. sent before this feature existed
-    with pytest.raises(outreach.TemplateError, match="no ThreadSubject recorded"):
-        outreach.render_email(str(campaign_dir), "followup1", "A", lead, is_first_stage=False)
-
-
-def test_render_email_non_blank_subject_resets_thread_subject(tmp_path):
-    campaign_dir = tmp_path / "ThreadTest5"
-    campaign_dir.mkdir()
-    (campaign_dir / "followup2_A.txt").write_text("Subject: A brand new angle for {{FirstName}}\n\nBody.")
-
-    lead = {"FirstName": "Sam", "ThreadSubject": "The old subject"}
-    rendered = outreach.render_email(str(campaign_dir), "followup2", "A", lead, is_first_stage=False)
-
-    assert rendered["subject"] == "A brand new angle for Sam"
-    assert rendered["is_continuation"] is False
-    assert rendered["thread_subject"] == "A brand new angle for Sam"  # reset to the new one
-
-
-def test_build_batch_carries_thread_subject_and_continuation_flag(monkeypatch):
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "Re: Original", "body": "B", "missing_variables": [],
-        "thread_subject": "Original", "is_continuation": True,
-    })
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(_row=2)
-    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
-    assert plan[0]["thread_subject"] == "Original"
-    assert plan[0]["is_continuation"] is True
-
-
-def test_send_batch_writes_thread_subject_to_master_sheet(monkeypatch):
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "Quick question", "body": "B", "missing_variables": [],
-        "thread_subject": "Quick question", "is_continuation": False,
-    })
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
-    outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert fake_sheets._leads[0]["ThreadSubject"] == "Quick question"
-
-
-# =============================================================================
-# backfill_thread_subjects — one-time migration for pre-existing leads
-# =============================================================================
-
-def test_backfill_skips_lead_with_thread_subject_already_set():
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(LeadID="L1", IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
-                      ThreadSubject="Already set")
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-    assert results == [{"lead_id": "L1", "status": "skipped_already_set"}]
-
-
-def test_backfill_skips_lead_never_sent_to():
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(IntroSentAt="", ThreadSubject="")
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-    assert results[0]["status"] == "skipped_not_sent_yet"
-
-
-def test_backfill_skips_lead_with_unknown_variant():
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(IntroSentAt="2026-08-01 09:00:00", IntroVariant="", ThreadSubject="")
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-    assert results[0]["status"] == "skipped_unknown_variant"
-    assert results[0]["stage"] == "intro"
-
-
-def test_backfill_uses_intro_when_only_intro_sent():
-    campaign_cfg = _base_campaign_cfg()
-    lead = make_lead(_row=2, LeadID="L1", FirstName="Sam",
-                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A", ThreadSubject="")
-
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-
-    expected_tmpl = outreach.load_template(TEMPLATES_DIR, "intro", "A")
-    expected_subject = outreach.render_text(expected_tmpl["subject"], lead)
-
-    assert results[0]["status"] == "backfilled"
-    assert results[0]["stage"] == "intro"
-    assert results[0]["thread_subject"] == expected_subject
-    assert results[0]["row"] == 2
-
-
-def test_backfill_uses_most_recently_sent_stage_not_intro(tmp_path):
-    # Lead has BOTH intro and followup1 sent — the correct subject to
-    # backfill from is followup1's (the most recent), not intro's. This is
-    # the core regression this whole function exists to get right.
-    #
-    # Deliberately isolated synthetic templates here, NOT the real
-    # templates/Kelson_Creators_Licensing ones — those are meant to be
-    # freely editable (including legitimately using a blank Subject for
-    # continuation), and this test's assertion depends on a SPECIFIC
-    # stage having a SPECIFIC non-blank subject, which the real templates
-    # shouldn't be constrained to guarantee forever.
-    campaign_dir = tmp_path / "BackfillOrderCampaign"
-    campaign_dir.mkdir()
-    (campaign_dir / "intro_A.txt").write_text("Subject: Intro subject\n\nBody.")
-    (campaign_dir / "followup1_B.txt").write_text("Subject: FollowUp1 subject\n\nBody.")
-
-    campaign_cfg = {
-        "templates_dir": str(campaign_dir), "variants": ["A", "B"],
-        "stages": [
-            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
-            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
-        ],
-    }
-    lead = make_lead(_row=3, LeadID="L2", FirstName="Sam",
-                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
-                      FollowUp1SentAt="2026-08-05 09:00:00", FollowUp1Variant="B", ThreadSubject="")
-
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-
-    assert results[0]["status"] == "backfilled"
-    assert results[0]["stage"] == "followup1"
-    assert results[0]["thread_subject"] == "FollowUp1 subject"
-
-
-def test_backfill_isolates_per_lead_template_errors(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    good_lead = make_lead(_row=2, LeadID="L1", IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
-                           ThreadSubject="")
-    bad_lead = make_lead(_row=3, LeadID="L2", IntroSentAt="2026-08-01 09:00:00", IntroVariant="Z",
-                          ThreadSubject="")  # variant Z has no template file — must not exist
-
-    results = outreach.backfill_thread_subjects(campaign_cfg, [good_lead, bad_lead])
-
-    statuses = {r["lead_id"]: r["status"] for r in results}
-    assert statuses["L1"] == "backfilled"
-    assert statuses["L2"] == "error"
-
-
-def test_backfill_skips_when_rerendered_subject_is_itself_blank(tmp_path):
-    campaign_dir = tmp_path / "BlankNowCampaign"
-    campaign_dir.mkdir()
-    (campaign_dir / "intro_A.txt").write_text("Subject: \n\nBody.")  # since migrated to blank-subject itself
-
-    campaign_cfg = {
-        "templates_dir": str(campaign_dir), "variants": ["A"],
-        "stages": [{"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0}],
-    }
-    lead = make_lead(IntroSentAt="2026-08-01 09:00:00", IntroVariant="A", ThreadSubject="")
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-    assert results[0]["status"] == "skipped_template_now_blank"
-
-
-def test_backfill_walks_back_past_a_blank_most_recent_stage(tmp_path):
-    # The exact real-world case that motivated this: Intro was sent with a
-    # real subject (before this feature existed), then followup1 was ALSO
-    # already sent — but using the NEW blank-subject-continuation
-    # convention. The most recent sent stage (followup1) has nothing to
-    # extract, but the real subject is still recoverable from Intro.
-    campaign_dir = tmp_path / "HybridCampaign"
-    campaign_dir.mkdir()
-    (campaign_dir / "intro_C.txt").write_text(
-        "Subject: DudeRobe – Meta Ad Usage Collaboration\n\nHi {{FirstName}},\n\nBody.")
-    (campaign_dir / "followup1_C.txt").write_text("Subject: \n\nJust following up.")
-
-    campaign_cfg = {
-        "templates_dir": str(campaign_dir), "variants": ["C"],
-        "stages": [
-            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
-            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
-        ],
-    }
-    lead = make_lead(_row=5, LeadID="L1", FirstName="Rithik",
-                      IntroSentAt="2026-08-26 05:29:01", IntroVariant="C",
-                      FollowUp1SentAt="2026-08-26 08:47:39", FollowUp1Variant="C", ThreadSubject="")
-
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-
-    assert results[0]["status"] == "backfilled"
-    assert results[0]["stage"] == "intro"  # walked back PAST followup1
-    assert results[0]["thread_subject"] == "DudeRobe – Meta Ad Usage Collaboration"
-
-
-def test_backfill_stops_at_first_non_blank_walking_backward_not_earliest(tmp_path):
-    # Three stages sent: intro (real subject A), followup1 (blank/continued),
-    # followup2 (real subject, deliberately reset). The correct answer is
-    # followup2's — the MOST RECENT real subject — not intro's, even though
-    # intro also has a real one and would be found by walking further back.
-    campaign_dir = tmp_path / "ThreeStageCampaign"
-    campaign_dir.mkdir()
-    (campaign_dir / "intro_A.txt").write_text("Subject: Original intro subject\n\nBody.")
-    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nContinuing the thread.")
-    (campaign_dir / "followup2_A.txt").write_text("Subject: A completely new angle\n\nBody.")
-
-    campaign_cfg = {
-        "templates_dir": str(campaign_dir), "variants": ["A"],
-        "stages": [
-            {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
-            {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
-            {"name": "followup2", "template_prefix": "followup2", "wait_days_after_previous": 4},
-        ],
-    }
-    lead = make_lead(_row=2, LeadID="L1",
-                      IntroSentAt="2026-08-01 09:00:00", IntroVariant="A",
-                      FollowUp1SentAt="2026-08-05 09:00:00", FollowUp1Variant="A",
-                      FollowUp2SentAt="2026-08-10 09:00:00", FollowUp2Variant="A", ThreadSubject="")
-
-    results = outreach.backfill_thread_subjects(campaign_cfg, [lead])
-
-    assert results[0]["status"] == "backfilled"
-    assert results[0]["stage"] == "followup2"
-    assert results[0]["thread_subject"] == "A completely new angle"
-
-
-def test_backfill_returns_nothing_to_write_for_empty_lead_list():
-    campaign_cfg = _base_campaign_cfg()
-    assert outreach.backfill_thread_subjects(campaign_cfg, []) == []
-
-
-# =============================================================================
-# is_within_sending_window — Phase E (Schedule). Every test passes an
-# explicit now_utc rather than relying on the real clock, so these are
-# fully deterministic regardless of when the suite actually runs.
-# =============================================================================
-
-def test_sending_window_empty_schedule_always_allowed():
-    within, reason = outreach.is_within_sending_window({})
-    assert within is True
-    assert reason == ""
-
-
-def test_sending_window_schedule_with_no_timezone_always_allowed():
-    # A schedule dict with only, say, send_days but no timezone can't be
-    # evaluated meaningfully — treat it as "no restriction" rather than
-    # guessing a timezone.
-    within, _ = outreach.is_within_sending_window({"send_days": ["mon"]})
-    assert within is True
-
-
-def test_sending_window_within_simple_window():
-    now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)  # a Monday, noon UTC
-    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
-    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
-    assert within is True
-    assert reason == ""
-
-
-def test_sending_window_before_window_start():
-    now = datetime(2026, 6, 15, 6, 0, tzinfo=timezone.utc)  # 06:00 UTC, before 09:00 window
-    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
-    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
-    assert within is False
-    assert "outside the sending window" in reason
-
-
-def test_sending_window_after_window_end():
-    now = datetime(2026, 6, 15, 18, 0, tzinfo=timezone.utc)  # 18:00 UTC, after 17:00 window
-    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
-    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
-    assert within is False
-
-
-def test_sending_window_boundaries_are_inclusive():
-    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
-    at_start = datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc)
-    at_end = datetime(2026, 6, 15, 17, 0, tzinfo=timezone.utc)
-    assert outreach.is_within_sending_window(schedule, now_utc=at_start)[0] is True
-    assert outreach.is_within_sending_window(schedule, now_utc=at_end)[0] is True
-
-
-def test_sending_window_midnight_crossing_window_inside():
-    # A window like 22:00-06:00 (overnight) — 23:00 and 02:00 should both
-    # count as "inside", even though start > end numerically.
-    schedule = {"timezone": "UTC", "window_start": "22:00", "window_end": "06:00"}
-    late_night = datetime(2026, 6, 15, 23, 0, tzinfo=timezone.utc)
-    early_morning = datetime(2026, 6, 16, 2, 0, tzinfo=timezone.utc)
-    assert outreach.is_within_sending_window(schedule, now_utc=late_night)[0] is True
-    assert outreach.is_within_sending_window(schedule, now_utc=early_morning)[0] is True
-
-
-def test_sending_window_midnight_crossing_window_outside():
-    schedule = {"timezone": "UTC", "window_start": "22:00", "window_end": "06:00"}
-    midday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
-    within, reason = outreach.is_within_sending_window(schedule, now_utc=midday)
-    assert within is False
-
-
-def test_sending_window_send_days_restricts_correctly():
-    schedule = {"timezone": "UTC", "send_days": ["mon", "tue", "wed", "thu", "fri"]}
-    monday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)  # a Monday
-    saturday = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)  # a Saturday
-    assert outreach.is_within_sending_window(schedule, now_utc=monday)[0] is True
-    within, reason = outreach.is_within_sending_window(schedule, now_utc=saturday)
-    assert within is False
-    assert "sat" in reason.lower()
-
-
-def test_sending_window_send_days_case_and_length_insensitive():
-    schedule = {"timezone": "UTC", "send_days": ["Monday", "TUE"]}
-    monday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
-    assert outreach.is_within_sending_window(schedule, now_utc=monday)[0] is True
-
-
-def test_sending_window_send_days_and_window_both_apply():
-    schedule = {"timezone": "UTC", "send_days": ["mon"], "window_start": "09:00", "window_end": "17:00"}
-    monday_in_window = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
-    monday_outside_window = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)
-    tuesday_in_window = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
-    assert outreach.is_within_sending_window(schedule, now_utc=monday_in_window)[0] is True
-    assert outreach.is_within_sending_window(schedule, now_utc=monday_outside_window)[0] is False
-    assert outreach.is_within_sending_window(schedule, now_utc=tuesday_in_window)[0] is False
-
-
-def test_sending_window_invalid_timezone_raises_config_error():
-    with pytest.raises(outreach.ConfigError, match="Invalid timezone"):
-        outreach.is_within_sending_window({"timezone": "Not/A/Real/Zone"})
-
-
-def test_sending_window_invalid_time_format_raises_config_error():
-    with pytest.raises(outreach.ConfigError, match="window_start/window_end"):
-        outreach.is_within_sending_window({"timezone": "UTC", "window_start": "9am", "window_end": "5pm"})
-
-
-def test_sending_window_dst_transition_same_utc_moment_different_local_result():
-    """The actual point of using zoneinfo instead of a fixed offset: the
-    SAME UTC instant of day must evaluate differently on either side of a
-    DST transition, because the real local time differs. A naive
-    fixed-offset implementation would get one of these two cases wrong."""
-    schedule = {"timezone": "America/Los_Angeles", "window_start": "09:00", "window_end": "17:00"}
-    # 16:00 UTC is 08:00 PST before the US 2026 spring-forward (Mar 8) —
-    # before the window opens.
-    before_dst = datetime(2026, 3, 1, 16, 0, tzinfo=timezone.utc)
-    # The SAME 16:00 UTC is 09:00 PDT after spring-forward — right at the
-    # window's start.
-    after_dst = datetime(2026, 3, 15, 16, 0, tzinfo=timezone.utc)
-
-    assert outreach.is_within_sending_window(schedule, now_utc=before_dst)[0] is False
-    assert outreach.is_within_sending_window(schedule, now_utc=after_dst)[0] is True
-
-
-def test_sending_window_naive_datetime_treated_as_utc():
-    """now_utc without tzinfo (e.g. datetime.now() called naively) must
-    still work correctly rather than raising or silently misbehaving —
-    treated as UTC, matching the function's own default when now_utc is
-    omitted entirely."""
-    naive_within_window = datetime(2026, 6, 15, 12, 0)  # no tzinfo
-    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
-    within, _ = outreach.is_within_sending_window(schedule, now_utc=naive_within_window)
-    assert within is True
-
-
-# =============================================================================
-# import_leads / remove_leads — Data tab backend (soft-remove only, never
-# a hard delete; see remove_leads' docstring)
-# =============================================================================
-
-def test_import_leads_appends_with_sequential_ids_continuing_from_max():
-    existing = [make_lead(_row=2, LeadID="3", Email="existing@abc.com")]
-    fake_sheets = FakeSheets(existing)
-    new_leads = [{"FirstName": "Sam", "Email": "sam@abc.com"}, {"FirstName": "Alex", "Email": "alex@abc.com"}]
-
-    summary = outreach.import_leads(fake_sheets, "TestCampaign", new_leads)
-
-    assert summary == {"imported": 2, "skipped_duplicate": 0, "skipped_no_email": 0}
-    imported = [l for l in fake_sheets._leads if l.get("FirstName") in ("Sam", "Alex")]
-    assert {l["LeadID"] for l in imported} == {"4", "5"}  # continues from existing max (3)
-
-
-def test_import_leads_sets_campaign_and_blank_approval_by_default():
-    fake_sheets = FakeSheets([])
-    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
-    imported = fake_sheets._leads[0]
-    assert imported["Campaign"] == "TestCampaign"
-    assert imported["Approval"] == ""  # Pending — never defaults to eligible-to-send
-
-
-def test_import_leads_respects_explicit_approval_if_caller_set_it():
-    fake_sheets = FakeSheets([])
-    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com", "Approval": "Yes"}])
-    assert fake_sheets._leads[0]["Approval"] == "Yes"
-
-
-def test_import_leads_skips_rows_with_no_email():
-    fake_sheets = FakeSheets([])
-    summary = outreach.import_leads(fake_sheets, "TestCampaign", [{"FirstName": "NoEmail"}])
-    assert summary == {"imported": 0, "skipped_duplicate": 0, "skipped_no_email": 1}
-    assert fake_sheets._leads == []
-
-
-def test_import_leads_skips_duplicate_emails_case_insensitive():
-    existing = [make_lead(_row=2, LeadID="1", Email="Sam@Abc.com")]
-    fake_sheets = FakeSheets(existing)
-    summary = outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
-    assert summary == {"imported": 0, "skipped_duplicate": 1, "skipped_no_email": 0}
-
-
-def test_import_leads_skips_duplicates_within_the_same_import_batch_too():
-    fake_sheets = FakeSheets([])
-    new_leads = [{"Email": "sam@abc.com"}, {"Email": "SAM@ABC.COM"}]
-    summary = outreach.import_leads(fake_sheets, "TestCampaign", new_leads)
-    assert summary == {"imported": 1, "skipped_duplicate": 1, "skipped_no_email": 0}
-
-
-def test_import_leads_first_id_is_one_when_no_existing_leads():
-    fake_sheets = FakeSheets([])
-    outreach.import_leads(fake_sheets, "TestCampaign", [{"Email": "sam@abc.com"}])
-    assert fake_sheets._leads[0]["LeadID"] == "1"
-
-
-def test_remove_leads_sets_status_removed_not_hard_delete():
-    leads = [make_lead(_row=2, LeadID="5", Email="a@abc.com"), make_lead(_row=3, LeadID="8", Email="b@abc.com")]
-    fake_sheets = FakeSheets(leads)
-
-    summary = outreach.remove_leads(fake_sheets, ["5"])
-
-    assert summary == {"removed": 1, "not_found": 0}
-    assert len(fake_sheets._leads) == 2  # row still exists — soft remove, not delete
-    removed = next(l for l in fake_sheets._leads if l["LeadID"] == "5")
-    assert removed["Status"] == outreach.STATUS_REMOVED
-    kept = next(l for l in fake_sheets._leads if l["LeadID"] == "8")
-    assert kept["Status"] != outreach.STATUS_REMOVED
-
-
-def test_remove_leads_reports_not_found_ids():
-    leads = [make_lead(_row=2, LeadID="5", Email="a@abc.com")]
-    fake_sheets = FakeSheets(leads)
-    summary = outreach.remove_leads(fake_sheets, ["5", "999"])
-    assert summary == {"removed": 1, "not_found": 1}
-
-
-def test_removed_status_excludes_lead_from_eligibility():
-    lead = make_lead(Status=outreach.STATUS_REMOVED)
-    eligible = outreach.get_eligible_leads([lead], STAGES, 0)
-    assert eligible == []
-
-
-def test_all_20_templates_load_and_render_without_leftover_placeholders_even_with_blank_fields():
-    # Deliberately blank FirstName/LastName/Company to prove optional fields
-    # never leak "{{...}}" into an outgoing email. ThreadSubject is
-    # supplied so this test isn't coupled to whether any particular real
-    # template has chosen to use a blank Subject (continue-the-thread) —
-    # that's a legitimate, supported per-template choice, and this test's
-    # job is just "does everything render cleanly", not "does every
-    # template have its own subject".
-    lead = {"FirstName": "", "LastName": "", "Company": "", "Email": "john@abc.com",
-            "ThreadSubject": "Placeholder Original Subject"}
-    stages = ["intro", "followup1", "followup2", "followup3", "followup4"]
-    variants = ["A", "B", "C", "D"]
-    count = 0
-    for stage in stages:
-        for variant in variants:
-            rendered = outreach.render_email(TEMPLATES_DIR, stage, variant, lead,
-                                               is_first_stage=(stage == "intro"))
-            assert rendered["subject"], f"{stage}_{variant}: empty subject"
-            assert "{{" not in rendered["subject"], f"{stage}_{variant}: unrendered var in subject"
-            assert "{{" not in rendered["body"], f"{stage}_{variant}: unrendered var in body"
-            count += 1
-    assert count == 20
-
-
-def test_templates_contain_no_diaz_or_event_branding():
-    stages = ["intro", "followup1", "followup2", "followup3", "followup4"]
-    variants = ["A", "B", "C", "D"]
-    for stage in stages:
-        for variant in variants:
-            path = os.path.join(TEMPLATES_DIR, f"{stage}_{variant}.txt")
-            content = open(path, encoding="utf-8").read().lower()
-            assert "diaz" not in content
-            assert "festival" not in content
-            assert "eventname" not in content
-
-
-# =============================================================================
-# config loader — template-folder discovery, settings.yaml, optional overrides
-# =============================================================================
-
-def _make_config_fixture(tmp_path, shared_sheet_id="real_sheet_id_123", extra_settings_yaml="",
-                          campaign_name="test_campaign", create_templates=True, template_variants=("A",),
-                          override_yaml=None):
-    """Builds a full settings.yaml + templates/<campaign>/ + optional
-    config/campaigns/<campaign>.yaml fixture under tmp_path, and returns
-    the (settings_path, campaigns_dir, templates_root) tuple to pass into
-    get_campaign()."""
-    settings_path = tmp_path / "settings.yaml"
-    campaigns_dir = tmp_path / "campaigns"
-    templates_root = tmp_path / "templates"
-    campaigns_dir.mkdir(exist_ok=True)
-    templates_root.mkdir(exist_ok=True)
-
-    settings_content = f"""
-shared_sheet_id: "{shared_sheet_id}"
-email_accounts:
-  default_account: "sales1"
-default_campaign_settings:
-  stage_wait_days:
-    intro: 0
-    followup1: 3
-    followup2: 4
-    followup3: 5
-    followup4: 5
-  sending:
-    timezone: "Asia/Kolkata"
-    window_start: "09:00"
-    window_end: "17:00"
-    delay_min_minutes: 1
-    delay_max_minutes: 2
-    daily_limit: 10
-{extra_settings_yaml}
-"""
-    settings_path.write_text(settings_content)
-
-    if create_templates:
-        campaign_templates_dir = templates_root / campaign_name
-        campaign_templates_dir.mkdir(exist_ok=True)
-        for variant in template_variants:
-            (campaign_templates_dir / f"intro_{variant}.txt").write_text("Subject: Hi\n\nBody")
-
-    if override_yaml is not None:
-        (campaigns_dir / f"{campaign_name}.yaml").write_text(override_yaml)
-
-    return str(settings_path), str(campaigns_dir), str(templates_root)
-
-
-def test_get_campaign_auto_derives_tab_names_from_campaign_key(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["sheet_id"] == "real_sheet_id_123"
-    assert cfg["master_tab"] == "test_campaign Master Sheet"
-    assert cfg["responses_tab"] == "test_campaign Response Sheet"
-    assert cfg["send_log_tab"] == "test_campaign Custom Log Sheet"
-    assert cfg["error_log_tab"] == "test_campaign Error Log"
-    assert cfg["dashboard_tab"] == "test_campaign Dashboard"
-    assert cfg["_global_default_account"] == "sales1"
-
-
-def test_get_campaign_rejects_missing_shared_sheet_id(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, shared_sheet_id="")
+def _get_or_create_ws(spreadsheet, gspread_module, title: str, required_header: List[str]):
     try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
+        ws = spreadsheet.worksheet(title)
+    except gspread_module.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=max(len(required_header) + 5, 10))
+        ws.append_row(required_header)
+        return ws
+
+    existing_header = ws.row_values(1)
+    if not existing_header:
+        ws.append_row(required_header)
+    elif existing_header[:len(required_header)] != required_header:
+        raise RuntimeError(
+            f"Header row in tab '{title}' does not start with the expected columns.\n"
+            f"Expected (in this order, as a prefix): {required_header}\n"
+            f"Found: {existing_header}\n"
+            "Fix the header manually, or delete the tab so it gets recreated "
+            "automatically on the next run. Extra columns AFTER the required "
+            "ones are fine and preserved."
+        )
+    return ws
 
 
-def test_get_campaign_missing_campaign_raises_and_lists_available(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
+class SheetsConnector:
+    def __init__(self, sheet_id: str, master_tab: str, responses_tab: str, send_log_tab: str,
+                 error_log_tab: str, dashboard_tab: str):
+        self.sheet_id = sheet_id
+        self._client, self._gspread = _build_gspread_client()
+        self._spreadsheet = self._client.open_by_key(sheet_id)
+
+        self.master_ws = _get_or_create_ws(self._spreadsheet, self._gspread, master_tab, MASTER_COLUMNS)
+        self.responses_ws = _get_or_create_ws(self._spreadsheet, self._gspread, responses_tab, RESPONSES_COLUMNS)
+        self.send_log_ws = _get_or_create_ws(self._spreadsheet, self._gspread, send_log_tab, SEND_LOG_COLUMNS)
+        self.error_log_ws = _get_or_create_ws(self._spreadsheet, self._gspread, error_log_tab, ERROR_LOG_COLUMNS)
+        self.dashboard_ws = _get_or_create_ws(self._spreadsheet, self._gspread, dashboard_tab, DASHBOARD_COLUMNS)
+
+    # ---------- Master ----------
+
+    def get_all_leads(self) -> List[Dict]:
+        # No expected_headers override: reads the REAL header row, so any
+        # extra custom columns you've added come through as dict keys too.
+        records = self.master_ws.get_all_records()
+        leads = []
+        for i, record in enumerate(records, start=2):  # row 1 is header
+            record["_row"] = i
+            leads.append(record)
+        return leads
+
+    def update_lead_fields(self, row_number: int, fields: Dict[str, str]) -> None:
+        gspread = self._gspread
+        updates = []
+        for col_name, value in fields.items():
+            if col_name not in MASTER_COLUMNS:
+                raise ValueError(f"Unknown Master column '{col_name}'")
+            col_index = MASTER_COLUMNS.index(col_name) + 1  # 1-indexed
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row_number, col_index),
+                "values": [[value]],
+            })
+        if updates:
+            self.master_ws.batch_update(updates)
+
+    def append_lead(self, fields: Dict[str, str]) -> None:
+        """Appends ONE new row. Unlike update_lead_fields, this is NOT
+        restricted to MASTER_COLUMNS — it builds the row against whatever
+        the sheet's ACTUAL header row currently is, so any custom trailing
+        columns (Title, Website, LinkedIn, ...) get filled in correctly
+        too. Any field not present in `fields` is left blank in that
+        column, not an error — a CSV import commonly won't map every
+        column."""
+        header = self.master_ws.row_values(1)
+        row = [str(fields.get(col, "")) for col in header]
+        self.master_ws.append_row(row, value_input_option="RAW")
+
+    def update_lead_statuses(self, row_numbers_to_status: Dict[int, str]) -> None:
+        """Bulk status update (e.g. soft-remove) — one batch_update call
+        covering every row, not one API call per row. Always stamps
+        LastActionAt alongside Status, matching every other status write
+        in this file."""
+        gspread = self._gspread
+        now_str = datetime.now().strftime(DATETIME_FMT)
+        status_col = MASTER_COLUMNS.index("Status") + 1
+        last_action_col = MASTER_COLUMNS.index("LastActionAt") + 1
+        updates = []
+        for row_number, status in row_numbers_to_status.items():
+            updates.append({"range": gspread.utils.rowcol_to_a1(row_number, status_col), "values": [[status]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(row_number, last_action_col), "values": [[now_str]]})
+        if updates:
+            self.master_ws.batch_update(updates)
+
+    # ---------- Responses ----------
+
+    def get_logged_message_ids(self) -> set:
+        ids = self.responses_ws.col_values(RESPONSES_COLUMNS.index("MessageID") + 1)
+        return set(ids[1:])  # skip header
+
+    def get_all_responses(self) -> List[Dict]:
+        return self.responses_ws.get_all_records()
+
+    def append_response(self, fields: Dict[str, str]) -> None:
+        row = [fields.get(col, "") for col in RESPONSES_COLUMNS]
+        self.responses_ws.append_row(row, value_input_option="RAW")
+
+    # ---------- Send Log ----------
+
+    def get_all_send_log(self) -> List[Dict]:
+        return self.send_log_ws.get_all_records()
+
+    def append_send_log(self, fields: Dict[str, str]) -> None:
+        row = [fields.get(col, "") for col in SEND_LOG_COLUMNS]
+        self.send_log_ws.append_row(row, value_input_option="RAW")
+
+    # ---------- Error Log ----------
+
+    def get_all_error_log(self) -> List[Dict]:
+        return self.error_log_ws.get_all_records()
+
+    def append_error_log(self, fields: Dict[str, str]) -> None:
+        row = [fields.get(col, "") for col in ERROR_LOG_COLUMNS]
+        self.error_log_ws.append_row(row, value_input_option="RAW")
+
+
+def get_all_campaigns_dashboard_ws(sheet_id: str):
+    """The combined cross-campaign dashboard lives in one shared tab, not
+    scoped to any single campaign's connector."""
+    client, gspread_module = _build_gspread_client()
+    spreadsheet = client.open_by_key(sheet_id)
+    return _get_or_create_ws(spreadsheet, gspread_module, "All Campaigns Dashboard", ALL_CAMPAIGNS_DASHBOARD_COLUMNS)
+
+
+# =============================================================================
+# SECTION 4: Error logging helper
+#
+# Used everywhere an error needs recording. Never lets a logging failure
+# crash the run it's trying to report on — falls back to stderr.
+# =============================================================================
+
+def log_error(sheets: "SheetsConnector", campaign_name: str, error_type: str, message: str,
+              lead_id: str = "", email_addr: str = "", stage: str = "", batch_id: str = "") -> None:
     try:
-        outreach.get_campaign("does_not_exist", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError as exc:
-        assert "does_not_exist" in str(exc)
-        assert "test_campaign" in str(exc)  # lists what IS available
-
-
-def test_get_campaign_works_with_zero_override_files(tmp_path):
-    # The core promise: a campaign with templates but NO override file at
-    # all must just work, using pure defaults.
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["sending"]["daily_limit"] == 10
-    assert cfg["variants"] == ["A"]
-
-
-def test_get_campaign_override_file_changes_only_what_it_specifies(tmp_path):
-    override = """
-sending:
-  daily_limit: 999
-"""
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["sending"]["daily_limit"] == 999          # overridden
-    assert cfg["sending"]["window_start"] == "09:00"      # still inherited
-    assert cfg["variants"] == ["A"]                       # still inherited
-
-
-def test_get_campaign_status_defaults_to_active_when_unset(tmp_path):
-    # Critical backward-compat guarantee: every campaign that existed
-    # before "status" was introduced has no override for it at all, and
-    # must keep behaving exactly as it always did — never silently paused.
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["status"] == "active"
-
-
-def test_get_campaign_status_respects_explicit_override(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml="status: paused\n")
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["status"] == "paused"
-
-
-def test_get_campaign_status_draft_override(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml="status: draft\n")
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["status"] == "draft"
-
-
-def test_get_campaign_explicit_tab_override_wins_over_auto_derivation(tmp_path):
-    override = 'master_tab: "CustomMaster"\n'
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["master_tab"] == "CustomMaster"
-    assert cfg["responses_tab"] == "test_campaign Response Sheet"  # still auto-derived
+        sheets.append_error_log({
+            "Timestamp": datetime.now().strftime(DATETIME_FMT),
+            "Campaign": campaign_name, "ErrorType": error_type, "LeadID": lead_id,
+            "Email": email_addr, "Stage": stage, "BatchID": batch_id, "Message": str(message)[:500],
+        })
+    except Exception as log_exc:  # noqa: BLE001 - never let error logging crash the run
+        print(f"WARNING: failed to write to error log ({error_type}: {message}): {log_exc}", file=sys.stderr)
 
 
 # =============================================================================
-# Template-folder discovery IS campaign existence (the actual safety gate)
+# SECTION 5: Template engine
+#
+# Only Email is mandatory per lead. Known variables (FirstName, LastName,
+# CompanyName) get graceful defaults when blank. Any OTHER {{Variable}} is
+# resolved directly against a matching Master column of the same name —
+# this is how custom variables (e.g. {{Industry}}) work, with no code
+# changes needed, as long as you've added that column to Master yourself.
+# A blank value (known or custom) renders as nothing, never as literal
+# "{{...}}" syntax. A variable that matches NO column at all (a likely
+# typo) also renders as nothing, but gets tracked and flagged — see
+# render_email's missing_variables return value.
 # =============================================================================
 
-def test_get_campaign_raises_clearly_when_templates_folder_missing(tmp_path):
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, create_templates=False)
-    try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError as exc:
-        assert "No templates found" in str(exc)
-        assert "test_campaign" in str(exc)
+PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
+TEMPLATE_VARIABLE_MAP = {
+    "FirstName": "FirstName",
+    "LastName": "LastName",
+    "CompanyName": "Company",
+    "Email": "Email",
+}
 
-def test_get_campaign_auto_discovers_fewer_variants_without_erroring(tmp_path):
-    # No explicit override: a campaign with just intro_A.txt (missing the
-    # B/C/D that a bigger campaign might have) is a perfectly valid,
-    # smaller campaign — must NOT raise, per the flexible-by-default design.
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(
-        tmp_path, template_variants=("A",))
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["variants"] == ["A"]
-    assert len(cfg["stages"]) == 1
-    assert cfg["stages"][0]["name"] == "intro"
-
-
-def test_get_campaign_explicit_override_still_raises_on_missing_file(tmp_path):
-    # Only when stages/variants are EXPLICITLY declared together in an
-    # override file does a missing template file raise an error —
-    # auto-discovery (no override) never requires more than what's there.
-    override = (
-        "stages:\n"
-        "  - name: intro\n"
-        "    template_prefix: intro\n"
-        "    wait_days_after_previous: 0\n"
-        'variants: ["A", "B"]\n'
-    )
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(
-        tmp_path, template_variants=("A",), override_yaml=override)  # only A exists, B declared
-    try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError as exc:
-        assert "intro_B.txt" in str(exc)
-
-
-def test_get_campaign_override_specifying_only_stages_not_variants_raises(tmp_path):
-    override = (
-        "stages:\n"
-        "  - name: intro\n"
-        "    template_prefix: intro\n"
-        "    wait_days_after_previous: 0\n"
-    )
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError as exc:
-        assert "only one of" in str(exc)
-
-
-def test_discover_campaign_names_lists_template_subfolders(tmp_path):
-    templates_root = tmp_path / "templates"
-    templates_root.mkdir()
-    (templates_root / "CampaignA").mkdir()
-    (templates_root / "CampaignB").mkdir()
-    (templates_root / ".hidden").mkdir()  # must be excluded
-    (templates_root / "not_a_dir.txt").write_text("x")  # must be excluded — not a directory
-    names = outreach.discover_campaign_names(str(templates_root))
-    assert names == ["CampaignA", "CampaignB"]
-
-
-def test_discover_campaign_names_empty_when_no_templates_root():
-    names = outreach.discover_campaign_names("/tmp/definitely_does_not_exist_xyz")
-    assert names == []
-
-
-# =============================================================================
-# _deep_merge
-# =============================================================================
-
-def test_deep_merge_overrides_only_specified_keys():
-    base = {"a": 1, "sending": {"daily_limit": 100, "timezone": "UTC"}}
-    override = {"sending": {"daily_limit": 5}}
-    result = outreach._deep_merge(base, override)
-    assert result == {"a": 1, "sending": {"daily_limit": 5, "timezone": "UTC"}}
-
-
-def test_deep_merge_replaces_lists_wholesale_not_elementwise():
-    base = {"stages": [{"name": "intro"}, {"name": "followup1"}]}
-    override = {"stages": [{"name": "intro"}]}
-    result = outreach._deep_merge(base, override)
-    assert result["stages"] == [{"name": "intro"}]  # fully replaced, not merged
-
-
-def test_deep_merge_does_not_mutate_base():
-    base = {"sending": {"daily_limit": 100}}
-    override = {"sending": {"daily_limit": 5}}
-    outreach._deep_merge(base, override)
-    assert base["sending"]["daily_limit"] == 100  # untouched
-
-
-# =============================================================================
-# resolve_sender_account — lead override > campaign default > global default
-# =============================================================================
-
-ACCOUNTS = {
-    "sales1": {"address": "sales1@gmail.com", "app_password": "aaaa bbbb cccc dddd"},
-    "sales2": {"address": "sales2@gmail.com", "app_password": "eeee ffff gggg hhhh"},
+DEFAULT_VALUES = {
+    "FirstName": "there",
+    "LastName": "",
+    "CompanyName": "your team",
 }
 
 
-def test_resolve_uses_lead_override_first():
-    lead = make_lead(SenderAccount="sales2")
-    campaign_cfg = {"_global_default_account": "sales1"}
-    assert outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS) == "sales2"
+class TemplateError(Exception):
+    pass
 
 
-def test_resolve_falls_back_to_campaign_default():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales1", "default_sender_account": "sales2"}
-    assert outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS) == "sales2"
+def load_template(templates_dir: str, template_prefix: str, variant: str) -> Dict[str, str]:
+    """Template file format: first line = 'Subject: ...', blank line, then body."""
+    path = os.path.join(templates_dir, f"{template_prefix}_{variant}.txt")
+    if not os.path.exists(path):
+        raise TemplateError(f"Template file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    if not content.startswith("Subject:"):
+        raise TemplateError(
+            f"Template {path} must start with a 'Subject: ...' line, followed by a "
+            "blank line and then the email body."
+        )
+    lines = content.split("\n")
+    subject = lines[0][len("Subject:"):].strip()
+    body = "\n".join(lines[1:]).lstrip("\n")
+    return {"subject": subject, "body": body}
 
 
-def test_resolve_falls_back_to_global_default():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales1"}
-    assert outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS) == "sales1"
+def render_text(text: str, lead: Dict[str, str], missing_out: Optional[List[str]] = None) -> str:
+    def _replace(match):
+        var_name = match.group(1)
+        if var_name in TEMPLATE_VARIABLE_MAP:
+            sheet_col = TEMPLATE_VARIABLE_MAP[var_name]
+            value = (lead.get(sheet_col) or "").strip()
+            return value if value else DEFAULT_VALUES.get(var_name, "")
+        if var_name in lead:
+            # A real custom column — just blank for this lead. Normal, not an error.
+            return (lead.get(var_name) or "").strip()
+        # No column anywhere matches this variable name — almost certainly a
+        # typo or a template referencing a field that was never added.
+        if missing_out is not None:
+            missing_out.append(var_name)
+        return ""
+
+    return PLACEHOLDER_RE.sub(_replace, text)
 
 
-def test_resolve_raises_for_unknown_lead_override():
-    lead = make_lead(SenderAccount="does_not_exist")
-    campaign_cfg = {"_global_default_account": "sales1"}
+def render_email(templates_dir: str, template_prefix: str, variant: str, lead: Dict[str, str],
+                  is_first_stage: bool = False) -> Dict:
+    """Renders subject + body. A template's Subject line can be left BLANK
+    to mean "continue the same thread" instead of starting a new one —
+    mirrors the same convention other outreach tools use. When blank:
+
+    - The outgoing subject becomes "Re: " + the lead's stored
+      ThreadSubject (the most recent NON-blank subject actually sent to
+      this lead), so Gmail/Outlook thread it together with the earlier
+      message instead of starting a new conversation. Already-"Re:"
+      subjects aren't double-prefixed.
+    - ThreadSubject itself is left unchanged (still continuing the same
+      original subject, not resetting it).
+
+    A non-blank Subject always "resets" ThreadSubject going forward to
+    whatever was actually rendered, so a later stage can deliberately
+    start a fresh subject/thread, and any stage after THAT can continue
+    from it with a blank Subject again.
+
+    is_first_stage=True (the very first stage in the sequence) can never
+    use a blank Subject — there's no previous thread to continue from a
+    first message, so this raises immediately rather than sending a blank
+    or guessed subject line.
+    """
+    tmpl = load_template(templates_dir, template_prefix, variant)
+    missing: List[str] = []
+    rendered_subject = render_text(tmpl["subject"], lead, missing_out=missing)
+    body = render_text(tmpl["body"], lead, missing_out=missing)
+
+    is_continuation = False
+    if rendered_subject.strip():
+        subject = rendered_subject
+        thread_subject = rendered_subject
+    else:
+        if is_first_stage:
+            raise TemplateError(
+                f"{template_prefix}_{variant}.txt has a blank Subject line, but this is the FIRST stage "
+                "in the sequence — there's no previous thread to continue. Every first-stage template "
+                "needs a non-blank Subject."
+            )
+        existing_thread_subject = (lead.get("ThreadSubject") or "").strip()
+        if not existing_thread_subject:
+            raise TemplateError(
+                f"{template_prefix}_{variant}.txt has a blank Subject line (continue-the-thread), but "
+                f"lead '{lead.get('LeadID', '?')}' has no ThreadSubject recorded to continue from — this "
+                "usually means the lead was sent to before this feature existed. Either put a Subject in "
+                "this template, or fill in ThreadSubject manually in the Master Sheet for this lead."
+            )
+        subject = existing_thread_subject if existing_thread_subject.lower().startswith("re:") \
+            else f"Re: {existing_thread_subject}"
+        thread_subject = existing_thread_subject
+        is_continuation = True
+
+    seen = set()
+    deduped_missing = []
+    for name in missing:
+        if name not in seen:
+            seen.add(name)
+            deduped_missing.append(name)
+
+    return {"subject": subject, "body": body, "missing_variables": deduped_missing,
+            "thread_subject": thread_subject, "is_continuation": is_continuation}
+
+
+# =============================================================================
+# SECTION 6: Variant selector
+# =============================================================================
+
+def pick_variant(leads: List[Dict], variant_field: str, variants: List[str],
+                  already_assigned_in_batch: Optional[Dict[str, int]] = None) -> str:
+    counts = {v: 0 for v in variants}
+    for lead in leads:
+        v = lead.get(variant_field, "")
+        if v in counts:
+            counts[v] += 1
+
+    if already_assigned_in_batch:
+        for v, n in already_assigned_in_batch.items():
+            if v in counts:
+                counts[v] += n
+
+    min_count = min(counts.values())
+    least_used = [v for v, c in counts.items() if c == min_count]
+    return random.choice(least_used)
+
+
+# =============================================================================
+# SECTION 7: Eligibility
+# =============================================================================
+
+def _parse_dt(value: str):
+    if not value:
+        return None
     try:
-        outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS)
-        assert False, "should have raised ValueError"
-    except ValueError:
-        pass
+        return dateparser.parse(value)
+    except (ValueError, TypeError):
+        return None
 
 
-def test_resolve_raises_when_nothing_configured():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": ""}
+EMAIL_FORMAT_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email_format(value: str) -> bool:
+    return bool(EMAIL_FORMAT_RE.match((value or "").strip()))
+
+
+def find_duplicate_email_leads(leads: List[Dict]) -> Dict[str, List[Dict]]:
+    """{email: [lead, lead, ...]} for every email address appearing in MORE
+    THAN ONE Master Sheet row — always a data-entry mistake within a single
+    campaign (a copy-paste, or re-adding a lead under a new LeadID), never
+    a legitimate case. get_eligible_leads already protects against
+    actually sending to more than one of them regardless of whether this
+    warning is surfaced — this is purely for visibility, so the mistake
+    gets noticed and cleaned up rather than silently persisting."""
+    by_email: Dict[str, List[Dict]] = {}
+    for lead in leads:
+        email = (lead.get("Email") or "").strip().lower()
+        if not email:
+            continue
+        by_email.setdefault(email, []).append(lead)
+    return {email: rows for email, rows in by_email.items() if len(rows) > 1}
+
+
+VALID_SEND_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def is_within_sending_window(schedule: Dict, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+    """schedule: {timezone, window_start, window_end, send_days} — all
+    optional, and a missing/empty schedule (or one with no timezone) means
+    "always allowed", exactly matching every campaign's behavior before
+    this feature existed. Returns (is_within, reason) — reason is only
+    ever non-empty when is_within is False.
+
+    Deliberately takes now_utc as a parameter (defaulting to the real
+    current time) rather than always calling datetime.now() internally —
+    that's what makes this testable across specific moments, including
+    DST transitions, without mocking the clock.
+
+    Uses a real IANA timezone via the stdlib zoneinfo — never a fixed
+    offset — so DST is handled correctly automatically; this is exactly
+    the category of bug (silently sending at the wrong local time, or
+    silently never sending at all) that's easy to get subtly wrong with a
+    naive UTC-offset calculation.
+    """
+    if not schedule:
+        return True, ""
+
+    tz_name = schedule.get("timezone")
+    if not tz_name:
+        return True, ""
+
     try:
-        outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS)
-        assert False, "should have raised ValueError"
-    except ValueError:
-        pass
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(
+            f"Invalid timezone '{tz_name}' in schedule config — use a real IANA name "
+            f"(e.g. 'America/Los_Angeles', not 'PST'). Error: {exc}"
+        )
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    local_now = now_utc.astimezone(tz)
+
+    send_days = schedule.get("send_days")
+    if send_days:
+        normalized_days = [d.strip().lower()[:3] for d in send_days]
+        today = VALID_SEND_DAYS[local_now.weekday()]
+        if today not in normalized_days:
+            return False, (
+                f"Today ({today}) is not one of this campaign's send_days ({', '.join(normalized_days)}) "
+                f"in {tz_name}"
+            )
+
+    window_start = schedule.get("window_start")
+    window_end = schedule.get("window_end")
+    if window_start and window_end:
+        try:
+            start_t = datetime.strptime(window_start, "%H:%M").time()
+            end_t = datetime.strptime(window_end, "%H:%M").time()
+        except ValueError as exc:
+            raise ConfigError(f"Invalid window_start/window_end in schedule config (expected HH:MM): {exc}")
+
+        current_t = local_now.time()
+        if start_t <= end_t:
+            in_window = start_t <= current_t <= end_t
+        else:
+            # A window that crosses midnight (e.g. 22:00-06:00) — "in
+            # window" means AFTER start OR BEFORE end, not between them.
+            in_window = current_t >= start_t or current_t <= end_t
+
+        if not in_window:
+            return False, (
+                f"Current time {current_t.strftime('%H:%M')} {tz_name} is outside the sending "
+                f"window ({window_start}-{window_end})"
+            )
+
+    return True, ""
+
+
+def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
+                        ignore_wait_days: bool = False) -> List[Dict]:
+    this_sent_field = stage_field_names(stage_index)["sent_at"]
+
+    prev_sent_field = None
+    wait_days = 0
+    if stage_index > 0:
+        prev_sent_field = stage_field_names(stage_index - 1)["sent_at"]
+        wait_days = stages[stage_index].get("wait_days_after_previous", 0)
+
+    eligible = []
+    now = datetime.now()
+
+    for lead in leads:
+        if not (lead.get("Email") or "").strip():
+            continue  # Email is mandatory
+        if lead.get("Approval") != APPROVAL_YES:
+            continue
+        if lead.get("Status", "") in TERMINAL_STATUSES:
+            continue
+        if lead.get("ReplyStatus", "") == "Replied":
+            continue
+        if lead.get(this_sent_field, ""):
+            continue  # already sent this stage — duplicate protection
+
+        if stage_index == 0:
+            eligible.append(lead)
+            continue
+
+        prev_sent_raw = lead.get(prev_sent_field, "")
+        if not prev_sent_raw:
+            continue  # the PREVIOUS stage must actually have been sent — this
+                       # is stage ORDER, never skippable, unaffected by
+                       # ignore_wait_days (that only overrides the WAIT, not
+                       # the requirement that the previous stage happened)
+
+        if ignore_wait_days:
+            eligible.append(lead)
+            continue
+
+        prev_sent_dt = _parse_dt(prev_sent_raw)
+        if prev_sent_dt is None:
+            continue
+
+        if now >= prev_sent_dt + timedelta(days=wait_days):
+            eligible.append(lead)
+
+    # De-duplicate by EMAIL ADDRESS, not row — the checks above only ever
+    # protect a single row against being sent to twice. If the same email
+    # exists as two separate rows (a copy-paste mistake, or re-adding a
+    # lead under a new LeadID), both rows independently pass every check
+    # and this would otherwise send the same person the same stage twice
+    # in the same run. Keeps the first (lowest row number) occurrence —
+    # see find_duplicate_email_leads for surfacing this as a warning
+    # rather than silently dropping it.
+    deduped = []
+    seen_emails = set()
+    for lead in eligible:
+        email = (lead.get("Email") or "").strip().lower()
+        if email in seen_emails:
+            continue
+        seen_emails.add(email)
+        deduped.append(lead)
+    return deduped
 
 
 # =============================================================================
-# SMTP message construction (pure — no real network)
+# SECTION 8: Email accounts — multi-account SMTP/IMAP with App Passwords
 # =============================================================================
 
-def test_build_outbound_message_sets_core_headers():
-    msg, message_id = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Hello", "Body text"
-    )
-    assert msg["From"] == "me@work.com"
-    assert msg["To"] == "lead@abc.com"
-    assert msg["Subject"] == "Hello"
-    assert msg["Message-ID"] == message_id
-    assert message_id  # non-empty
-    assert msg["In-Reply-To"] is None
-    assert msg["References"] is None
+EMAIL_ACCOUNT_SLOT_COUNT = 10  # start small — see check_single_account_health's docstring in the
+                                # Campaigns Hub plan for why this isn't jumped straight to 20
 
 
-def test_build_outbound_message_sets_threading_headers_when_provided():
-    msg, _ = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Re: Hello", "Body",
-        in_reply_to="<abc@mail.gmail.com>", references="<abc@mail.gmail.com>",
-    )
-    assert msg["In-Reply-To"] == "<abc@mail.gmail.com>"
-    assert msg["References"] == "<abc@mail.gmail.com>"
+def _load_email_accounts_from_slots() -> Dict[str, Dict[str, str]]:
+    """Reads EMAIL_ACCOUNT_SLOT_1..N env vars, each holding ONE account's
+    JSON ({"name": ..., "address": ..., "app_password": ...}), empty/unset
+    if that slot isn't in use. Returns {} — NOT an error — if none of the
+    slots are populated at all, since a repo mid-migration (or one that
+    hasn't started migrating) legitimately has zero slots set and relies
+    entirely on the legacy EMAIL_ACCOUNTS_JSON blob instead."""
+    accounts: Dict[str, Dict[str, str]] = {}
+    for i in range(1, EMAIL_ACCOUNT_SLOT_COUNT + 1):
+        raw = os.environ.get(f"EMAIL_ACCOUNT_SLOT_{i}")
+        if not raw or not raw.strip():
+            continue
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"EMAIL_ACCOUNT_SLOT_{i} is not valid JSON: {exc}")
+        for field in ("name", "address", "app_password"):
+            if field not in info:
+                raise RuntimeError(f"EMAIL_ACCOUNT_SLOT_{i} is missing '{field}'.")
+        accounts[info["name"]] = {"address": info["address"], "app_password": info["app_password"]}
+    return accounts
 
 
-def test_build_outbound_message_sets_cc_header_when_provided():
-    msg, _ = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Hello", "Body", cc=["a@abc.com", "b@abc.com"],
-    )
-    assert msg["Cc"] == "a@abc.com, b@abc.com"
+def load_email_accounts() -> Dict[str, Dict[str, str]]:
+    """Reads from the new per-account EMAIL_ACCOUNT_SLOT_1..N secrets if
+    any are populated, merged with the legacy EMAIL_ACCOUNTS_JSON blob if
+    THAT'S also still set — a slot always wins over a same-named
+    EMAIL_ACCOUNTS_JSON entry, so an in-app edit (which only ever touches
+    a slot) takes effect immediately even before the old blob is
+    eventually retired. Once every account has been migrated into a slot
+    and EMAIL_ACCOUNTS_JSON is removed, this naturally becomes
+    "slots only" with no code change needed here."""
+    slot_accounts = _load_email_accounts_from_slots()
+
+    raw_json = os.environ.get("EMAIL_ACCOUNTS_JSON")
+    json_accounts: Dict[str, Dict[str, str]] = {}
+    if raw_json:
+        json_accounts = json.loads(raw_json)
+        for name, info in json_accounts.items():
+            if "address" not in info or "app_password" not in info:
+                raise RuntimeError(f"Account '{name}' in EMAIL_ACCOUNTS_JSON is missing 'address' or 'app_password'.")
+
+    if not slot_accounts and not json_accounts:
+        raise RuntimeError(
+            "No email accounts configured — set EMAIL_ACCOUNT_SLOT_1 (etc.), the legacy "
+            "EMAIL_ACCOUNTS_JSON, or both during migration."
+        )
+
+    merged = dict(json_accounts)
+    merged.update(slot_accounts)  # slots win on a name collision
+    return merged
 
 
-def test_build_outbound_message_omits_cc_header_when_not_provided():
-    msg, _ = outreach._build_outbound_message("me@work.com", "lead@abc.com", "Hello", "Body")
-    assert msg["Cc"] is None
+def resolve_sender_account(lead: Dict, campaign_cfg: Dict, accounts: Dict[str, Dict[str, str]]) -> str:
+    """Original single-default resolution (no rotation): lead override >
+    campaign default > global default. Still used directly whenever
+    sender_rotation is off. Kept unchanged so nothing that depended on it
+    before breaks."""
+    requested = (lead.get("SenderAccount") or "").strip()
+    if requested:
+        if requested not in accounts:
+            raise MissingSenderAccountError(f"Unknown SenderAccount '{requested}' — not in EMAIL_ACCOUNTS_JSON.")
+        return requested
+
+    campaign_default = campaign_cfg.get("default_sender_account", "")
+    if campaign_default:
+        if campaign_default not in accounts:
+            raise MissingSenderAccountError(
+                f"Campaign default_sender_account '{campaign_default}' not in EMAIL_ACCOUNTS_JSON.")
+        return campaign_default
+
+    global_default = campaign_cfg.get("_global_default_account", "")
+    if not global_default:
+        raise MissingSenderAccountError("No SenderAccount on the lead, and no default account is configured.")
+    if global_default not in accounts:
+        raise MissingSenderAccountError(f"Default account '{global_default}' not in EMAIL_ACCOUNTS_JSON.")
+    return global_default
 
 
-def test_build_outbound_message_never_adds_a_bcc_header():
-    """Bcc must never appear in the message itself — that's what makes it
-    blind. build_outbound_message doesn't even accept a bcc parameter;
-    only smtp_send does, where it can only ever affect the SMTP envelope
-    recipient list, never the message content."""
-    import inspect
-    sig = inspect.signature(outreach._build_outbound_message)
-    assert "bcc" not in sig.parameters
+def get_rotation_accounts(campaign_cfg: Dict, accounts: Dict[str, Dict[str, str]]) -> List[str]:
+    """Which accounts are in the rotation pool. Defaults to every account in
+    EMAIL_ACCOUNTS_JSON; narrow it with sending.rotation_accounts."""
+    configured = campaign_cfg.get("sending", {}).get("rotation_accounts")
+    if configured:
+        return [a for a in configured if a in accounts]
+    return list(accounts.keys())
 
 
-def test_smtp_send_cc_recipients_included_in_envelope(monkeypatch):
-    captured = {}
-
-    class FakeSMTP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def login(self, address, password):
-            pass
-
-        def sendmail(self, from_addr, to_addrs, msg_string):
-            captured["to_addrs"] = to_addrs
-            captured["msg_string"] = msg_string
-
-    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
-    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
-                        cc=["cc1@abc.com", "cc2@abc.com"])
-
-    assert captured["to_addrs"] == ["lead@abc.com", "cc1@abc.com", "cc2@abc.com"]
-    assert "Cc: cc1@abc.com, cc2@abc.com" in captured["msg_string"]
+def pick_rotation_account(rotation_accounts: List[str], per_account_daily_limit: Optional[int],
+                           sent_today_by_account: Dict[str, int],
+                           batch_assigned_counts: Dict[str, int]) -> Optional[str]:
+    """Picks the least-used-today account from the rotation pool that still
+    has capacity. Returns None if every account is at its cap."""
+    eligible = []
+    for acct in rotation_accounts:
+        used = sent_today_by_account.get(acct, 0) + batch_assigned_counts.get(acct, 0)
+        if per_account_daily_limit is not None and used >= per_account_daily_limit:
+            continue
+        eligible.append((acct, used))
+    if not eligible:
+        return None
+    min_used = min(u for _, u in eligible)
+    least_used = [a for a, u in eligible if u == min_used]
+    return random.choice(least_used)
 
 
-def test_smtp_send_bcc_recipients_in_envelope_but_never_in_message_text(monkeypatch):
-    captured = {}
-
-    class FakeSMTP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def login(self, address, password):
-            pass
-
-        def sendmail(self, from_addr, to_addrs, msg_string):
-            captured["to_addrs"] = to_addrs
-            captured["msg_string"] = msg_string
-
-    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
-    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
-                        bcc=["secret@abc.com"])
-
-    assert "secret@abc.com" in captured["to_addrs"]  # gets the mail
-    assert "secret@abc.com" not in captured["msg_string"]  # but invisible to every other recipient
-    assert "Bcc" not in captured["msg_string"]
+def _check_account_capacity(account_name: str, per_account_daily_limit: Optional[int],
+                             sent_today_by_account: Dict[str, int],
+                             batch_assigned_counts: Dict[str, int]) -> None:
+    if per_account_daily_limit is None:
+        return
+    used = sent_today_by_account.get(account_name, 0) + batch_assigned_counts.get(account_name, 0)
+    if used >= per_account_daily_limit:
+        raise SenderCapacityReachedError(
+            f"Account '{account_name}' has reached its per-account daily limit ({per_account_daily_limit}).")
 
 
-def test_smtp_send_cc_and_bcc_together(monkeypatch):
-    captured = {}
+def resolve_sender_account_for_send(lead: Dict, campaign_cfg: Dict, accounts: Dict[str, Dict[str, str]],
+                                     sent_today_by_account: Dict[str, int],
+                                     batch_assigned_counts: Dict[str, int]) -> str:
+    """The resolution actually used at send time. Priority, per the design
+    goal of keeping manual assignment as an override rather than replacing
+    it:
 
-    class FakeSMTP:
-        def __init__(self, *a, **kw):
-            pass
+    1. The lead's own SenderAccount cell, if set — ALWAYS wins, and is
+       checked against the per-account daily limit exactly like every other
+       path (a manual pin doesn't bypass the safety cap; if that account is
+       full, this lead is deferred rather than silently rerouted to a
+       different account than the sheet says).
+    2. If sending.sender_rotation is enabled — auto-pick the least-used
+       eligible account from the rotation pool.
+    3. Otherwise, the original single-default behavior (resolve_sender_account).
 
-        def __enter__(self):
-            return self
+    Raises MissingSenderAccountError or SenderCapacityReachedError, both
+    caught and classified by send_batch's per-lead error isolation.
+    """
+    sending_cfg = campaign_cfg.get("sending", {})
+    per_account_limit = sending_cfg.get("per_account_daily_limit")
 
-        def __exit__(self, *a):
-            return False
+    requested = (lead.get("SenderAccount") or "").strip()
+    if requested:
+        if requested not in accounts:
+            raise MissingSenderAccountError(f"Unknown SenderAccount '{requested}' — not in EMAIL_ACCOUNTS_JSON.")
+        _check_account_capacity(requested, per_account_limit, sent_today_by_account, batch_assigned_counts)
+        return requested
 
-        def login(self, address, password):
-            pass
+    if sending_cfg.get("sender_rotation"):
+        rotation_accounts = get_rotation_accounts(campaign_cfg, accounts)
+        if not rotation_accounts:
+            raise MissingSenderAccountError(
+                "sender_rotation is enabled but no valid accounts are configured "
+                "(check sending.rotation_accounts and EMAIL_ACCOUNTS_JSON)."
+            )
+        chosen = pick_rotation_account(rotation_accounts, per_account_limit,
+                                        sent_today_by_account, batch_assigned_counts)
+        if chosen is None:
+            raise SenderCapacityReachedError(
+                f"All rotation accounts are at their per-account daily limit ({per_account_limit}).")
+        return chosen
 
-        def sendmail(self, from_addr, to_addrs, msg_string):
-            captured["to_addrs"] = to_addrs
-
-    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
-    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
-                        cc=["cc@abc.com"], bcc=["bcc@abc.com"])
-
-    assert captured["to_addrs"] == ["lead@abc.com", "cc@abc.com", "bcc@abc.com"]
-
-
-def test_smtp_send_with_no_cc_or_bcc_envelope_unchanged():
-    """Backward-compat guarantee — every existing call site (build_batch's
-    normal sends) doesn't pass cc/bcc at all; the envelope must stay
-    exactly [to], matching behavior before this feature existed."""
-    import inspect
-    sig = inspect.signature(outreach.smtp_send)
-    assert sig.parameters["cc"].default is None
-    assert sig.parameters["bcc"].default is None
-
-
-# =============================================================================
-# send_manual_reply — Phase H1. Deliberately never looks anything up
-# itself (which thread, which lead) — the caller is expected to have
-# already resolved to/subject/in_reply_to/references; this only sends
-# and validates what it's given.
-# =============================================================================
-
-ACCOUNTS_FOR_REPLY = {"sales1": {"address": "sales1@gmail.com", "app_password": "aaaa bbbb cccc dddd"}}
-
-
-def test_send_manual_reply_calls_smtp_send_with_resolved_threading(monkeypatch):
-    captured = {}
-
-    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
-                        cc=None, bcc=None, attachments=None):
-        captured.update(locals())
-        return {"message_id": "<reply1@mail.gmail.com>"}
-
-    monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
-
-    result = outreach.send_manual_reply(
-        ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Re: Hi", "Thanks for your interest!",
-        in_reply_to="<inbound1@mail.gmail.com>", references="<orig@mail.gmail.com> <inbound1@mail.gmail.com>",
-    )
-
-    assert result == {"message_id": "<reply1@mail.gmail.com>"}
-    assert captured["to"] == "lead@abc.com"
-    assert captured["in_reply_to"] == "<inbound1@mail.gmail.com>"
-    assert captured["references"] == "<orig@mail.gmail.com> <inbound1@mail.gmail.com>"
-    assert captured["address"] == "sales1@gmail.com"
-
-
-def test_send_manual_reply_passes_through_cc_and_bcc(monkeypatch):
-    captured = {}
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
-
-    outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                cc=["cc@abc.com"], bcc=["bcc@abc.com"])
-
-    assert captured["cc"] == ["cc@abc.com"]
-    assert captured["bcc"] == ["bcc@abc.com"]
-
-
-def test_send_manual_reply_raises_for_unknown_sender_account():
-    with pytest.raises(outreach.MissingSenderAccountError, match="ghost_account"):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "ghost_account", "lead@abc.com", "Hi", "Body")
-
-
-def test_send_manual_reply_raises_for_invalid_to_email():
-    with pytest.raises(outreach.InvalidEmailFormatError):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "not-an-email", "Hi", "Body")
-
-
-def test_send_manual_reply_raises_for_invalid_cc_email():
-    with pytest.raises(outreach.InvalidEmailFormatError, match="Cc/Bcc"):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                    cc=["not-an-email"])
-
-
-def test_send_manual_reply_raises_for_invalid_bcc_email():
-    with pytest.raises(outreach.InvalidEmailFormatError, match="Cc/Bcc"):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                    bcc=["not-an-email"])
-
-
-def test_send_manual_reply_never_calls_smtp_for_invalid_recipient(monkeypatch):
-    smtp_called = []
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1))
-    with pytest.raises(outreach.InvalidEmailFormatError):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "not-an-email", "Hi", "Body")
-    assert smtp_called == []
-
-
-def test_send_manual_reply_works_with_no_threading_info():
-    """A reply doesn't strictly require in_reply_to/references — while
-    every real use case from the Responses tab will supply them, the
-    function itself shouldn't require it (matches smtp_send's own
-    Optional parameters)."""
-    import inspect
-    sig = inspect.signature(outreach.send_manual_reply)
-    assert sig.parameters["in_reply_to"].default is None
-    assert sig.parameters["references"].default is None
+    chosen = resolve_sender_account(lead, campaign_cfg, accounts)
+    _check_account_capacity(chosen, per_account_limit, sent_today_by_account, batch_assigned_counts)
+    return chosen
 
 
 # =============================================================================
-# Attachments — Phase H2
+# SECTION 9: SMTP sending
 # =============================================================================
 
-def test_build_outbound_message_no_attachments_produces_plain_mimetext():
-    """Backward-compat guarantee — every automated send (build_batch's
-    normal path) never passes attachments; the message shape must stay
-    EXACTLY the plain MIMEText it always was, not a MIMEMultipart wrapper
-    around a single part."""
-    msg, _ = outreach._build_outbound_message("me@work.com", "lead@abc.com", "Hello", "Body")
-    assert msg.get_content_maintype() == "text"
-    assert not msg.is_multipart()
-
-
-def test_build_outbound_message_with_attachments_is_multipart():
-    msg, _ = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Hello", "Body",
-        attachments=[{"filename": "photo.png", "content": b"fake-png-bytes"}],
-    )
-    assert msg.is_multipart()
-    parts = msg.get_payload()
-    assert len(parts) == 2  # body + one attachment
-
-
-def test_build_outbound_message_attachment_filename_and_content_preserved():
-    msg, _ = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Hello", "Body",
-        attachments=[{"filename": "photo.png", "content": b"fake-png-bytes"}],
-    )
-    attachment_part = msg.get_payload()[1]
-    assert attachment_part.get_filename() == "photo.png"
-    import base64
-    assert base64.b64decode(attachment_part.get_payload()) == b"fake-png-bytes"
-
-
-def test_build_outbound_message_multiple_attachments():
-    msg, _ = outreach._build_outbound_message(
-        "me@work.com", "lead@abc.com", "Hello", "Body",
-        attachments=[
-            {"filename": "a.png", "content": b"aaa"},
-            {"filename": "b.png", "content": b"bbb"},
-        ],
-    )
-    parts = msg.get_payload()
-    assert len(parts) == 3  # body + two attachments
-    filenames = {p.get_filename() for p in parts[1:]}
-    assert filenames == {"a.png", "b.png"}
-
-
-def test_send_manual_reply_rejects_attachments_over_size_cap():
-    oversized = [{"filename": "huge.png", "content": b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)}]
-    with pytest.raises(outreach.AttachmentTooLargeError, match="MB"):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                    attachments=oversized)
-
-
-def test_send_manual_reply_accepts_attachments_under_size_cap(monkeypatch):
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    small = [{"filename": "small.png", "content": b"x" * 100}]
-    result = outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                         attachments=small)
-    assert result == {"message_id": "<m@mail.gmail.com>"}
-
-
-def test_send_manual_reply_size_check_sums_multiple_attachments():
-    half = outreach.MAX_TOTAL_ATTACHMENT_BYTES // 2 + 1
-    oversized = [{"filename": "a.png", "content": b"x" * half}, {"filename": "b.png", "content": b"x" * half}]
-    with pytest.raises(outreach.AttachmentTooLargeError):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                    attachments=oversized)
-
-
-def test_send_manual_reply_never_calls_smtp_when_attachments_too_large(monkeypatch):
-    smtp_called = []
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1))
-    oversized = [{"filename": "huge.png", "content": b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)}]
-    with pytest.raises(outreach.AttachmentTooLargeError):
-        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                    attachments=oversized)
-    assert smtp_called == []
-
-
-def test_send_manual_reply_passes_attachments_through_to_smtp_send(monkeypatch):
-    captured = {}
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
-    attachments = [{"filename": "photo.png", "content": b"data"}]
-    outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
-                                attachments=attachments)
-    assert captured["attachments"] == attachments
-
-
-def test_smtp_send_no_attachments_backward_compatible():
-    """Same backward-compat guarantee at the smtp_send layer — no
-    attachments means attachments=None flows through unchanged, matching
-    every call site before this feature existed."""
-    import inspect
-    sig = inspect.signature(outreach.smtp_send)
-    assert sig.parameters["attachments"].default is None
-
-
-# =============================================================================
-# Account health check — connection status without ever exposing passwords
-# =============================================================================
-
-def test_check_single_account_health_success(monkeypatch):
-    class FakeIMAP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def login(self, address, password):
-            pass
-
-        def logout(self):
-            pass
-
-    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
-    status, detail = outreach.check_single_account_health("sales1@gmail.com", "app-pass")
-    assert status == "Connected"
-    assert detail == ""
-
-
-def test_check_single_account_health_failure_never_includes_password(monkeypatch):
-    class FakeIMAP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def login(self, address, password):
-            raise outreach.imaplib.IMAP4.error("AUTHENTICATIONFAILED Invalid credentials")
-
-        def logout(self):
-            pass
-
-    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
-    status, detail = outreach.check_single_account_health("sales1@gmail.com", "super-secret-app-password")
-    assert status == "Disconnected"
-    assert "super-secret-app-password" not in detail
-    assert "super-secret-app-password" not in status
-
-
-def test_check_single_account_health_logs_out_even_on_failure(monkeypatch):
-    logout_called = []
-
-    class FakeIMAP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def login(self, address, password):
-            raise RuntimeError("connection refused")
-
-        def logout(self):
-            logout_called.append(1)
-
-    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
-    outreach.check_single_account_health("sales1@gmail.com", "app-pass")
-    assert logout_called == [1]
-
-
-def test_check_single_account_health_logout_failure_does_not_mask_result(monkeypatch):
-    class FakeIMAP:
-        def __init__(self, *a, **kw):
-            pass
-
-        def login(self, address, password):
-            pass
-
-        def logout(self):
-            raise RuntimeError("logout also broken")
-
-    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
-    status, detail = outreach.check_single_account_health("sales1@gmail.com", "app-pass")
-    assert status == "Connected"  # the real result, not swallowed by the logout failure
-
-
-def test_check_account_health_isolates_broken_account_from_working_ones(monkeypatch):
-    accounts = {
-        "sales1": {"address": "sales1@gmail.com", "app_password": "good-pass"},
-        "sales2": {"address": "sales2@gmail.com", "app_password": "bad-pass"},
-    }
-
-    def fake_check(address, app_password):
-        if app_password == "bad-pass":
-            return "Disconnected", "auth failed"
-        return "Connected", ""
-
-    monkeypatch.setattr(outreach, "check_single_account_health", fake_check)
-    results = outreach.check_account_health(accounts)
-
-    assert len(results) == 2
-    by_name = {r["AccountName"]: r for r in results}
-    assert by_name["sales1"]["Status"] == "Connected"
-    assert by_name["sales2"]["Status"] == "Disconnected"
-
-
-def test_check_account_health_never_includes_app_password_field(monkeypatch):
-    accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "super-secret"}}
-    monkeypatch.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
-    results = outreach.check_account_health(accounts)
-    assert "app_password" not in results[0]
-    assert "super-secret" not in json.dumps(results[0])
-
-
-def test_check_account_health_matches_column_schema():
-    accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "x"}}
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
-        results = outreach.check_account_health(accounts)
-    assert set(results[0].keys()) == set(outreach.ACCOUNT_HEALTH_COLUMNS)
-
-
-def test_check_account_health_empty_accounts_dict():
-    assert outreach.check_account_health({}) == []
-
-
-def test_write_account_health_clears_existing_rows_before_writing(monkeypatch):
-    class FakeWorksheet:
-        def __init__(self):
-            self.cleared_ranges = []
-            self.appended_rows = []
-            self._values = [outreach.ACCOUNT_HEALTH_COLUMNS, ["old_account", "old@x.com", "Connected", "", "t"]]
-
-        def get_all_values(self):
-            return self._values
-
-        def row_values(self, n):
-            return self._values[n - 1] if n <= len(self._values) else []
-
-        def batch_clear(self, ranges):
-            self.cleared_ranges.extend(ranges)
-
-        def append_rows(self, rows):
-            self.appended_rows.extend(rows)
-
-    fake_ws = FakeWorksheet()
-
-    class FakeSpreadsheet:
-        def worksheet(self, title):
-            return fake_ws
-
-    class FakeGspreadModule:
-        class exceptions:
-            class WorksheetNotFound(Exception):
-                pass
-
-    monkeypatch.setattr(outreach, "_build_gspread_client",
-                         lambda: (type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet()})(),
-                                  FakeGspreadModule))
-
-    results = [{"AccountName": "sales1", "Address": "sales1@x.com", "Status": "Connected",
-                "Detail": "", "CheckedAt": "2026-08-29 09:00:00"}]
-    outreach.write_account_health("fake-sheet-id", results)
-
-    assert fake_ws.cleared_ranges == ["A2:E2"]
-    assert fake_ws.appended_rows == [["sales1", "sales1@x.com", "Connected", "", "2026-08-29 09:00:00"]]
-
-
-def test_write_account_health_skips_clear_when_tab_was_empty(monkeypatch):
-    class FakeWorksheet:
-        def __init__(self):
-            self.cleared_ranges = []
-            self.appended_rows = []
-            self._values = [outreach.ACCOUNT_HEALTH_COLUMNS]  # header only, no data rows yet
-
-        def get_all_values(self):
-            return self._values
-
-        def row_values(self, n):
-            return self._values[n - 1] if n <= len(self._values) else []
-
-        def batch_clear(self, ranges):
-            self.cleared_ranges.extend(ranges)
-
-        def append_rows(self, rows):
-            self.appended_rows.extend(rows)
-
-    fake_ws = FakeWorksheet()
-
-    class FakeSpreadsheet:
-        def worksheet(self, title):
-            return fake_ws
-
-    class FakeGspreadModule:
-        class exceptions:
-            class WorksheetNotFound(Exception):
-                pass
-
-    monkeypatch.setattr(outreach, "_build_gspread_client",
-                         lambda: (type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet()})(),
-                                  FakeGspreadModule))
-
-    outreach.write_account_health("fake-sheet-id", [{"AccountName": "sales1", "Address": "a@x.com",
-                                                       "Status": "Connected", "Detail": "", "CheckedAt": "t"}])
-    assert fake_ws.cleared_ranges == []  # nothing to clear
-
-
-def test_cmd_check_account_health_writes_and_prints(monkeypatch, capsys):
-    monkeypatch.setattr(outreach, "load_email_accounts",
-                         lambda: {"sales1": {"address": "sales1@gmail.com", "app_password": "x"}})
-    monkeypatch.setattr(outreach, "load_settings", lambda: {"shared_sheet_id": "fake-id"})
-    monkeypatch.setattr(outreach, "check_account_health",
-                         lambda accounts: [{"AccountName": "sales1", "Address": "sales1@gmail.com",
-                                             "Status": "Connected", "Detail": "", "CheckedAt": "t"}])
-    write_calls = []
-    monkeypatch.setattr(outreach, "write_account_health", lambda sheet_id, results: write_calls.append((sheet_id, results)))
-
-    outreach.cmd_check_account_health(argparse.Namespace())
-
-    assert write_calls[0][0] == "fake-id"
-    out = capsys.readouterr().out
-    assert "sales1" in out
-    assert "Connected" in out
-
-
-# =============================================================================
-# cmd_send_reply — the CLI/workflow entry point
-# =============================================================================
-
-def _write_reply_payload(tmp_path, **overrides):
-    import json as _json
-    payload = {
-        "sender_account": "sales1", "to": "lead@abc.com", "subject": "Re: Hi",
-        "body": "Thanks!", "in_reply_to": "<inbound1@mail.gmail.com>",
-        "references": "<orig@mail.gmail.com> <inbound1@mail.gmail.com>",
-        "lead_id": "5",
-    }
-    payload.update(overrides)
-    path = tmp_path / "reply_payload.json"
-    path.write_text(_json.dumps(payload))
-    return str(path)
-
-
-def test_cmd_send_reply_success_logs_sent_to_send_log(monkeypatch, tmp_path, capsys):
-    fake_sheets = FakeSheets([])
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<reply1@mail.gmail.com>"})
-
-    payload_path = _write_reply_payload(tmp_path)
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-    outreach.cmd_send_reply(args)
-
-    assert len(fake_sheets.send_log) == 1
-    entry = fake_sheets.send_log[0]
-    assert entry["Status"] == "sent"
-    assert entry["Stage"] == "manual_reply"
-    assert entry["MessageID"] == "<reply1@mail.gmail.com>"
-    assert entry["LeadID"] == "5"
-    assert "Sent." in capsys.readouterr().out
-
-
-def test_cmd_send_reply_failure_logs_error_and_exits_nonzero(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-
-    def failing_smtp_send(*a, **kw):
-        raise RuntimeError("SMTP boom")
-
-    monkeypatch.setattr(outreach, "smtp_send", failing_smtp_send)
-
-    payload_path = _write_reply_payload(tmp_path)
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-
-    with pytest.raises(SystemExit) as exc_info:
-        outreach.cmd_send_reply(args)
-    assert exc_info.value.code == 1
-
-    assert len(fake_sheets.send_log) == 1
-    assert fake_sheets.send_log[0]["Status"] == "error"
-    assert len(fake_sheets.error_log) == 1
-
-
-def test_cmd_send_reply_unknown_sender_account_isolated(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-
-    payload_path = _write_reply_payload(tmp_path, sender_account="ghost_account")
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-
-    with pytest.raises(SystemExit):
-        outreach.cmd_send_reply(args)
-
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_MISSING_SENDER_ACCOUNT
-
-
-def test_cmd_send_reply_passes_cc_bcc_through_to_send(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    captured = {}
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
-
-    payload_path = _write_reply_payload(tmp_path, cc=["cc@abc.com"], bcc=["bcc@abc.com"])
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-    outreach.cmd_send_reply(args)
-
-    assert captured["cc"] == ["cc@abc.com"]
-    assert captured["bcc"] == ["bcc@abc.com"]
-
-
-def test_cmd_send_reply_decodes_base64_attachments(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    captured = {}
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
-
-    import base64 as _b64
-    encoded = _b64.b64encode(b"fake-png-bytes").decode("ascii")
-    payload_path = _write_reply_payload(tmp_path, attachments=[{"filename": "photo.png", "content_base64": encoded}])
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-    outreach.cmd_send_reply(args)
-
-    assert captured["attachments"] == [{"filename": "photo.png", "content": b"fake-png-bytes"}]
-
-
-def test_cmd_send_reply_no_attachments_key_passes_none(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    captured = {}
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
-
-    payload_path = _write_reply_payload(tmp_path)  # no "attachments" key at all
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-    outreach.cmd_send_reply(args)
-
-    assert captured["attachments"] is None
-
-
-def test_cmd_send_reply_attachment_too_large_logs_and_exits_nonzero(monkeypatch, tmp_path):
-    fake_sheets = FakeSheets([])
-    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
-    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
-    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
-
-    import base64 as _b64
-    huge_encoded = _b64.b64encode(b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)).decode("ascii")
-    payload_path = _write_reply_payload(tmp_path,
-                                         attachments=[{"filename": "huge.png", "content_base64": huge_encoded}])
-    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
-
-    with pytest.raises(SystemExit):
-        outreach.cmd_send_reply(args)
-
-    assert fake_sheets.send_log[0]["Status"] == "error"
-    assert len(fake_sheets.error_log) == 1
-
-
-# =============================================================================
-# IMAP message parsing (pure — no real network)
-# =============================================================================
-
-def _make_raw_email(subject="Re: Hello", from_addr="john@abc.com", body="Sure, let's talk.",
-                     in_reply_to=None, references=None):
-    msg = MIMEText(body)
+def _build_outbound_message(sender_address: str, to: str, subject: str, body_text: str,
+                             in_reply_to: Optional[str] = None, references: Optional[str] = None,
+                             cc: Optional[List[str]] = None, attachments: Optional[List[Dict]] = None):
+    """attachments: [{"filename": str, "content": bytes}, ...] — sent as
+    regular email attachments (not inline/embedded HTML images; that
+    would need a whole HTML-body path this codebase doesn't have). When
+    empty/None, builds the exact same plain MIMEText message as before
+    this feature existed — every existing caller (every automated
+    send) never passes attachments, so their message shape is completely
+    unchanged."""
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body_text))
+        for att in attachments:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(att["content"])
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{att["filename"]}"')
+            msg.attach(part)
+    else:
+        msg = MIMEText(body_text)
     msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = "me@work.com"
-    msg["Message-ID"] = "<reply123@mail.gmail.com>"
+    msg["From"] = sender_address
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    # Bcc is deliberately NEVER added as a header — that's what makes it
+    # blind. It only ever affects the SMTP envelope recipient list, in
+    # smtp_send below.
+    msg["Date"] = formatdate(localtime=True)
+    message_id = make_msgid()
+    msg["Message-ID"] = message_id
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
-    return msg.as_bytes()
+    return msg, message_id
 
 
-def test_parse_email_message_extracts_core_fields():
-    raw = _make_raw_email(in_reply_to="<intro1@mail.gmail.com>", references="<intro1@mail.gmail.com>")
-    parsed = outreach._parse_email_message(raw)
-    assert parsed["subject"] == "Re: Hello"
-    assert parsed["from"] == "john@abc.com"
-    assert parsed["message_id"] == "<reply123@mail.gmail.com>"
-    assert parsed["in_reply_to"] == "<intro1@mail.gmail.com>"
-    assert parsed["references"] == "<intro1@mail.gmail.com>"
-    assert "Sure, let's talk" in parsed["body"]
+def smtp_send(address: str, app_password: str, to: str, subject: str, body_text: str,
+              in_reply_to: Optional[str] = None, references: Optional[str] = None,
+              cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None,
+              attachments: Optional[List[Dict]] = None) -> Dict[str, str]:
+    msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references,
+                                               cc=cc, attachments=attachments)
+    envelope_recipients = [to] + list(cc or []) + list(bcc or [])
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(address, app_password)
+        server.sendmail(address, envelope_recipients, msg.as_string())
+    return {"message_id": message_id}
 
 
-def test_parse_email_message_handles_missing_threading_headers():
-    raw = _make_raw_email()
-    parsed = outreach._parse_email_message(raw)
-    assert parsed["in_reply_to"] == ""
-    assert parsed["references"] == ""
+MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB, see AttachmentTooLargeError's docstring
 
 
-# =============================================================================
-# NextEligibleAt / BatchID
-# =============================================================================
+def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, to_email: str,
+                       subject: str, body: str, in_reply_to: Optional[str] = None,
+                       references: Optional[str] = None, cc: Optional[List[str]] = None,
+                       bcc: Optional[List[str]] = None, attachments: Optional[List[Dict]] = None) -> Dict[str, str]:
+    """Sends a one-off manual reply from inside the app — NOT part of the
+    automated batch sequence, and never called with data Streamlit
+    computed insecurely: the caller (Streamlit's Responses tab) is
+    expected to have already resolved in_reply_to/references from the
+    specific inbound message being replied to, exactly the same
+    header-based threading every automated follow-up already relies on —
+    this function just sends what it's given, it doesn't look anything up
+    itself.
 
-def test_next_eligible_at_computed_for_next_stage():
-    now = datetime(2026, 8, 19, 10, 0, 0)
-    result = outreach._compute_next_eligible_at(STAGES, 0, now)
-    expected = (now + timedelta(days=STAGES[1]["wait_days_after_previous"])).strftime(outreach.DATETIME_FMT)
-    assert result == expected
+    attachments (optional): [{"filename": str, "content": bytes}, ...].
+    Raises AttachmentTooLargeError if their combined size exceeds
+    MAX_TOTAL_ATTACHMENT_BYTES — checked BEFORE anything is sent.
 
+    Raises MissingSenderAccountError / InvalidEmailFormatError the same
+    way the rest of this file does, so classify_send_exception and the
+    existing error-logging path both already handle it correctly with no
+    special-casing needed.
+    """
+    if sender_account not in accounts:
+        raise MissingSenderAccountError(f"Unknown SenderAccount '{sender_account}' — not in EMAIL_ACCOUNTS_JSON.")
+    if not is_valid_email_format(to_email):
+        raise InvalidEmailFormatError(f"'{to_email}' is not a valid email address format")
+    for extra in list(cc or []) + list(bcc or []):
+        if not is_valid_email_format(extra):
+            raise InvalidEmailFormatError(f"'{extra}' (Cc/Bcc) is not a valid email address format")
+    if attachments:
+        total_size = sum(len(att["content"]) for att in attachments)
+        if total_size > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise AttachmentTooLargeError(
+                f"Attachments total {total_size / (1024*1024):.1f} MB, over the "
+                f"{MAX_TOTAL_ATTACHMENT_BYTES / (1024*1024):.0f} MB limit."
+            )
 
-def test_next_eligible_at_blank_for_last_stage():
-    now = datetime(2026, 8, 19, 10, 0, 0)
-    result = outreach._compute_next_eligible_at(STAGES, len(STAGES) - 1, now)
-    assert result == ""
-
-
-def test_make_batch_id_format():
-    batch_id = outreach.make_batch_id()
-    assert batch_id.startswith("BATCH-")
-    assert len(batch_id) == len("BATCH-20260819-103000")
-
-
-# =============================================================================
-# build_batch — variant override + thread continuation
-# =============================================================================
-
-def test_build_batch_forced_variant_applies_to_all():
-    campaign_cfg = {"templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES}
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com"),
-             make_lead(_row=3, LeadID="L2", Email="jane@xyz.com")]
-    plan = outreach.build_batch(campaign_cfg, leads, "intro", 10, forced_variant="B")
-    assert len(plan) == 2
-    assert all(item["variant"] == "B" for item in plan)
-
-
-def test_build_batch_rejects_invalid_forced_variant():
-    campaign_cfg = {"templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES}
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
-    try:
-        outreach.build_batch(campaign_cfg, leads, "intro", 10, forced_variant="Z")
-        assert False, "should have raised ValueError"
-    except ValueError:
-        pass
+    account = accounts[sender_account]
+    return smtp_send(account["address"], account["app_password"], to=to_email, subject=subject,
+                      body_text=body, in_reply_to=in_reply_to, references=references, cc=cc, bcc=bcc,
+                      attachments=attachments)
 
 
-def test_intro_stage_never_sets_in_reply_to():
-    campaign_cfg = {"templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES}
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<old@mail.gmail.com>")]
-    plan = outreach.build_batch(campaign_cfg, leads, "intro", 10)
-    assert plan[0]["in_reply_to"] is None
-
-
-def test_followup_continues_thread_via_in_reply_to_and_references():
-    campaign_cfg = {"templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES}
-    old = (datetime.now() - timedelta(days=5)).strftime(FMT)
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", IntroSentAt=old,
-                        MessageID="<intro1@mail.gmail.com>", ThreadReferences="")]
-    plan = outreach.build_batch(campaign_cfg, leads, "followup1", 10)
-    assert len(plan) == 1
-    assert plan[0]["in_reply_to"] == "<intro1@mail.gmail.com>"
-    assert plan[0]["references"] == "<intro1@mail.gmail.com>"
-
-
-def test_followup_accumulates_references_chain():
-    campaign_cfg = {"templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"],
-                     "stages": STAGES + [{"name": "followup2", "template_prefix": "followup2",
-                                           "wait_days_after_previous": 4}]}
-    old = (datetime.now() - timedelta(days=5)).strftime(FMT)
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", IntroSentAt=old, FollowUp1SentAt=old,
-                        MessageID="<fu1@mail.gmail.com>", ThreadReferences="<intro1@mail.gmail.com>")]
-    plan = outreach.build_batch(campaign_cfg, leads, "followup2", 10)
-    assert plan[0]["in_reply_to"] == "<fu1@mail.gmail.com>"
-    assert plan[0]["references"] == "<intro1@mail.gmail.com> <fu1@mail.gmail.com>"
+def classify_send_exception(exc: Exception) -> str:
+    """Maps any exception raised during the send attempt to one of the
+    error-monitoring categories."""
+    if isinstance(exc, MissingSenderAccountError):
+        return ERR_MISSING_SENDER_ACCOUNT
+    if isinstance(exc, SenderCapacityReachedError):
+        return ERR_SENDER_CAPACITY
+    if isinstance(exc, InvalidEmailFormatError):
+        return ERR_INVALID_EMAIL
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return ERR_AUTH_FAILURE
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return ERR_INVALID_EMAIL
+    if isinstance(exc, smtplib.SMTPResponseException):
+        code = getattr(exc, "smtp_code", None)
+        raw_error = getattr(exc, "smtp_error", b"")
+        text = f"{raw_error} {exc}".lower()
+        if code in (421, 450, 451, 452, 454) or "rate" in text or "too many" in text or "try again later" in text:
+            return ERR_RATE_LIMIT
+        return ERR_SEND_FAILURE
+    if isinstance(exc, (smtplib.SMTPException, OSError, TimeoutError)):
+        return ERR_SEND_FAILURE
+    if type(exc).__name__ == "APIError" or "gspread" in type(exc).__module__:
+        return ERR_SHEETS_API
+    return ERR_SEND_FAILURE
 
 
 # =============================================================================
-# Full send_batch integration (fake Sheets + monkeypatched smtp_send)
+# SECTION 10: IMAP reading
 # =============================================================================
 
-class FakeSheets:
-    def __init__(self, leads):
-        self._leads = leads
-        self.send_log = []
-        self.responses = []
-        self.error_log = []
-        self._logged_ids = set()
-
-    def get_all_leads(self):
-        return [dict(lead) for lead in self._leads]
-
-    def update_lead_fields(self, row_number, fields):
-        for lead in self._leads:
-            if lead["_row"] == row_number:
-                lead.update(fields)
-
-    def append_lead(self, fields):
-        next_row = max((l["_row"] for l in self._leads), default=1) + 1
-        new_lead = dict(fields)
-        new_lead["_row"] = next_row
-        self._leads.append(new_lead)
-
-    def update_lead_statuses(self, row_numbers_to_status):
-        for lead in self._leads:
-            if lead["_row"] in row_numbers_to_status:
-                lead["Status"] = row_numbers_to_status[lead["_row"]]
-                lead["LastActionAt"] = "2026-08-01 09:00:00"  # fixed stub — tests don't assert this value
-
-    def append_send_log(self, fields):
-        self.send_log.append(fields)
-
-    def append_response(self, fields):
-        self.responses.append(fields)
-        self._logged_ids.add(fields.get("MessageID", ""))
-
-    def get_logged_message_ids(self):
-        return set(self._logged_ids)
-
-    def append_error_log(self, fields):
-        self.error_log.append(fields)
-
-    def get_all_responses(self):
-        return list(self.responses)
-
-    def get_all_send_log(self):
-        return list(self.send_log)
-
-    def get_all_error_log(self):
-        return list(self.error_log)
+def _decode_header_value(raw: str) -> str:
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    decoded = []
+    for text, encoding in parts:
+        if isinstance(text, bytes):
+            decoded.append(text.decode(encoding or "utf-8", errors="replace"))
+        else:
+            decoded.append(text)
+    return "".join(decoded)
 
 
-def _base_campaign_cfg():
+def _extract_plain_text_body(msg) -> str:
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition", "")):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="replace")
+        return ""
+    if msg.get_content_type() == "text/plain":
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="replace")
+    return ""
+
+
+def _message_to_dict(msg) -> Dict:
+    subject = _decode_header_value(msg.get("Subject", ""))
+    from_ = _decode_header_value(msg.get("From", ""))
+    message_id = (msg.get("Message-ID", "") or "").strip()
+    in_reply_to = (msg.get("In-Reply-To", "") or "").strip()
+    references = (msg.get("References", "") or "").strip()
+    body = _extract_plain_text_body(msg)
+    headers = {k.lower(): v for k, v in msg.items()}
+
+    parsed_date = None
+    date_header = headers.get("date", "")
+    if date_header:
+        try:
+            parsed_date = parsedate_to_datetime(date_header)
+            if parsed_date.tzinfo is not None:
+                parsed_date = parsed_date.replace(tzinfo=None)
+        except (TypeError, ValueError):
+            parsed_date = None
+
     return {
-        "templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES,
-        "sending": {"daily_limit": 100, "delay_min_minutes": 0, "delay_max_minutes": 0},
-        "_campaign_name": "test_campaign", "_global_default_account": "sales1",
+        "message_id": message_id, "in_reply_to": in_reply_to, "references": references,
+        "subject": subject, "from": from_, "headers": headers, "body": body,
+        "snippet": body[:500], "date": parsed_date,
     }
 
 
-def test_send_batch_raises_campaign_paused_error_before_touching_anything(monkeypatch):
-    smtp_called = []
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1) or {"message_id": "<m>"})
-
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["status"] = "paused"
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
-    with pytest.raises(outreach.CampaignPausedError, match="paused"):
-        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-
-    assert smtp_called == []  # never even got as far as resolving eligible leads
+def _parse_email_message(raw_bytes: bytes) -> Dict:
+    msg = email.message_from_bytes(raw_bytes)
+    return _message_to_dict(msg)
 
 
-def test_send_batch_active_status_sends_normally(monkeypatch):
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["status"] = "active"
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "sent"
-
-
-def test_send_batch_missing_status_key_sends_normally(monkeypatch):
-    # _base_campaign_cfg() fixtures predate the "status" field entirely —
-    # send_batch must not KeyError on campaign_cfg.get("status") being absent.
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    campaign_cfg = _base_campaign_cfg()
-    assert "status" not in campaign_cfg
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-    # Doesn't raise CampaignPausedError just because "status" key is missing.
+def imap_fetch_recent(address: str, app_password: str, since_dt: datetime) -> List[Dict]:
+    imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
     try:
-        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    except outreach.CampaignPausedError:
-        pytest.fail("send_batch treated a missing 'status' key as paused")
+        imap.login(address, app_password)
+        imap.select("INBOX", readonly=True)
+        date_str = since_dt.strftime("%d-%b-%Y")
+        status, data = imap.search(None, f'(SINCE "{date_str}")')
+        if status != "OK":
+            return []
+        ids = data[0].split()
+        messages = []
+        for num in ids:
+            status, msg_data = imap.fetch(num, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw = msg_data[0][1]
+            parsed = _parse_email_message(raw)
+
+            msg_date = parsed["date"]
+            if msg_date is not None and msg_date < since_dt:
+                continue
+
+            messages.append(parsed)
+        return messages
+    finally:
+        try:
+            imap.logout()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
 
 
-def test_build_batch_ignores_paused_status_preview_still_works(monkeypatch):
-    # Preview/build_batch must stay usable for a paused campaign — only
-    # send_batch is gated.
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["status"] = "paused"
-    lead = make_lead(_row=2)
-    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
-    assert len(plan) == 1
+def classify_imap_exception(exc: Exception) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, imaplib.IMAP4.error) or "authenticationfailed" in text or "invalid credentials" in text \
+            or "login failed" in text:
+        return ERR_AUTH_FAILURE
+    return ERR_REPLY_CHECK
 
 
-def test_send_batch_raises_outside_sending_window_error_before_touching_anything(monkeypatch):
-    smtp_called = []
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1) or {"message_id": "<m>"})
-
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["schedule"] = {"timezone": "UTC"}  # content irrelevant — is_within_sending_window is mocked below
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
-    # Mocked rather than relying on a real "always closed" window, so this
-    # test's outcome never depends on the real wall-clock time it happens
-    # to run at — is_within_sending_window's own correctness is covered
-    # exhaustively above; this test is specifically about send_batch's
-    # handling of a False result.
-    monkeypatch.setattr(outreach, "is_within_sending_window",
-                         lambda schedule: (False, "outside for this test"))
-
-    with pytest.raises(outreach.OutsideSendingWindowError, match="outside its configured sending window"):
-        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-
-    assert smtp_called == []
-
-
-def test_send_batch_within_sending_window_sends_normally(monkeypatch):
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["schedule"] = {"timezone": "UTC", "window_start": "00:00", "window_end": "23:59"}
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "sent"
-
-
-def test_send_batch_no_schedule_key_sends_normally(monkeypatch):
-    # _base_campaign_cfg() fixtures predate the "schedule" field entirely.
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-    campaign_cfg = _base_campaign_cfg()
-    assert "schedule" not in campaign_cfg
-    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
-    fake_sheets = FakeSheets([lead])
-
+def check_single_account_health(address: str, app_password: str) -> Tuple[str, str]:
+    """Cheap connectivity check — logs in via IMAP and immediately logs
+    out, never fetches or sends anything. Returns (status, detail):
+    status is 'Connected' or 'Disconnected'; detail is a short,
+    password-free reason on failure, empty on success. The password
+    itself never appears in the return value — only ever used locally,
+    in-process, for this one login attempt."""
+    imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
     try:
-        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    except outreach.OutsideSendingWindowError:
-        pytest.fail("send_batch treated a missing 'schedule' key as a restriction")
+        imap.login(address, app_password)
+        return "Connected", ""
+    except Exception as exc:  # noqa: BLE001 - any failure here means "can't currently connect", full stop
+        return "Disconnected", str(exc)[:200]
+    finally:
+        try:
+            imap.logout()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
 
 
-def test_build_batch_ignores_schedule_restriction_preview_still_works(monkeypatch):
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
-    campaign_cfg = _base_campaign_cfg()
-    campaign_cfg["schedule"] = {"timezone": "UTC", "window_start": "00:00", "window_end": "00:01"}
-    lead = make_lead(_row=2)
-    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
-    assert len(plan) == 1
+def check_account_health(accounts: Dict[str, Dict[str, str]]) -> List[Dict]:
+    """Checks every configured account's connectivity, one IMAP login
+    attempt each, isolated so one broken account can't block the rest.
+    Never includes app_password anywhere in the returned rows — only
+    AccountName, Address, Status, Detail, CheckedAt, matching
+    ACCOUNT_HEALTH_COLUMNS exactly, since this is written straight to a
+    Sheet Streamlit reads."""
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    results = []
+    for name, account in accounts.items():
+        status, detail = check_single_account_health(account["address"], account["app_password"])
+        results.append({
+            "AccountName": name, "Address": account["address"], "Status": status,
+            "Detail": detail, "CheckedAt": now_str,
+        })
+    return results
 
 
-
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
-        return {"message_id": "<msg1@mail.gmail.com>"}
-
-    monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-
-    assert len(results) == 1
-    assert results[0]["status"] == "sent"
-    assert results[0]["batch_id"].startswith("BATCH-")
-    assert results[0]["account"] == "sales1"
-
-    assert len(fake_sheets.send_log) == 1
-    assert fake_sheets.send_log[0]["Status"] == "sent"
-    assert fake_sheets.send_log[0]["SenderAccount"] == "sales1"
-
-    updated = fake_sheets._leads[0]
-    assert updated["IntroSentAt"]
-    assert updated["NextEligibleAt"]
-    assert updated["LastActionAt"]
-    assert updated["MessageID"] == "<msg1@mail.gmail.com>"
-    assert updated["SenderAccount"] == "sales1"  # locked in for future stages
-
-
-def test_send_batch_locks_in_resolved_account_for_reuse():
-    # After a lead's SenderAccount is written back, resolve_sender_account
-    # should use it directly rather than re-resolving the default.
-    lead = make_lead(SenderAccount="sales1")
-    campaign_cfg = {"_global_default_account": "sales2"}  # different default, deliberately
-    assert outreach.resolve_sender_account(lead, campaign_cfg, ACCOUNTS) == "sales1"
-
-
-def test_send_batch_error_isolation_does_not_write_send_at(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
-    fake_sheets = FakeSheets(leads)
-
-    def failing_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
-        raise RuntimeError("simulated SMTP failure")
-
-    monkeypatch.setattr(outreach, "smtp_send", failing_smtp_send)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-
-    assert len(results) == 1
-    assert results[0]["status"] == "error"
-    assert fake_sheets.send_log[0]["Status"] == "error"
-    assert fake_sheets._leads[0]["IntroSentAt"] == ""
-    assert fake_sheets._leads[0]["Error"]
-
-
-def test_send_batch_unknown_sender_account_is_isolated_per_lead(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", SenderAccount="ghost_account")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_smtp_send(*a, **kw):
-        raise AssertionError("smtp_send should never be called for an unresolvable account")
-
-    monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "error"
-    assert "ghost_account" in results[0]["error"]
+def write_account_health(sheet_id: str, results: List[Dict]) -> None:
+    """Overwrites the whole Email Accounts Health tab's data rows every
+    run — this is a current-status SNAPSHOT, not an accumulating log, so
+    a since-removed account's stale row disappears on the next check
+    rather than lingering forever."""
+    client, gspread_module = _build_gspread_client()
+    spreadsheet = client.open_by_key(sheet_id)
+    ws = _get_or_create_ws(spreadsheet, gspread_module, ACCOUNT_HEALTH_TAB, ACCOUNT_HEALTH_COLUMNS)
+    existing_row_count = len(ws.get_all_values())
+    if existing_row_count > 1:
+        ws.batch_clear([f"A2:E{existing_row_count}"])
+    rows = [[r["AccountName"], r["Address"], r["Status"], r["Detail"], r["CheckedAt"]] for r in results]
+    if rows:
+        ws.append_rows(rows)
 
 
 # =============================================================================
-# check_replies — header-based match preferred over email-address match
+# SECTION 11: Batch building + sending
 # =============================================================================
 
-def test_check_replies_matches_by_message_id_header_first(monkeypatch):
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<reply1@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
-            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello",
-            "from": "someone-else@notjohn.com",  # deliberately NOT john's address
-            "headers": {}, "body": "sure, let's talk", "snippet": "sure, let's talk",
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
-                                      campaign_name="test_campaign")
-    assert len(actions) == 1
-    assert actions[0]["lead_id"] == "L1"
-    assert actions[0]["match_method"] == "Header"
-    assert actions[0]["classification"] == outreach.CLASSIFICATION_GENUINE
-    assert fake_sheets.responses[0]["Campaign"] == "test_campaign"
-    assert fake_sheets.responses[0]["MatchMethod"] == "Header"
+def make_batch_id() -> str:
+    return f"BATCH-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 
-def test_check_replies_falls_back_to_email_when_no_header_match(monkeypatch):
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<reply2@mail.gmail.com>", "in_reply_to": "", "references": "",
-            "subject": "Re: Hello", "from": "john@abc.com",
-            "headers": {}, "body": "sounds good", "snippet": "sounds good", "date": None,
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
-    assert len(actions) == 1
-    assert actions[0]["match_method"] == "Email"
-    # An Email-only match must NEVER stop a sequence, even when the content
-    # would otherwise classify as a genuine reply — this is the exact
-    # production bug this suite guards against (see the tests below).
-    assert actions[0]["classification"] == outreach.CLASSIFICATION_GENUINE
-    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNVERIFIED
-    updated_lead = fake_sheets._leads[0]
-    assert updated_lead["ReplyStatus"] != "Replied"
-    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
+def _compute_next_eligible_at(stages: List[Dict], idx: int, sent_at: datetime) -> str:
+    if idx + 1 >= len(stages):
+        return ""
+    next_wait_days = stages[idx + 1].get("wait_days_after_previous", 0)
+    return (sent_at + timedelta(days=next_wait_days)).strftime(DATETIME_FMT)
 
 
-def test_check_replies_genuine_reply_stops_sequence(monkeypatch):
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
-            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
-            "headers": {}, "body": "yes let's talk", "snippet": "yes let's talk",
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
-    updated = fake_sheets._leads[0]
-    assert updated["Status"] == outreach.STATUS_STOPPED_REPLIED
-    assert updated["ReplyStatus"] == "Replied"
-    assert updated["LastActionAt"]
+def _count_sent_today(leads: List[Dict], stages: List[Dict]) -> int:
+    today = datetime.now().strftime("%Y-%m-%d")
+    count = 0
+    for lead in leads:
+        for i in range(len(stages)):
+            field = stage_field_names(i)["sent_at"]
+            if lead.get(field, "").startswith(today):
+                count += 1
+    return count
 
 
-def test_check_replies_one_account_imap_failure_does_not_block_others(monkeypatch):
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
-    fake_sheets = FakeSheets(leads)
-
-    def flaky_imap_fetch_recent(address, app_password, since_dt):
-        if address == "sales1@gmail.com":
-            raise RuntimeError("simulated IMAP outage")
-        return [{
-            "message_id": "<reply4@mail.gmail.com>", "in_reply_to": "", "references": "",
-            "subject": "Re: Hello", "from": "john@abc.com",
-            "headers": {}, "body": "interested", "snippet": "interested",
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", flaky_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, ACCOUNTS, lookback_hours=24)
-    assert len(actions) == 1  # sales2's message still got processed despite sales1 failing
-    assert actions[0]["account"] == "sales2"
+def _count_sent_today_by_account(send_log: List[Dict]) -> Dict[str, int]:
+    """Per-account send counts for today, sourced from SendLog (the only
+    place that records which account each individual send used, with a
+    timestamp — Master only keeps the most recent account per lead)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    counts: Dict[str, int] = {}
+    for row in send_log:
+        if row.get("Status") == "sent" and str(row.get("Timestamp", "")).startswith(today):
+            acct = row.get("SenderAccount", "")
+            if acct:
+                counts[acct] = counts.get(acct, 0) + 1
+    return counts
 
 
-# =============================================================================
-# load_email_accounts
-# =============================================================================
+def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict]:
+    """One-time migration helper: for every lead whose ThreadSubject is
+    blank, reconstructs it by re-rendering the subject of the most
+    recently sent stage that actually HAD a non-blank subject — walking
+    backward through sent stages (last to first) and skipping over any
+    that themselves used the blank-means-continue convention, since
+    there's nothing to extract from those. This handles both:
 
-def test_load_email_accounts_parses_json(monkeypatch):
-    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON",
-                        '{"sales1": {"address": "a@b.com", "app_password": "xxxx"}}')
-    accounts = outreach.load_email_accounts()
-    assert accounts["sales1"]["address"] == "a@b.com"
+    - Leads sent entirely before ThreadSubject existed (every stage had a
+      real subject — the very first one checked always works).
+    - Leads with a MIX of old real-subject stages and newer
+      blank-subject-continuation stages (e.g. Intro had a real subject,
+      but a later followup already used a blank Subject to continue it) —
+      those newer blank stages are skipped over rather than causing the
+      whole lookup to give up, since the real subject is still recoverable
+      from the stage before them.
+
+    Never overwrites an already-set ThreadSubject, and never writes
+    anything itself — returns a plan the caller writes back (same
+    "compute first, act separately" shape as build_batch), so this is
+    naturally safe to dry-run and to re-run repeatedly.
+
+    IMPORTANT CAVEAT: this assumes the stage it ultimately finds hasn't
+    had its template Subject edited since it was actually sent. If you've
+    since changed that wording, the backfilled value will be wrong for
+    leads sent under the old one. There's no historical record of the
+    exact subject actually sent (SendLog doesn't store it) — re-rendering
+    the current template is a practical best effort, not a guarantee. For
+    leads where getting this exactly right matters, set ThreadSubject
+    manually from your actual sent mail instead — carefully: a
+    copy-pasted subject from the WRONG lead/campaign will "work" (no
+    error) but silently produce a mis-threaded reply, since nothing here
+    can verify a manually-entered value against what was really sent.
+    """
+    stages = campaign_cfg["stages"]
+    results = []
+    for lead in leads:
+        lead_id = lead.get("LeadID", "")
+        if (lead.get("ThreadSubject") or "").strip():
+            results.append({"lead_id": lead_id, "status": "skipped_already_set"})
+            continue
+
+        sent_indices = [i for i in range(len(stages) - 1, -1, -1)
+                         if (lead.get(stage_field_names(i)["sent_at"]) or "").strip()]
+
+        if not sent_indices:
+            results.append({"lead_id": lead_id, "status": "skipped_not_sent_yet"})
+            continue
+
+        found = None
+        skipped_blank_stages = []
+        last_error = None
+        last_error_stage = None
+        for idx in sent_indices:
+            fields = stage_field_names(idx)
+            variant = (lead.get(fields["variant"]) or "").strip()
+            stage_label = stages[idx]["name"]
+            if not variant:
+                continue  # try an earlier stage rather than giving up entirely
+            try:
+                tmpl = load_template(campaign_cfg["templates_dir"], stages[idx]["template_prefix"], variant)
+                subject = render_text(tmpl["subject"], lead)
+            except Exception as exc:  # noqa: BLE001 - isolate per-lead template issues, keep trying earlier stages
+                last_error, last_error_stage = str(exc), stage_label
+                continue
+            if not subject.strip():
+                skipped_blank_stages.append(stage_label)  # this one also used blank-continuation — try earlier
+                continue
+            found = {"subject": subject, "stage": stage_label, "row": lead["_row"]}
+            break
+
+        if found is not None:
+            results.append({"lead_id": lead_id, "status": "backfilled", "thread_subject": found["subject"],
+                             "row": found["row"], "stage": found["stage"]})
+        elif last_error is not None:
+            results.append({"lead_id": lead_id, "status": "error", "stage": last_error_stage, "error": last_error})
+        elif skipped_blank_stages:
+            results.append({"lead_id": lead_id, "status": "skipped_template_now_blank",
+                             "stage": skipped_blank_stages[0]})
+        else:
+            results.append({"lead_id": lead_id, "status": "skipped_unknown_variant",
+                             "stage": stages[sent_indices[0]]["name"]})
+    return results
 
 
-def test_load_email_accounts_missing_env_raises(monkeypatch):
-    monkeypatch.delenv("EMAIL_ACCOUNTS_JSON", raising=False)
+def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Dict[str, str]]) -> Dict[str, int]:
+    """Appends new_leads as new Master Sheet rows. Skips any row with no
+    Email (mandatory everywhere else in this system) and any row whose
+    Email already exists among current leads (case-insensitive) — the
+    same "first row wins" assumption find_duplicate_email_leads already
+    enforces elsewhere, just applied at import time instead of left for
+    that check to flag later.
+
+    Every imported lead's Approval is left BLANK (Pending) unless the
+    caller explicitly set it in that row's dict — a bulk import should
+    never default new leads straight to "Yes" and eligible to send; a
+    human needs to approve them first, same as any manually-added row.
+    """
+    existing = sheets.get_all_leads()
+    existing_ids = [int(l["LeadID"]) for l in existing if str(l.get("LeadID", "")).strip().isdigit()]
+    next_id = (max(existing_ids) + 1) if existing_ids else 1
+    existing_emails = {(l.get("Email") or "").strip().lower() for l in existing if (l.get("Email") or "").strip()}
+
+    imported = 0
+    skipped_duplicate = 0
+    skipped_no_email = 0
+    for lead in new_leads:
+        email = (lead.get("Email") or "").strip()
+        if not email:
+            skipped_no_email += 1
+            continue
+        if email.lower() in existing_emails:
+            skipped_duplicate += 1
+            continue
+        row = dict(lead)
+        row["LeadID"] = str(next_id)
+        row["Campaign"] = campaign_name
+        row.setdefault("Approval", "")
+        sheets.append_lead(row)
+        existing_emails.add(email.lower())
+        next_id += 1
+        imported += 1
+
+    return {"imported": imported, "skipped_duplicate": skipped_duplicate, "skipped_no_email": skipped_no_email}
+
+
+def remove_leads(sheets: SheetsConnector, lead_ids: List[str]) -> Dict[str, int]:
+    """Soft-remove: sets Status=Removed for every matching LeadID — NEVER
+    a hard delete. The row and everything already sent to that lead stays
+    exactly as it was; get_eligible_leads already excludes any
+    TERMINAL_STATUSES status, which Removed is now part of, so a removed
+    lead simply stops being picked up for anything further."""
+    existing = sheets.get_all_leads()
+    lead_id_set = {str(lid) for lid in lead_ids}
+    row_updates = {l["_row"]: STATUS_REMOVED for l in existing if str(l.get("LeadID", "")) in lead_id_set}
+    sheets.update_lead_statuses(row_updates)
+    found_ids = {str(l.get("LeadID", "")) for l in existing if l["_row"] in row_updates}
+    return {"removed": len(row_updates), "not_found": len(lead_id_set - found_ids)}
+
+
+def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_size: int,
+                 forced_variant: Optional[str] = None, ignore_wait_days: bool = False) -> List[Dict]:
+    """Computes eligible leads + assigns variants + renders emails WITHOUT
+    sending or writing anything. Safe to call repeatedly for preview.
+
+    ignore_wait_days=True skips ONLY the wait_days_after_previous timing
+    check for stages after the first — every other eligibility rule still
+    applies unchanged: Approval must be Yes, the lead can't be in a
+    terminal/replied state, this stage can't already be sent, and the
+    PREVIOUS stage must actually have been sent (stage order is never
+    skippable, only the wait between stages is overridable). This is the
+    "send this follow-up now regardless of schedule" override.
+    """
+    stages = campaign_cfg["stages"]
+    variants = campaign_cfg["variants"]
+    idx = _stage_index(stages, stage_name)
+    fields = stage_field_names(idx)
+
+    if forced_variant is not None and forced_variant not in variants:
+        raise ValueError(f"Variant '{forced_variant}' is not in campaign variants: {variants}")
+
+    eligible = get_eligible_leads(leads, stages, idx, ignore_wait_days=ignore_wait_days)[:batch_size]
+
+    batch_counts = {v: 0 for v in variants}
+    plan = []
+    for lead in eligible:
+        if forced_variant is not None:
+            variant = forced_variant
+        else:
+            variant = pick_variant(leads, fields["variant"], variants, batch_counts)
+            batch_counts[variant] += 1
+        rendered = render_email(campaign_cfg["templates_dir"], stages[idx]["template_prefix"], variant, lead,
+                                 is_first_stage=(idx == 0))
+
+        prior_message_id = lead.get("MessageID", "") if idx > 0 else ""
+        prior_references = lead.get("ThreadReferences", "") if idx > 0 else ""
+        in_reply_to = prior_message_id or None
+        if prior_message_id:
+            references = f"{prior_references} {prior_message_id}".strip()
+        else:
+            references = prior_references or None
+
+        plan.append({
+            "lead": lead, "variant": variant,
+            "subject": rendered["subject"], "body": rendered["body"],
+            "missing_variables": rendered["missing_variables"],
+            "in_reply_to": in_reply_to, "references": references,
+            "thread_subject": rendered["thread_subject"], "is_continuation": rendered["is_continuation"],
+        })
+    return plan
+
+
+def _resolve_account_for_round(lead: Dict, campaign_cfg: Dict, accounts: Dict[str, Dict[str, str]],
+                                confirmed_batch_counts: Dict[str, int], sent_today_by_account: Dict[str, int],
+                                used_accounts_this_round: set) -> Tuple[str, object]:
+    """Resolution used when building one CONCURRENT sending round (see
+    send_batch). Returns one of:
+
+      ("account", account_name) — ready to send this round.
+      ("defer", None)           — this lead's account is already busy this
+                                   round (e.g. two leads both pinned to the
+                                   same SenderAccount, or every rotation
+                                   account is already taken this round).
+                                   Not an error — retried in the next round.
+      ("error", exception)      — permanently unsendable this run (unknown
+                                   account, or genuinely out of capacity
+                                   across every eligible account).
+
+    Capacity itself (sending.per_account_daily_limit) is always checked
+    against confirmed_batch_counts — successes actually confirmed from
+    completed rounds so far — never against same-round reservations, so a
+    lead is never falsely told "at capacity" just because another lead
+    happens to be using that account in the same round.
+    """
+    per_account_limit = campaign_cfg.get("sending", {}).get("per_account_daily_limit")
+    requested = (lead.get("SenderAccount") or "").strip()
+
+    if requested:
+        if requested not in accounts:
+            return ("error", MissingSenderAccountError(
+                f"Unknown SenderAccount '{requested}' — not in EMAIL_ACCOUNTS_JSON."))
+        try:
+            _check_account_capacity(requested, per_account_limit, sent_today_by_account, confirmed_batch_counts)
+        except SenderCapacityReachedError as exc:
+            return ("error", exc)
+        if requested in used_accounts_this_round:
+            return ("defer", None)
+        return ("account", requested)
+
+    sending_cfg = campaign_cfg.get("sending", {})
+    if sending_cfg.get("sender_rotation"):
+        rotation_accounts = get_rotation_accounts(campaign_cfg, accounts)
+        if not rotation_accounts:
+            return ("error", MissingSenderAccountError(
+                "sender_rotation is enabled but no valid accounts are configured "
+                "(check sending.rotation_accounts and EMAIL_ACCOUNTS_JSON)."))
+
+        def has_capacity(acct: str) -> bool:
+            if per_account_limit is None:
+                return True
+            used = sent_today_by_account.get(acct, 0) + confirmed_batch_counts.get(acct, 0)
+            return used < per_account_limit
+
+        capacity_ok = [a for a in rotation_accounts if has_capacity(a)]
+        if not capacity_ok:
+            return ("error", SenderCapacityReachedError(
+                f"All rotation accounts are at their per-account daily limit ({per_account_limit})."))
+
+        # Prefer an account not already claimed by another lead THIS round —
+        # this is what makes concurrent sending safe: every job fired at the
+        # same time in one round uses a different account.
+        available_now = [a for a in capacity_ok if a not in used_accounts_this_round]
+        if not available_now:
+            return ("defer", None)  # every currently-usable account is busy this round only
+
+        chosen = pick_rotation_account(available_now, per_account_limit, sent_today_by_account,
+                                        confirmed_batch_counts)
+        return ("account", chosen)
+
+    # No manual pin, no rotation — the single campaign/global default account.
     try:
-        outreach.load_email_accounts()
-        assert False, "should have raised RuntimeError"
-    except RuntimeError:
+        chosen = resolve_sender_account(lead, campaign_cfg, accounts)
+        _check_account_capacity(chosen, per_account_limit, sent_today_by_account, confirmed_batch_counts)
+    except (MissingSenderAccountError, SenderCapacityReachedError) as exc:
+        return ("error", exc)
+    if chosen in used_accounts_this_round:
+        return ("defer", None)
+    return ("account", chosen)
+
+
+def _record_send_failure(sheets: "SheetsConnector", campaign_name: str, batch_id: str, stage_name: str,
+                          item: Dict, exc: Exception, account_name: str = "") -> Dict:
+    lead = item["lead"]
+    row = lead["_row"]
+    lead_id = lead.get("LeadID", "")
+    lead_email = lead.get("Email", "")
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    error_type = classify_send_exception(exc)
+    is_skip = isinstance(exc, SenderCapacityReachedError)
+    outcome_status = "skipped" if is_skip else "error"
+    try:
+        sheets.update_lead_fields(row, {"Error": str(exc)[:500]})
+        sheets.append_send_log({
+            "BatchID": batch_id, "Timestamp": now_str, "LeadID": lead_id, "Email": lead_email,
+            "Campaign": campaign_name, "Stage": stage_name, "Variant": item["variant"],
+            "SenderAccount": account_name, "Status": outcome_status, "MessageID": "",
+            "Error": str(exc)[:500],
+        })
+    except Exception:  # noqa: BLE001 - the error log entry below is the durable record either way
         pass
+    log_error(sheets, campaign_name, error_type, str(exc), lead_id=lead_id, email_addr=lead_email,
+              stage=stage_name, batch_id=batch_id)
+    return {"lead_id": lead_id, "email": lead_email, "status": outcome_status,
+            "error": str(exc), "error_type": error_type, "batch_id": batch_id}
 
 
-def test_load_email_accounts_rejects_incomplete_entry(monkeypatch):
-    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON", '{"sales1": {"address": "a@b.com"}}')  # missing app_password
+def _record_send_success(sheets: "SheetsConnector", campaign_name: str, batch_id: str, stage_name: str,
+                          fields: Dict[str, str], idx: int, stages: List[Dict], item: Dict,
+                          account_name: str, sent: Dict[str, str]) -> Dict:
+    lead = item["lead"]
+    row = lead["_row"]
+    lead_id = lead.get("LeadID", "")
+    lead_email = lead.get("Email", "")
+    now = datetime.now()
+    now_str = now.strftime(DATETIME_FMT)
     try:
-        outreach.load_email_accounts()
-        assert False, "should have raised RuntimeError"
-    except RuntimeError:
-        pass
+        sheets.update_lead_fields(row, {
+            fields["sent_at"]: now_str,
+            fields["variant"]: item["variant"],
+            "CurrentStage": stage_name,
+            "NextEligibleAt": _compute_next_eligible_at(stages, idx, now),
+            "Status": f"{stage_name} Sent",
+            "LastActionAt": now_str,
+            "MessageID": sent["message_id"],
+            "ThreadReferences": item["references"] or "",
+            "ThreadSubject": item["thread_subject"],
+            "SenderAccount": account_name,
+            "Error": "",
+        })
+        sheets.append_send_log({
+            "BatchID": batch_id, "Timestamp": now_str, "LeadID": lead_id, "Email": lead_email,
+            "Campaign": campaign_name, "Stage": stage_name, "Variant": item["variant"],
+            "SenderAccount": account_name, "Status": "sent", "MessageID": sent["message_id"], "Error": "",
+        })
+        for var_name in item["missing_variables"]:
+            log_error(sheets, campaign_name, ERR_MISSING_VARIABLE,
+                      f"Template variable '{{{{{var_name}}}}}' has no matching Master column — "
+                      "rendered blank. Check for a typo, or add that column.",
+                      lead_id=lead_id, email_addr=lead_email, stage=stage_name, batch_id=batch_id)
+        return {"lead_id": lead_id, "email": lead_email, "status": "sent",
+                "variant": item["variant"], "batch_id": batch_id, "account": account_name}
+    except Exception as sheets_exc:  # noqa: BLE001
+        # The send genuinely happened, so this account WAS used, and the
+        # caller still needs to count it against confirmed_batch_counts —
+        # flagged distinctly so it's not confused with an ordinary send
+        # failure (the email is already in the recipient's inbox).
+        log_error(sheets, campaign_name, ERR_SHEETS_API,
+                  f"Email sent successfully (Message-ID {sent['message_id']}) but failed to update "
+                  f"the sheet: {sheets_exc}. Check manually to avoid a duplicate resend.",
+                  lead_id=lead_id, email_addr=lead_email, stage=stage_name, batch_id=batch_id)
+        return {"lead_id": lead_id, "email": lead_email, "status": "sent_but_sheet_error",
+                "error": str(sheets_exc), "batch_id": batch_id, "account": account_name}
+
+
+def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]],
+               stage_name: str, batch_size: int, forced_variant: Optional[str] = None,
+               ignore_wait_days: bool = False) -> List[Dict]:
+    """Sends the batch in CONCURRENT ROUNDS instead of one email at a time.
+
+    Each round is built greedily so that no two jobs in it share a sender
+    account — meaning every job in a round can genuinely fire at the same
+    moment (real threads, real simultaneous SMTP connections), one send per
+    account per round. A lead whose resolved account is already taken by
+    another lead in the current round isn't an error — it's simply carried
+    over to the next round. With N distinct sender accounts, this produces
+    exactly the "N accounts to N leads at once, then wait, then the next N"
+    behavior. With a single account (or nothing but manually-pinned leads
+    all sharing one account), every round naturally has exactly one job —
+    identical in effect to the old fully-sequential behavior, so nothing
+    changes for single-account setups.
+
+    sending.delay_min_minutes / delay_max_minutes are the wait BETWEEN
+    ROUNDS now, not between individual emails — the pacing that used to
+    apply per-send now applies per-account (each account only sends its
+    next email one round-delay later).
+
+    Every attempt (sent, error, or skipped) is logged to SendLog under one
+    BatchID, and every error is also classified and logged to the Error
+    Log. Failures are isolated per lead and never abort the batch. A lead
+    that can never be sent this run (unknown account, genuinely at
+    capacity) is recorded immediately, without waiting for a round.
+
+    ignore_wait_days=True overrides ONLY the scheduled wait between stages
+    (e.g. send followup1 today even though it's not due for 3 more days) —
+    see build_batch's docstring for exactly what is and isn't skipped.
+
+    Raises CampaignPausedError immediately, before touching anything, if
+    campaign_cfg["status"] in ("paused", "draft"), and OutsideSendingWindowError
+    if campaign_cfg["schedule"] restricts sending to specific days/hours
+    and right now doesn't qualify — Preview/build_batch are deliberately
+    NOT gated by either, so a paused, still-draft, or schedule-restricted
+    campaign can still be reviewed any time, just not sent.
+    """
+    status = campaign_cfg.get("status") or "active"
+    if status == "paused":
+        raise CampaignPausedError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is paused — no batch will be sent. "
+            "Resume it (set status back to 'active') first if this was unintentional."
+        )
+    if status == "draft":
+        raise CampaignPausedError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is still a draft and hasn't been "
+            "launched — no batch will be sent. Launch it first if this was unintentional."
+        )
+
+    within_window, window_reason = is_within_sending_window(campaign_cfg.get("schedule") or {})
+    if not within_window:
+        raise OutsideSendingWindowError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is outside its configured sending "
+            f"window — no batch will be sent. {window_reason}."
+        )
+
+    stages = campaign_cfg["stages"]
+    sending_cfg = campaign_cfg["sending"]
+    daily_limit = sending_cfg["daily_limit"]
+    delay_min = sending_cfg["delay_min_minutes"]
+    delay_max = sending_cfg["delay_max_minutes"]
+    campaign_name = campaign_cfg.get("_campaign_name", "")
+
+    leads = sheets.get_all_leads()
+    already_today = _count_sent_today(leads, stages)
+    remaining_today = max(daily_limit - already_today, 0)
+    effective_batch_size = min(batch_size, remaining_today)
+
+    if effective_batch_size <= 0:
+        return []
+
+    plan = build_batch(campaign_cfg, leads, stage_name, effective_batch_size, forced_variant=forced_variant,
+                        ignore_wait_days=ignore_wait_days)
+    if not plan:
+        return []
+
+    idx = _stage_index(stages, stage_name)
+    fields = stage_field_names(idx)
+    batch_id = make_batch_id()
+
+    send_log = sheets.get_all_send_log()
+    sent_today_by_account = _count_sent_today_by_account(send_log)
+    confirmed_batch_counts: Dict[str, int] = {}  # confirmed successes from ROUNDS ALREADY COMPLETED this run
+
+    results: List[Optional[Dict]] = [None] * len(plan)
+    pending: List[Tuple[int, Dict]] = list(enumerate(plan))
+
+    while pending:
+        round_jobs: List[Tuple[int, Dict, str]] = []
+        used_accounts_this_round: set = set()
+        still_pending: List[Tuple[int, Dict]] = []
+
+        for orig_idx, item in pending:
+            lead = item["lead"]
+            lead_email = lead.get("Email", "")
+
+            if not is_valid_email_format(lead_email):
+                exc = InvalidEmailFormatError(f"'{lead_email}' is not a valid email address format")
+                results[orig_idx] = _record_send_failure(sheets, campaign_name, batch_id, stage_name, item, exc)
+                continue
+
+            status, value = _resolve_account_for_round(lead, campaign_cfg, accounts, confirmed_batch_counts,
+                                                         sent_today_by_account, used_accounts_this_round)
+            if status == "error":
+                results[orig_idx] = _record_send_failure(sheets, campaign_name, batch_id, stage_name, item, value)
+                continue
+            if status == "defer":
+                still_pending.append((orig_idx, item))
+                continue
+
+            account_name = value
+            used_accounts_this_round.add(account_name)
+            round_jobs.append((orig_idx, item, account_name))
+
+        if round_jobs:
+            # Fire every job in this round AT THE SAME TIME — real threads,
+            # real concurrent SMTP connections, one per account. Sheets
+            # writes are deliberately NOT done from these threads (gspread's
+            # Worksheet object isn't meant to be hit concurrently) — only
+            # the network send itself is parallelized.
+            sent_outcomes: Dict[int, Tuple[str, object]] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(round_jobs)) as executor:
+                future_to_job = {
+                    executor.submit(smtp_send, accounts[acct]["address"], accounts[acct]["app_password"],
+                                     to=job_item["lead"].get("Email", ""), subject=job_item["subject"],
+                                     body_text=job_item["body"], in_reply_to=job_item["in_reply_to"],
+                                     references=job_item["references"]): orig_idx
+                    for orig_idx, job_item, acct in round_jobs
+                }
+                for future in concurrent.futures.as_completed(future_to_job):
+                    orig_idx = future_to_job[future]
+                    try:
+                        sent_outcomes[orig_idx] = ("ok", future.result())
+                    except Exception as exc:  # noqa: BLE001 - isolate per-lead SMTP failures within the round
+                        sent_outcomes[orig_idx] = ("error", exc)
+
+            # Persist results sequentially, back on the main thread, in the
+            # round's original order.
+            for orig_idx, job_item, acct in round_jobs:
+                outcome, payload = sent_outcomes[orig_idx]
+                if outcome == "ok":
+                    result = _record_send_success(sheets, campaign_name, batch_id, stage_name, fields, idx,
+                                                   stages, job_item, acct, payload)
+                    if result["status"] in ("sent", "sent_but_sheet_error"):
+                        confirmed_batch_counts[acct] = confirmed_batch_counts.get(acct, 0) + 1
+                else:
+                    result = _record_send_failure(sheets, campaign_name, batch_id, stage_name, job_item,
+                                                   payload, account_name=acct)
+                results[orig_idx] = result
+
+        pending = still_pending
+        if pending:
+            time.sleep(random.uniform(delay_min * 60, delay_max * 60))
+
+    return results
 
 
 # =============================================================================
-# Email account slots — the safe per-account secret model. Every test
-# explicitly clears all slot env vars first/via monkeypatch's own
-# isolation, so these never depend on what's left over from another test.
+# SECTION 12: Reply monitor
 # =============================================================================
 
-def _clear_all_slots(monkeypatch):
-    for i in range(1, outreach.EMAIL_ACCOUNT_SLOT_COUNT + 1):
-        monkeypatch.delenv(f"EMAIL_ACCOUNT_SLOT_{i}", raising=False)
-
-
-def test_load_accounts_from_slots_empty_when_none_set(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    assert outreach._load_email_accounts_from_slots() == {}
-
-
-def test_load_accounts_from_slots_single_slot(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
-                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
-    accounts = outreach._load_email_accounts_from_slots()
-    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
-
-
-def test_load_accounts_from_slots_multiple_slots(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
-                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_3",
-                        '{"name": "sales2", "address": "sales2@gmail.com", "app_password": "yyyy"}')
-    accounts = outreach._load_email_accounts_from_slots()
-    assert set(accounts.keys()) == {"sales1", "sales2"}
-
-
-def test_load_accounts_from_slots_skips_empty_string_slots(monkeypatch):
-    """A slot set to an empty string (as opposed to fully unset) — e.g.
-    a secret that was cleared but the env var mechanism still defines it
-    as "" — must be silently skipped, not treated as a populated account."""
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", "")
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_2",
-                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
-    accounts = outreach._load_email_accounts_from_slots()
-    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
-
-
-def test_load_accounts_from_slots_invalid_json_raises_clear_error(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", "not valid json{{{")
-    with pytest.raises(RuntimeError, match="EMAIL_ACCOUNT_SLOT_1"):
-        outreach._load_email_accounts_from_slots()
-
-
-def test_load_accounts_from_slots_missing_field_raises(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1", '{"name": "sales1", "address": "sales1@gmail.com"}')  # no app_password
-    with pytest.raises(RuntimeError, match="missing 'app_password'"):
-        outreach._load_email_accounts_from_slots()
-
-
-def test_load_email_accounts_slots_only_no_json_blob(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.delenv("EMAIL_ACCOUNTS_JSON", raising=False)
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
-                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "xxxx"}')
-    accounts = outreach.load_email_accounts()
-    assert accounts == {"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx"}}
-
-
-def test_load_email_accounts_json_only_no_slots_unchanged_behavior(monkeypatch):
-    """The exact backward-compat guarantee — zero slots set, only the
-    legacy blob, must behave identically to before this feature existed."""
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON", '{"sales1": {"address": "a@b.com", "app_password": "xxxx"}}')
-    accounts = outreach.load_email_accounts()
-    assert accounts == {"sales1": {"address": "a@b.com", "app_password": "xxxx"}}
-
-
-def test_load_email_accounts_merges_slots_and_json_blob(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON", '{"sales_legacy": {"address": "legacy@b.com", "app_password": "old"}}')
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
-                        '{"name": "sales_new", "address": "new@gmail.com", "app_password": "new_pass"}')
-    accounts = outreach.load_email_accounts()
-    assert set(accounts.keys()) == {"sales_legacy", "sales_new"}
-
-
-def test_load_email_accounts_slot_wins_over_same_named_json_entry(monkeypatch):
-    """The migration invariant that matters most: editing an account via
-    a slot must take effect immediately, even while the same account name
-    still lingers (stale) in EMAIL_ACCOUNTS_JSON during the transition."""
-    _clear_all_slots(monkeypatch)
-    monkeypatch.setenv("EMAIL_ACCOUNTS_JSON",
-                        '{"sales1": {"address": "sales1@gmail.com", "app_password": "OLD_PASSWORD"}}')
-    monkeypatch.setenv("EMAIL_ACCOUNT_SLOT_1",
-                        '{"name": "sales1", "address": "sales1@gmail.com", "app_password": "NEW_PASSWORD"}')
-    accounts = outreach.load_email_accounts()
-    assert accounts["sales1"]["app_password"] == "NEW_PASSWORD"
-
-
-def test_load_email_accounts_raises_when_neither_slots_nor_json_set(monkeypatch):
-    _clear_all_slots(monkeypatch)
-    monkeypatch.delenv("EMAIL_ACCOUNTS_JSON", raising=False)
-    with pytest.raises(RuntimeError, match="No email accounts configured"):
-        outreach.load_email_accounts()
-
-
-# =============================================================================
-# is_valid_email_format
-# =============================================================================
-
-def test_valid_email_formats():
-    for addr in ["a@b.com", "john.doe+tag@sub.domain.co", "x@y.io"]:
-        assert outreach.is_valid_email_format(addr), addr
-
-
-def test_invalid_email_formats():
-    for addr in ["", "no-at-sign", "a@b", "a @b.com", "a@b .com", "justtext"]:
-        assert not outreach.is_valid_email_format(addr), addr
-
-
-# =============================================================================
-# classify_send_exception — error monitoring categories
-# =============================================================================
-
-def test_classify_missing_sender_account_error():
-    exc = outreach.MissingSenderAccountError("nope")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_MISSING_SENDER_ACCOUNT
-
-
-def test_classify_invalid_email_format_error():
-    exc = outreach.InvalidEmailFormatError("bad format")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_INVALID_EMAIL
-
-
-def test_classify_smtp_authentication_error():
-    import smtplib
-    exc = smtplib.SMTPAuthenticationError(535, b"Authentication failed")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_AUTH_FAILURE
-
-
-def test_classify_smtp_recipients_refused():
-    import smtplib
-    exc = smtplib.SMTPRecipientsRefused({"bad@x.com": (550, b"No such user")})
-    assert outreach.classify_send_exception(exc) == outreach.ERR_INVALID_EMAIL
-
-
-def test_classify_smtp_rate_limit_by_code():
-    import smtplib
-    exc = smtplib.SMTPResponseException(454, b"4.7.0 Too many login attempts")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_RATE_LIMIT
-
-
-def test_classify_smtp_rate_limit_by_keyword():
-    import smtplib
-    exc = smtplib.SMTPResponseException(552, b"rate limited, try again later")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_RATE_LIMIT
-
-
-def test_classify_smtp_generic_response_exception_is_send_failure():
-    import smtplib
-    exc = smtplib.SMTPResponseException(552, b"message too large")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_SEND_FAILURE
-
-
-def test_classify_generic_os_error_is_send_failure():
-    exc = OSError("connection reset")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_SEND_FAILURE
-
-
-# =============================================================================
-# classify_imap_exception
-# =============================================================================
-
-def test_classify_imap_auth_failure_by_message():
-    exc = Exception("b'AUTHENTICATIONFAILED Invalid credentials'")
-    assert outreach.classify_imap_exception(exc) == outreach.ERR_AUTH_FAILURE
-
-
-def test_classify_imap_generic_failure():
-    exc = Exception("connection timed out")
-    assert outreach.classify_imap_exception(exc) == outreach.ERR_REPLY_CHECK
-
-
-# =============================================================================
-# log_error
-# =============================================================================
-
-def test_log_error_appends_structured_entry():
-    fake_sheets = FakeSheets([])
-    outreach.log_error(fake_sheets, "camp1", outreach.ERR_SEND_FAILURE, "boom",
-                        lead_id="L1", email_addr="a@b.com", stage="intro", batch_id="BATCH-1")
-    assert len(fake_sheets.error_log) == 1
-    entry = fake_sheets.error_log[0]
-    assert entry["ErrorType"] == outreach.ERR_SEND_FAILURE
-    assert entry["Message"] == "boom"
-    assert entry["LeadID"] == "L1"
-    assert entry["Campaign"] == "camp1"
-    assert entry["BatchID"] == "BATCH-1"
-
-
-def test_log_error_never_raises_even_if_sheet_write_fails():
-    class BrokenSheets:
-        def append_error_log(self, fields):
-            raise RuntimeError("sheets down")
-
-    # Must not raise — this is the whole point of log_error's own try/except.
-    outreach.log_error(BrokenSheets(), "camp1", outreach.ERR_SEND_FAILURE, "boom")
-
-
-# =============================================================================
-# _get_or_create_ws — relaxed prefix-based header validation
-# =============================================================================
-
-class FakeGspreadExceptions:
-    class WorksheetNotFound(Exception):
-        pass
-
-
-class FakeGspreadModule:
-    exceptions = FakeGspreadExceptions
-
-
-class FakeWs:
-    def __init__(self, header=None):
-        self._header = header if header is not None else []
-        self.appended_rows = []
-
-    def row_values(self, n):
-        return self._header
-
-    def append_row(self, row):
-        self.appended_rows.append(row)
-        if not self._header:
-            self._header = row
-
-
-class FakeSpreadsheet:
-    def __init__(self, existing=None):
-        self._existing = existing or {}
-        self.added = {}
-
-    def worksheet(self, title):
-        if title in self._existing:
-            return self._existing[title]
-        raise FakeGspreadExceptions.WorksheetNotFound(title)
-
-    def add_worksheet(self, title, rows, cols):
-        ws = FakeWs()
-        self.added[title] = ws
-        self._existing[title] = ws
-        return ws
-
-
-def test_get_or_create_ws_creates_new_tab_with_header():
-    spreadsheet = FakeSpreadsheet()
-    ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
-    assert ws.appended_rows == [["A", "B"]]
-    assert "MyTab" in spreadsheet.added
-
-
-def test_get_or_create_ws_accepts_extra_trailing_custom_columns():
-    existing_ws = FakeWs(header=["A", "B", "Industry", "JobTitle"])
-    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
-    ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
-    assert ws is existing_ws  # accepted as-is, no error, custom columns preserved
-
-
-def test_get_or_create_ws_rejects_missing_required_column():
-    existing_ws = FakeWs(header=["A", "WrongColumn"])
-    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
-    try:
-        outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
-        assert False, "should have raised RuntimeError"
-    except RuntimeError:
-        pass
-
-
-def test_get_or_create_ws_fills_header_on_blank_existing_tab():
-    existing_ws = FakeWs(header=[])
-    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
-    ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
-    assert ws.appended_rows == [["A", "B"]]
-
-
-# =============================================================================
-# write_dashboard / write_all_campaigns_dashboard
-# =============================================================================
-
-class FakeDashboardWs:
-    def __init__(self):
-        self.cleared = False
-        self.updated_values = None
-        self.updated_range = None
-
-    def clear(self):
-        self.cleared = True
-
-    def update(self, values, range_name=None):
-        self.updated_values = values
-        self.updated_range = range_name
-
-
-def test_write_dashboard_clears_then_writes_header_and_rows():
-    ws = FakeDashboardWs()
-    rows = [("Overview", "Total Leads", "5"), ("Overview", "Total Sent", "3")]
-    outreach.write_dashboard(ws, rows)
-    assert ws.cleared is True
-    assert ws.updated_values[0] == outreach.DASHBOARD_COLUMNS
-    assert ws.updated_values[1] == ["Overview", "Total Leads", "5"]
-    assert ws.updated_values[2] == ["Overview", "Total Sent", "3"]
-
-
-def test_write_all_campaigns_dashboard_clears_then_writes():
-    ws = FakeDashboardWs()
-    rows = [["camp1", "10", "8", "8", "7", "1", "0", "2", "25.0%", "50.0%"]]
-    outreach.write_all_campaigns_dashboard(ws, rows)
-    assert ws.cleared is True
-    assert ws.updated_values[0] == outreach.ALL_CAMPAIGNS_DASHBOARD_COLUMNS
-    assert ws.updated_values[1] == rows[0]
-
-
-# =============================================================================
-# compute_campaign_dashboard — full synthetic scenario
-# =============================================================================
-
-DASH_STAGES = [
-    {"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0},
-    {"name": "followup1", "template_prefix": "followup1", "wait_days_after_previous": 3},
-    {"name": "followup2", "template_prefix": "followup2", "wait_days_after_previous": 4},
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def _extract_email(from_header: str) -> str:
+    match = EMAIL_RE.search(from_header or "")
+    return match.group(0).lower() if match else ""
+
+
+def _most_recent_send_at(lead: Dict) -> Optional[datetime]:
+    """Latest send timestamp across every stage for this lead. Used to
+    sanity-check whether an inbound message could plausibly be a reply to
+    THIS campaign's own outreach — it can't be a reply to something that
+    hadn't been sent to this lead yet."""
+    latest = None
+    for field in ("IntroSentAt", "FollowUp1SentAt", "FollowUp2SentAt", "FollowUp3SentAt", "FollowUp4SentAt"):
+        dt = _parse_dt(lead.get(field, ""))
+        if dt is not None and (latest is None or dt > latest):
+            latest = dt
+    return latest
+
+
+# Reply-matching outcomes. A Header match (inbound In-Reply-To/References
+# contains a Message-ID this system actually sent) is the only signal
+# trusted enough to stop a live sequence. An Email-only match (same sender
+# address, no header link) is real signal worth logging, but NEVER trusted
+# on its own to stop anything — the same address can legitimately appear
+# across more than one campaign (or a previous, since-replaced campaign),
+# and sender-address alone can't tell those apart. See README "Reply
+# matching safety" for the full rationale and the production incident that
+# prompted this.
+ACTION_STOPPED = "Stopped Sequence"
+ACTION_LOGGED_ONLY = "Logged Only"
+ACTION_LOGGED_UNVERIFIED = "Logged Only (Unverified Match)"
+ACTION_LOGGED_UNRELATED = "Logged Only (Predates Contact)"
+
+
+OOO_KEYWORDS = [
+    "out of office", "automatic reply", "auto-reply", "auto reply",
+    "away from my desk", "on leave", "on vacation", "currently unavailable",
+    "will be back on", "annual leave",
 ]
+BOUNCE_HARD_KEYWORDS = [
+    "undeliverable", "delivery has failed", "delivery failed",
+    "address not found", "recipient address rejected",
+    "mailbox unavailable", "550", "does not exist",
+]
+BOUNCE_SOFT_KEYWORDS = [
+    "mailbox full", "quota exceeded", "temporarily deferred",
+    "try again later", "451", "452",
+]
+BOUNCE_SENDER_PATTERNS = ["mailer-daemon", "postmaster", "mail delivery subsystem"]
 
 
-def _dash_lead(**overrides):
-    lead = {
-        "_row": 2, "LeadID": "", "Email": "", "Approval": "Yes", "Status": "", "ReplyStatus": "",
-        "CurrentStage": "", "SenderAccount": "",
-        "IntroSentAt": "", "IntroVariant": "",
-        "FollowUp1SentAt": "", "FollowUp1Variant": "",
-        "FollowUp2SentAt": "", "FollowUp2Variant": "",
-    }
-    lead.update(overrides)
-    return lead
+def _status_code_severity(text: str) -> str:
+    match = re.search(r"\b([245])\.\d\.\d\b", text)
+    if not match:
+        return ""
+    code = match.group(1)
+    if code == "5":
+        return CLASSIFICATION_BOUNCE_HARD
+    if code == "4":
+        return CLASSIFICATION_BOUNCE_SOFT
+    return ""
 
 
-def _rows_to_dict(rows):
-    return {(r[0], r[1]): r[2] for r in rows}
+def classify_message(headers: Dict[str, str], subject: str, body: str, from_addr: str) -> str:
+    headers = {k.lower(): v for k, v in (headers or {}).items()}
+    subject_l = (subject or "").lower()
+    body_l = (body or "").lower()
+    from_l = (from_addr or "").lower()
+
+    auto_submitted = headers.get("auto-submitted", "").lower()
+    if auto_submitted and auto_submitted != "no":
+        return CLASSIFICATION_AUTOREPLY
+    if "x-autoreply" in headers or "x-autorespond" in headers:
+        return CLASSIFICATION_AUTOREPLY
+    if headers.get("precedence", "").lower() in ("bulk", "auto_reply", "junk"):
+        return CLASSIFICATION_AUTOREPLY
+
+    content_type = headers.get("content-type", "").lower()
+    is_bounce_sender = any(p in from_l for p in BOUNCE_SENDER_PATTERNS)
+    is_dsn = "report-type=delivery-status" in content_type or "multipart/report" in content_type
+
+    if is_bounce_sender or is_dsn:
+        severity = _status_code_severity(body_l) or _status_code_severity(subject_l)
+        if severity:
+            return severity
+        if any(k in body_l or k in subject_l for k in BOUNCE_HARD_KEYWORDS):
+            return CLASSIFICATION_BOUNCE_HARD
+        if any(k in body_l or k in subject_l for k in BOUNCE_SOFT_KEYWORDS):
+            return CLASSIFICATION_BOUNCE_SOFT
+        return CLASSIFICATION_BOUNCE_HARD
+
+    if any(k in subject_l or k in body_l for k in OOO_KEYWORDS):
+        return CLASSIFICATION_OOO
+
+    return CLASSIFICATION_GENUINE
 
 
-def test_compute_campaign_dashboard_full_scenario():
-    ts = "2026-08-20 10:00:00"
-    leads = [
-        _dash_lead(_row=2, LeadID="L1", Email="john@abc.com", IntroSentAt=ts, IntroVariant="A",
-                   SenderAccount="sales1", CurrentStage="intro", Status="intro Sent"),
-        _dash_lead(_row=3, LeadID="L2", Email="jane@abc.com", IntroSentAt=ts, IntroVariant="B",
-                   FollowUp1SentAt=ts, FollowUp1Variant="A", FollowUp2SentAt=ts, FollowUp2Variant="A",
-                   SenderAccount="sales1", CurrentStage="followup2", Status="followup2 Sent"),
-        _dash_lead(_row=4, LeadID="L3", Email="bob@xyz.com", IntroSentAt=ts, IntroVariant="A",
-                   SenderAccount="sales2", CurrentStage="intro", Status=outreach.STATUS_STOPPED_REPLIED,
-                   ReplyStatus="Replied"),
-        _dash_lead(_row=5, LeadID="L4", Email=""),  # no email — excluded from total_leads
-    ]
-    send_log = [
-        {"Status": "sent", "SenderAccount": "sales1"},
-        {"Status": "sent", "SenderAccount": "sales1"},
-        {"Status": "sent", "SenderAccount": "sales1"},
-        {"Status": "sent", "SenderAccount": "sales2"},
-        {"Status": "error", "SenderAccount": "sales1"},  # must NOT count toward total_sent
-    ]
-    responses = [
-        {"Classification": outreach.CLASSIFICATION_GENUINE},
-        {"Classification": outreach.CLASSIFICATION_BOUNCE_HARD},
-        {"Classification": outreach.CLASSIFICATION_BOUNCE_SOFT},
-    ]
-    error_log = [
-        {"Timestamp": "t1", "ErrorType": outreach.ERR_SEND_FAILURE, "Message": "boom1"},
-        {"Timestamp": "t2", "ErrorType": outreach.ERR_SEND_FAILURE, "Message": "boom2"},
-        {"Timestamp": "t3", "ErrorType": outreach.ERR_INVALID_EMAIL, "Message": "bad@"},
-    ]
-    campaign_cfg = {"stages": DASH_STAGES}
+def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], lookback_hours: int,
+                   campaign_name: str = "") -> List[Dict]:
+    leads = sheets.get_all_leads()
 
-    rows = outreach.compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
-    d = _rows_to_dict(rows)
+    by_message_id = {}
+    by_email = {}
+    for lead in leads:
+        mid = (lead.get("MessageID") or "").strip()
+        if mid:
+            by_message_id.setdefault(mid, lead)
+        email_addr = (lead.get("Email") or "").strip().lower()
+        if email_addr:
+            by_email.setdefault(email_addr, lead)
 
-    assert d[("Overview", "Total Leads (with Email)")] == "3"
-    assert d[("Overview", "Unique Leads Contacted")] == "3"
-    assert d[("Overview", "Total Emails Sent")] == "4"
-    assert d[("Overview", "Delivered (est. = Sent minus Hard Bounces)")] == "3"
-    assert d[("Overview", "Bounced (Hard)")] == "1"
-    assert d[("Overview", "Bounced (Soft)")] == "1"
-    assert d[("Overview", "Genuine Replies")] == "1"
-    assert d[("Overview", "Reply Rate (Replies / Unique Contacted)")] == "33.3%"
-    assert d[("Overview", "Sequence Completion (Reached Final Stage / Unique Contacted)")] == "33.3%"
+    already_logged = sheets.get_logged_message_ids()
+    since_dt = datetime.now() - timedelta(hours=lookback_hours)
 
-    assert d[("Per-Stage", "intro - Sent")] == "3"
-    assert d[("Per-Stage", "followup1 - Sent")] == "1"
-    assert d[("Per-Stage", "followup2 - Sent")] == "1"
+    actions = []
+    for account_name, account in accounts.items():
+        try:
+            messages = imap_fetch_recent(account["address"], account["app_password"], since_dt)
+        except Exception as exc:  # noqa: BLE001 - one account's IMAP outage shouldn't block the rest
+            error_type = classify_imap_exception(exc)
+            print(f"WARNING: IMAP check failed for account '{account_name}': {exc}", file=sys.stderr)
+            log_error(sheets, campaign_name, error_type, f"IMAP check failed for account '{account_name}': {exc}")
+            continue
 
-    assert d[("Sender Performance", "sales1 - Sent")] == "3"
-    assert d[("Sender Performance", "sales1 - Replies")] == "0"
-    assert d[("Sender Performance", "sales2 - Sent")] == "1"
-    assert d[("Sender Performance", "sales2 - Replies")] == "1"
-    assert d[("Sender Performance", "sales2 - Reply Rate")] == "100.0%"
+        for msg in messages:
+            if msg["message_id"] and msg["message_id"] in already_logged:
+                continue
 
-    assert d[("Variant Performance", "intro-A - Sent")] == "2"
-    assert d[("Variant Performance", "intro-A - Replies (approx.)")] == "1"
-    assert d[("Variant Performance", "intro-B - Sent")] == "1"
-    assert d[("Variant Performance", "intro-B - Replies (approx.)")] == "0"
+            combined_refs = f'{msg.get("in_reply_to", "")} {msg.get("references", "")}'
+            matched_lead = None
+            match_method = None
+            for mid, lead in by_message_id.items():
+                if mid and mid in combined_refs:
+                    matched_lead = lead
+                    match_method = "Header"
+                    break
+            if matched_lead is None:
+                sender_email = _extract_email(msg["from"])
+                matched_lead = by_email.get(sender_email)
+                if matched_lead is not None:
+                    match_method = "Email"
+            if matched_lead is None:
+                continue
 
-    assert d[("Errors (All Time)", outreach.ERR_SEND_FAILURE)] == "2"
-    assert d[("Errors (All Time)", outreach.ERR_INVALID_EMAIL)] == "1"
+            classification = classify_message(msg["headers"], msg["subject"], msg["body"], msg["from"])
+            now_str = datetime.now().strftime(DATETIME_FMT)
 
+            master_updates = {"LastInboundClassification": classification, "LastInboundAt": now_str,
+                               "LastActionAt": now_str}
 
-def test_compute_all_campaigns_row_matches_column_order():
-    ts = "2026-08-20 10:00:00"
-    leads = [_dash_lead(_row=2, LeadID="L1", Email="john@abc.com", IntroSentAt=ts)]
-    send_log = [{"Status": "sent", "SenderAccount": "sales1"}]
-    responses = []
-    row = outreach.compute_all_campaigns_row("mycamp", leads, responses, send_log, DASH_STAGES)
-    assert len(row) == len(outreach.ALL_CAMPAIGNS_DASHBOARD_COLUMNS)
-    assert row[0] == "mycamp"
-    assert row[1] == "1"  # Total Leads
-    assert row[2] == "1"  # Unique Contacted
-    assert row[3] == "1"  # Total Sent
+            if match_method == "Header":
+                # Strong signal: this message is provably part of THIS
+                # campaign's own outbound thread. Safe to act on.
+                action_taken = ACTION_LOGGED_ONLY
+                if classification == CLASSIFICATION_GENUINE:
+                    master_updates.update({"ReplyStatus": "Replied", "ReplyAt": now_str,
+                                            "Status": STATUS_STOPPED_REPLIED})
+                    action_taken = ACTION_STOPPED
+                elif classification == CLASSIFICATION_BOUNCE_HARD:
+                    master_updates["Status"] = STATUS_STOPPED_BOUNCED
+                    action_taken = ACTION_STOPPED
+            else:
+                # Sender-only match — logged for visibility, but NEVER
+                # allowed to stop a sequence (ReplyStatus/Status are
+                # deliberately left untouched below in both branches).
+                last_sent = _most_recent_send_at(matched_lead)
+                msg_date = msg.get("date")
+                if last_sent is not None and msg_date is not None and msg_date < last_sent:
+                    # Chronologically impossible to be a reply to this
+                    # campaign's outreach — almost certainly a stale message
+                    # tied to a different (possibly deleted) campaign that
+                    # happens to share this lead's email address.
+                    action_taken = ACTION_LOGGED_UNRELATED
+                else:
+                    action_taken = ACTION_LOGGED_UNVERIFIED
 
+            try:
+                sheets.update_lead_fields(matched_lead["_row"], master_updates)
+                sheets.append_response({
+                    "ResponseID": msg["message_id"] or f"noid-{now_str}", "LeadID": matched_lead.get("LeadID", ""),
+                    "Campaign": campaign_name, "ReceivedAt": now_str, "From": msg["from"], "Subject": msg["subject"],
+                    "Snippet": msg["snippet"], "Classification": classification, "MatchMethod": match_method,
+                    "MessageID": msg["message_id"], "InReplyTo": msg.get("in_reply_to", ""),
+                    "ActionTaken": action_taken,
+                })
+            except Exception as sheets_exc:  # noqa: BLE001
+                log_error(sheets, campaign_name, ERR_SHEETS_API,
+                          f"Reply detected but failed to update the sheet: {sheets_exc}",
+                          lead_id=matched_lead.get("LeadID", ""), email_addr=matched_lead.get("Email", ""))
+                continue
 
-# =============================================================================
-# send_batch — new error-monitoring integration paths
-# =============================================================================
+            actions.append({"lead_id": matched_lead.get("LeadID", ""), "email": matched_lead.get("Email", ""),
+                             "classification": classification, "action": action_taken,
+                             "match_method": match_method, "account": account_name})
 
-def test_send_batch_invalid_email_format_never_calls_smtp(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="not-a-valid-email")]
-    fake_sheets = FakeSheets(leads)
-
-    def should_not_be_called(*a, **kw):
-        raise AssertionError("smtp_send should never be called for an invalid email format")
-
-    monkeypatch.setattr(outreach, "smtp_send", should_not_be_called)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "error"
-    assert results[0]["error_type"] == outreach.ERR_INVALID_EMAIL
-    assert len(fake_sheets.error_log) == 1
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_INVALID_EMAIL
-
-
-def test_send_batch_unknown_sender_account_classified_correctly(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", SenderAccount="ghost_account")]
-    fake_sheets = FakeSheets(leads)
-
-    monkeypatch.setattr(outreach, "smtp_send",
-                         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not be called")))
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "error"
-    assert results[0]["error_type"] == outreach.ERR_MISSING_SENDER_ACCOUNT
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_MISSING_SENDER_ACCOUNT
-
-
-def test_send_batch_logs_missing_template_variable_after_successful_send(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
-    fake_sheets = FakeSheets(leads)
-
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<msg1@mail.gmail.com>"})
-    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
-        "subject": "Hi", "body": "Body", "missing_variables": ["Industry"],
-        "thread_subject": "Hi", "is_continuation": False,
-    })
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "sent"
-    assert len(fake_sheets.error_log) == 1
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_MISSING_VARIABLE
-    assert "Industry" in fake_sheets.error_log[0]["Message"]
-
-
-class RaisingUpdateFakeSheets(FakeSheets):
-    def update_lead_fields(self, row_number, fields):
-        raise RuntimeError("sheets down")
-
-
-def test_send_batch_sent_but_sheet_error_when_sheet_write_fails_after_send(monkeypatch):
-    campaign_cfg = _base_campaign_cfg()
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
-    fake_sheets = RaisingUpdateFakeSheets(leads)
-
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<msg1@mail.gmail.com>"})
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "sent_but_sheet_error"
-    assert len(fake_sheets.error_log) == 1
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_SHEETS_API
-    assert "sent successfully" in fake_sheets.error_log[0]["Message"].lower()
+    return actions
 
 
 # =============================================================================
-# check_replies — IMAP failures now also logged to Error Log
-# =============================================================================
-
-def test_check_replies_imap_failure_logs_to_error_log(monkeypatch):
-    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
-    fake_sheets = FakeSheets(leads)
-
-    def flaky_imap_fetch_recent(address, app_password, since_dt):
-        raise RuntimeError("simulated IMAP outage")
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", flaky_imap_fetch_recent)
-
-    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
-                            campaign_name="test_campaign")
-    assert len(fake_sheets.error_log) == 1
-    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_REPLY_CHECK
-    assert fake_sheets.error_log[0]["Campaign"] == "test_campaign"
-
-
-# =============================================================================
-# get_rotation_accounts
-# =============================================================================
-
-ROTATION_ACCOUNTS = {
-    "sales1": {"address": "sales1@gmail.com", "app_password": "aaaa"},
-    "sales2": {"address": "sales2@gmail.com", "app_password": "bbbb"},
-    "sales3": {"address": "sales3@gmail.com", "app_password": "cccc"},
-}
-
-
-def test_get_rotation_accounts_defaults_to_all_accounts():
-    campaign_cfg = {"sending": {}}
-    result = outreach.get_rotation_accounts(campaign_cfg, ROTATION_ACCOUNTS)
-    assert set(result) == {"sales1", "sales2", "sales3"}
-
-
-def test_get_rotation_accounts_respects_explicit_subset():
-    campaign_cfg = {"sending": {"rotation_accounts": ["sales1", "sales3"]}}
-    result = outreach.get_rotation_accounts(campaign_cfg, ROTATION_ACCOUNTS)
-    assert set(result) == {"sales1", "sales3"}
-
-
-def test_get_rotation_accounts_filters_out_unknown_names():
-    campaign_cfg = {"sending": {"rotation_accounts": ["sales1", "does_not_exist"]}}
-    result = outreach.get_rotation_accounts(campaign_cfg, ROTATION_ACCOUNTS)
-    assert result == ["sales1"]
-
-
-# =============================================================================
-# pick_rotation_account
-# =============================================================================
-
-def test_pick_rotation_account_picks_least_used():
-    result = outreach.pick_rotation_account(
-        ["sales1", "sales2", "sales3"], None, {"sales1": 5, "sales2": 1, "sales3": 5}, {})
-    assert result == "sales2"
-
-
-def test_pick_rotation_account_excludes_accounts_at_capacity():
-    result = outreach.pick_rotation_account(
-        ["sales1", "sales2"], 3, {"sales1": 3, "sales2": 1}, {})
-    assert result == "sales2"  # sales1 is at its cap of 3
-
-
-def test_pick_rotation_account_returns_none_when_all_at_capacity():
-    result = outreach.pick_rotation_account(
-        ["sales1", "sales2"], 3, {"sales1": 3, "sales2": 3}, {})
-    assert result is None
-
-
-def test_pick_rotation_account_counts_in_batch_assignments_too():
-    # sales1 has 0 from SendLog but already got 3 assigned earlier THIS batch
-    result = outreach.pick_rotation_account(
-        ["sales1", "sales2"], 3, {"sales1": 0, "sales2": 0}, {"sales1": 3})
-    assert result == "sales2"
-
-
-def test_pick_rotation_account_no_limit_never_excludes():
-    result = outreach.pick_rotation_account(["sales1", "sales2"], None, {"sales1": 100}, {})
-    assert result == "sales2"  # still picks least-used even with huge counts, since no cap
-
-
-# =============================================================================
-# _check_account_capacity
-# =============================================================================
-
-def test_check_account_capacity_no_limit_never_raises():
-    outreach._check_account_capacity("sales1", None, {"sales1": 999}, {})  # should not raise
-
-
-def test_check_account_capacity_under_limit_does_not_raise():
-    outreach._check_account_capacity("sales1", 5, {"sales1": 3}, {})  # should not raise
-
-
-def test_check_account_capacity_at_limit_raises():
-    try:
-        outreach._check_account_capacity("sales1", 5, {"sales1": 5}, {})
-        assert False, "should have raised SenderCapacityReachedError"
-    except outreach.SenderCapacityReachedError:
-        pass
-
-
-# =============================================================================
-# resolve_sender_account_for_send
-# =============================================================================
-
-def test_resolve_for_send_manual_override_wins_even_with_rotation_on():
-    lead = make_lead(SenderAccount="sales3")
-    campaign_cfg = {"_global_default_account": "sales1", "sending": {"sender_rotation": True}}
-    result = outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, {}, {})
-    assert result == "sales3"
-
-
-def test_resolve_for_send_manual_override_respects_capacity_not_silently_rerouted():
-    lead = make_lead(SenderAccount="sales1")
-    campaign_cfg = {"_global_default_account": "sales2", "sending": {"per_account_daily_limit": 2}}
-    sent_today = {"sales1": 2}  # sales1 already at its cap
-    try:
-        outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, sent_today, {})
-        assert False, "should have raised SenderCapacityReachedError"
-    except outreach.SenderCapacityReachedError:
-        pass  # must NOT silently fall back to sales2
-
-
-def test_resolve_for_send_rotation_picks_least_used_when_no_override():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales1", "sending": {"sender_rotation": True}}
-    sent_today = {"sales1": 10, "sales2": 0, "sales3": 5}
-    result = outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, sent_today, {})
-    assert result == "sales2"
-
-
-def test_resolve_for_send_rotation_all_at_capacity_raises_capacity_error():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales1",
-                     "sending": {"sender_rotation": True, "per_account_daily_limit": 2}}
-    sent_today = {"sales1": 2, "sales2": 2, "sales3": 2}
-    try:
-        outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, sent_today, {})
-        assert False, "should have raised SenderCapacityReachedError"
-    except outreach.SenderCapacityReachedError:
-        pass
-
-
-def test_resolve_for_send_rotation_off_falls_back_to_single_default():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales2", "sending": {}}
-    result = outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, {}, {})
-    assert result == "sales2"
-
-
-def test_resolve_for_send_rotation_respects_whitelist():
-    lead = make_lead(SenderAccount="")
-    campaign_cfg = {"_global_default_account": "sales1",
-                     "sending": {"sender_rotation": True, "rotation_accounts": ["sales2", "sales3"]}}
-    sent_today = {"sales1": 0, "sales2": 5, "sales3": 5}  # sales1 has lowest usage but isn't in the whitelist
-    result = outreach.resolve_sender_account_for_send(lead, campaign_cfg, ROTATION_ACCOUNTS, sent_today, {})
-    assert result in ("sales2", "sales3")
-
-
-# =============================================================================
-# _count_sent_today_by_account
-# =============================================================================
-
-def test_count_sent_today_by_account_counts_only_sent_status_today():
-    today = datetime.now().strftime(outreach.DATETIME_FMT)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime(outreach.DATETIME_FMT)
-    send_log = [
-        {"Status": "sent", "SenderAccount": "sales1", "Timestamp": today},
-        {"Status": "sent", "SenderAccount": "sales1", "Timestamp": today},
-        {"Status": "sent", "SenderAccount": "sales2", "Timestamp": today},
-        {"Status": "error", "SenderAccount": "sales1", "Timestamp": today},   # excluded — not "sent"
-        {"Status": "skipped", "SenderAccount": "sales1", "Timestamp": today},  # excluded — not "sent"
-        {"Status": "sent", "SenderAccount": "sales1", "Timestamp": yesterday},  # excluded — not today
-    ]
-    counts = outreach._count_sent_today_by_account(send_log)
-    assert counts == {"sales1": 2, "sales2": 1}
-
-
-# =============================================================================
-# classify_send_exception — new category
-# =============================================================================
-
-def test_classify_sender_capacity_reached_error():
-    exc = outreach.SenderCapacityReachedError("all full")
-    assert outreach.classify_send_exception(exc) == outreach.ERR_SENDER_CAPACITY
-
-
-# =============================================================================
-# Config validation — new sending keys
-# =============================================================================
-
-def test_validate_campaign_rejects_non_positive_per_account_daily_limit(tmp_path):
-    override = "sending:\n  per_account_daily_limit: 0\n"
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
-
-
-def test_validate_campaign_accepts_valid_rotation_config(tmp_path):
-    override = (
-        "sending:\n"
-        "  per_account_daily_limit: 5\n"
-        "  sender_rotation: true\n"
-        "  rotation_accounts: [\"sales1\", \"sales2\"]\n"
-    )
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
-                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
-    assert cfg["sending"]["per_account_daily_limit"] == 5
-    assert cfg["sending"]["sender_rotation"] is True
-    assert cfg["sending"]["rotation_accounts"] == ["sales1", "sales2"]
-
-
-def test_validate_campaign_rejects_non_bool_sender_rotation(tmp_path):
-    override = 'sending:\n  sender_rotation: "yes please"\n'
-    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
-    try:
-        outreach.get_campaign("test_campaign", settings_path=settings_path,
-                               campaigns_dir=campaigns_dir, templates_root=templates_root)
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
-
-
-# =============================================================================
-# send_batch — rotation and per-account limit integration
-# =============================================================================
-
-def _rotation_campaign_cfg(**sending_overrides):
-    sending = {"daily_limit": 100, "delay_min_minutes": 0, "delay_max_minutes": 0}
-    sending.update(sending_overrides)
-    return {
-        "templates_dir": TEMPLATES_DIR, "variants": ["A", "B", "C", "D"], "stages": STAGES,
-        "sending": sending, "_campaign_name": "test_campaign", "_global_default_account": "sales1",
-    }
-
-
-def test_send_batch_rotates_across_accounts_with_no_manual_assignment(monkeypatch):
-    campaign_cfg = _rotation_campaign_cfg(sender_rotation=True)
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-        make_lead(_row=5, LeadID="L4", Email="d@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    sent = [r for r in results if r["status"] == "sent"]
-    assert len(sent) == 4
-    accounts_used = [r["account"] for r in sent]
-    # Balanced rotation across 3 accounts for 4 sends: no account should be
-    # used more than twice (ceil(4/3) = 2).
-    for acct in ROTATION_ACCOUNTS:
-        assert accounts_used.count(acct) <= 2
-    # Every lead's SenderAccount must have been written back (locked in).
-    for lead in fake_sheets._leads:
-        assert lead["SenderAccount"] in ROTATION_ACCOUNTS
-
-
-def test_send_batch_skips_lead_when_all_rotation_accounts_at_capacity(monkeypatch):
-    campaign_cfg = _rotation_campaign_cfg(sender_rotation=True, per_account_daily_limit=1,
-                                           rotation_accounts=["sales1", "sales2"])
-    today = datetime.now().strftime(outreach.DATETIME_FMT)
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    # Pre-seed today's SendLog as if sales1 and sales2 already each sent once today.
-    fake_sheets.send_log = [
-        {"Status": "sent", "SenderAccount": "sales1", "Timestamp": today},
-        {"Status": "sent", "SenderAccount": "sales2", "Timestamp": today},
-    ]
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    # All 3 leads should be skipped since both accounts are already at their
-    # cap of 1 for today (sales3 isn't in the whitelist).
-    assert all(r["status"] == "skipped" for r in results)
-    assert all(r["error_type"] == outreach.ERR_SENDER_CAPACITY for r in results)
-
-
-def test_send_batch_manual_assignment_skipped_not_rerouted_when_at_capacity(monkeypatch):
-    campaign_cfg = _rotation_campaign_cfg(per_account_daily_limit=1)
-    today = datetime.now().strftime(outreach.DATETIME_FMT)
-    leads = [make_lead(_row=2, LeadID="L1", Email="a@abc.com", SenderAccount="sales1")]
-    fake_sheets = FakeSheets(leads)
-    fake_sheets.send_log = [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": today}]
-
-    def should_not_be_called(*a, **kw):
-        raise AssertionError("smtp_send should not be called — sales1 is at capacity")
-
-    monkeypatch.setattr(outreach, "smtp_send", should_not_be_called)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    assert results[0]["status"] == "skipped"
-    assert results[0]["error_type"] == outreach.ERR_SENDER_CAPACITY
-
-
-def test_send_batch_third_lead_in_same_batch_respects_in_batch_rotation_count(monkeypatch):
-    # per_account_daily_limit=1, 2 accounts, 3 leads, no prior SendLog history:
-    # first two leads consume sales1 and sales2's capacity WITHIN this batch,
-    # so the third lead must be skipped even though SendLog itself is empty.
-    campaign_cfg = _rotation_campaign_cfg(sender_rotation=True, per_account_daily_limit=1,
-                                           rotation_accounts=["sales1", "sales2"])
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    sent = [r for r in results if r["status"] == "sent"]
-    skipped = [r for r in results if r["status"] == "skipped"]
-    assert len(sent) == 2
-    assert len(skipped) == 1
-    assert {r["account"] for r in sent} == {"sales1", "sales2"}
-
-
-# =============================================================================
-# send_batch — concurrent rounds (multi-account "send at the same time")
-# =============================================================================
-
-def test_send_batch_sends_full_round_concurrently_not_sequentially(monkeypatch):
-    """The actual point of the round-based redesign: with N distinct
-    accounts and N leads, all N sends should be IN FLIGHT AT THE SAME TIME
-    (real overlap), not one after another. We prove this by having each
-    fake smtp_send briefly sleep and recording wall-clock start/end times —
-    sequential execution could never produce overlapping intervals."""
-    campaign_cfg = _rotation_campaign_cfg(sender_rotation=True)
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    intervals = []
-
-    def slow_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
-        start = time.monotonic()
-        time.sleep(0.2)
-        intervals.append((start, time.monotonic()))
-        return {"message_id": f"<{to}@mail.gmail.com>"}
-
-    monkeypatch.setattr(outreach, "smtp_send", slow_smtp_send)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    sent = [r for r in results if r["status"] == "sent"]
-    assert len(sent) == 3
-
-    # With 3 distinct accounts, all 3 sends belong to one round and should
-    # overlap: every interval's start must fall before some other
-    # interval's end (impossible if they ran one at a time with a 0.2s
-    # sleep each, which would produce non-overlapping back-to-back windows).
-    overlap_found = any(
-        a_start < b_end and b_start < a_end
-        for i, (a_start, a_end) in enumerate(intervals)
-        for j, (b_start, b_end) in enumerate(intervals)
-        if i != j
-    )
-    assert overlap_found, f"Expected overlapping (concurrent) send windows, got {intervals}"
-
-
-def test_send_batch_only_sleeps_between_rounds_not_between_every_send(monkeypatch):
-    """2 accounts, 4 leads => 2 rounds of 2. time.sleep should be called
-    exactly once (between the two rounds), not three times (which is what
-    the old one-delay-per-email design would have done)."""
-    campaign_cfg = _rotation_campaign_cfg(sender_rotation=True,
-                                           rotation_accounts=["sales1", "sales2"],
-                                           delay_min_minutes=1, delay_max_minutes=1)
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-        make_lead(_row=5, LeadID="L4", Email="d@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-
-    sleep_calls = []
-    monkeypatch.setattr(outreach.time, "sleep", lambda seconds: sleep_calls.append(seconds))
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ROTATION_ACCOUNTS, "intro", 10)
-    assert len([r for r in results if r["status"] == "sent"]) == 4
-    assert len(sleep_calls) == 1
-    assert sleep_calls[0] == pytest.approx(60.0, rel=0.01)  # 1 minute, since min==max==1
-
-
-def test_send_batch_two_leads_pinned_to_same_account_split_across_rounds(monkeypatch):
-    """Two leads manually pinned to the SAME SenderAccount can't be in the
-    same concurrent round (one account can't be counted as sending two
-    'simultaneous' emails for pacing purposes) — the second is deferred to
-    round 2, not treated as an error."""
-    campaign_cfg = _base_campaign_cfg()
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com", SenderAccount="sales1"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com", SenderAccount="sales1"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    call_order = []
-
-    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
-        call_order.append(to)
-        return {"message_id": f"<{to}@mail.gmail.com>"}
-
-    monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    sent = [r for r in results if r["status"] == "sent"]
-    assert len(sent) == 2
-    assert call_order == ["a@abc.com", "b@abc.com"]  # round 1 then round 2, in original order
-
-
-def test_send_batch_round_grouping_leaves_single_account_setup_unchanged(monkeypatch):
-    """No rotation, no manual pin — every lead resolves to the same single
-    default account, so every round has exactly 1 job. This is the
-    single-account backward-compatibility guarantee: behavior is identical
-    to the old fully-sequential design."""
-    campaign_cfg = _base_campaign_cfg()
-    leads = [
-        make_lead(_row=2, LeadID="L1", Email="a@abc.com"),
-        make_lead(_row=3, LeadID="L2", Email="b@abc.com"),
-        make_lead(_row=4, LeadID="L3", Email="c@abc.com"),
-    ]
-    fake_sheets = FakeSheets(leads)
-    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
-
-    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
-    sent = [r for r in results if r["status"] == "sent"]
-    assert len(sent) == 3
-    assert all(r["account"] == "sales1" for r in sent)
-
-
-# =============================================================================
-# Dashboard — Sender Usage Today section
-# =============================================================================
-
-def test_dashboard_shows_sender_usage_today_with_cap():
-    today = datetime.now().strftime(outreach.DATETIME_FMT)
-    leads = [_dash_lead(_row=2, LeadID="L1", Email="a@abc.com", IntroSentAt=today, SenderAccount="sales1")]
-    send_log = [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": today}]
-    campaign_cfg = {"stages": DASH_STAGES, "sending": {"per_account_daily_limit": 5, "sender_rotation": True}}
-    rows = outreach.compute_campaign_dashboard(campaign_cfg, leads, [], send_log, [])
-    d = _rows_to_dict(rows)
-    assert d[("Sender Usage Today", "Sender Rotation Enabled")] == "Yes"
-    assert d[("Sender Usage Today", "sales1 - Sent Today")] == "1 / 5"
-
-
-def test_dashboard_shows_sender_usage_today_without_cap():
-    today = datetime.now().strftime(outreach.DATETIME_FMT)
-    leads = [_dash_lead(_row=2, LeadID="L1", Email="a@abc.com", IntroSentAt=today, SenderAccount="sales1")]
-    send_log = [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": today}]
-    campaign_cfg = {"stages": DASH_STAGES, "sending": {}}
-    rows = outreach.compute_campaign_dashboard(campaign_cfg, leads, [], send_log, [])
-    d = _rows_to_dict(rows)
-    assert d[("Sender Usage Today", "sales1 - Sent Today")] == "1 (no per-account cap set)"
-
-
-# =============================================================================
-# apply_sending_overrides — per-run CLI overrides for send
-# =============================================================================
-
-def test_apply_sending_overrides_no_args_changes_nothing():
-    original_sending = {"daily_limit": 100, "sender_rotation": False}
-    campaign_cfg = {"sending": original_sending}
-    overridden = outreach.apply_sending_overrides(campaign_cfg)
-    assert overridden == []
-    assert campaign_cfg["sending"]["daily_limit"] == 100
-    assert campaign_cfg["sending"]["sender_rotation"] is False
-    # The dict itself must be a NEW object — never the same one that was
-    # passed in — so nothing shared/cached elsewhere gets mutated.
-    assert campaign_cfg["sending"] is not original_sending
-
-
-def test_apply_sending_overrides_daily_limit():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    overridden = outreach.apply_sending_overrides(campaign_cfg, daily_limit=25)
-    assert overridden == ["daily_limit"]
-    assert campaign_cfg["sending"]["daily_limit"] == 25
-
-
-def test_apply_sending_overrides_per_account_daily_limit():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    overridden = outreach.apply_sending_overrides(campaign_cfg, per_account_daily_limit=5)
-    assert overridden == ["per_account_daily_limit"]
-    assert campaign_cfg["sending"]["per_account_daily_limit"] == 5
-
-
-def test_apply_sending_overrides_sender_rotation_true():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    overridden = outreach.apply_sending_overrides(campaign_cfg, sender_rotation="true")
-    assert overridden == ["sender_rotation"]
-    assert campaign_cfg["sending"]["sender_rotation"] is True
-
-
-def test_apply_sending_overrides_sender_rotation_false():
-    campaign_cfg = {"sending": {"daily_limit": 100, "sender_rotation": True}}
-    overridden = outreach.apply_sending_overrides(campaign_cfg, sender_rotation="false")
-    assert overridden == ["sender_rotation"]
-    assert campaign_cfg["sending"]["sender_rotation"] is False
-
-
-def test_apply_sending_overrides_all_three_at_once():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    overridden = outreach.apply_sending_overrides(
-        campaign_cfg, daily_limit=10, per_account_daily_limit=2, sender_rotation="true")
-    assert set(overridden) == {"daily_limit", "per_account_daily_limit", "sender_rotation"}
-    assert campaign_cfg["sending"]["daily_limit"] == 10
-    assert campaign_cfg["sending"]["per_account_daily_limit"] == 2
-    assert campaign_cfg["sending"]["sender_rotation"] is True
-
-
-def test_apply_sending_overrides_rejects_non_positive_daily_limit():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    try:
-        outreach.apply_sending_overrides(campaign_cfg, daily_limit=0)
-        assert False, "should have raised ValueError"
-    except ValueError:
-        pass
-
-
-def test_apply_sending_overrides_rejects_negative_per_account_daily_limit():
-    campaign_cfg = {"sending": {"daily_limit": 100}}
-    try:
-        outreach.apply_sending_overrides(campaign_cfg, per_account_daily_limit=-3)
-        assert False, "should have raised ValueError"
-    except ValueError:
-        pass
-
-
-def test_apply_sending_overrides_never_mutates_yaml_source_dict():
-    # Simulates the real scenario: campaign_cfg['sending'] initially IS the
-    # same dict object loaded from yaml. After calling the override
-    # function, that ORIGINAL dict must be untouched.
-    yaml_loaded_sending = {"daily_limit": 100}
-    campaign_cfg = {"sending": yaml_loaded_sending}
-    outreach.apply_sending_overrides(campaign_cfg, daily_limit=5)
-    assert yaml_loaded_sending["daily_limit"] == 100  # untouched
-    assert campaign_cfg["sending"]["daily_limit"] == 5  # only the copy changed
-
-
-# =============================================================================
-# check_replies — reply-matching safety fix (production incident regression)
+# SECTION 13: Dashboards
 #
-# Reported scenario: a lead's email address was reused across campaigns
-# (an old/deleted campaign, then a fresh "Kelson_Creators_Licensing" style
-# campaign with the same lead list). An old reply — genuinely In-Reply-To a
-# DIFFERENT, unrelated Message-ID — was incorrectly matched to the new
-# campaign's lead via sender-email fallback alone, and incorrectly stopped
-# the new sequence. These tests reproduce that exact shape and assert it's
-# now impossible.
+# Fully recomputed and rewritten every run (not appended to) — a snapshot
+# of current state, not a log. "Delivered" is an ESTIMATE (Sent minus
+# confirmed hard bounces) since SMTP provides no real delivery receipt;
+# labeled as such rather than overclaiming precision.
+# "Variant Performance" reply attribution is approximate: a reply is
+# attributed to whichever stage/variant was the lead's most recent send
+# (CurrentStage) at the time they replied.
 # =============================================================================
 
-def _most_recent_send_at_lead(**overrides):
-    lead = make_lead(**overrides)
-    return lead
+def _pct(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "0.0%"
+    return f"{(numerator / denominator) * 100:.1f}%"
 
 
-def test_most_recent_send_at_picks_latest_across_stages():
-    old = "2026-08-01 10:00:00"
-    newer = "2026-08-10 10:00:00"
-    lead = _most_recent_send_at_lead(IntroSentAt=old, FollowUp1SentAt=newer, FollowUp2SentAt="")
-    result = outreach._most_recent_send_at(lead)
-    assert result == outreach._parse_dt(newer)
+def compute_campaign_dashboard(campaign_cfg: Dict, leads: List[Dict], responses: List[Dict],
+                                send_log: List[Dict], error_log: List[Dict]) -> List[Tuple[str, str, str]]:
+    stages = campaign_cfg["stages"]
+
+    total_leads = sum(1 for l in leads if (l.get("Email") or "").strip())
+    contacted = [l for l in leads if any((l.get(stage_field_names(i)["sent_at"]) or "").strip()
+                                          for i in range(len(stages)))]
+    unique_contacted = len(contacted)
+
+    total_sent = sum(1 for r in send_log if r.get("Status") == "sent")
+    bounced_hard = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_BOUNCE_HARD)
+    bounced_soft = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_BOUNCE_SOFT)
+    genuine_replies = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_GENUINE)
+    delivered_est = max(total_sent - bounced_hard, 0)
+
+    last_stage_field = stage_field_names(len(stages) - 1)["sent_at"] if stages else None
+    completed = sum(1 for l in leads if last_stage_field and (l.get(last_stage_field) or "").strip()) \
+        if last_stage_field else 0
+
+    rows: List[Tuple[str, str, str]] = []
+    rows.append(("Overview", "Last Updated", datetime.now().strftime(DATETIME_FMT)))
+    rows.append(("Overview", "Total Leads (with Email)", str(total_leads)))
+    rows.append(("Overview", "Unique Leads Contacted", str(unique_contacted)))
+    rows.append(("Overview", "Total Emails Sent", str(total_sent)))
+    rows.append(("Overview", "Delivered (est. = Sent minus Hard Bounces)", str(delivered_est)))
+    rows.append(("Overview", "Bounced (Hard)", str(bounced_hard)))
+    rows.append(("Overview", "Bounced (Soft)", str(bounced_soft)))
+    rows.append(("Overview", "Genuine Replies", str(genuine_replies)))
+    rows.append(("Overview", "Reply Rate (Replies / Unique Contacted)", _pct(genuine_replies, unique_contacted)))
+    rows.append(("Overview", "Sequence Completion (Reached Final Stage / Unique Contacted)",
+                  _pct(completed, unique_contacted)))
+
+    for i, stage in enumerate(stages):
+        sent_field = stage_field_names(i)["sent_at"]
+        sent_count = sum(1 for l in leads if (l.get(sent_field) or "").strip())
+        rows.append(("Per-Stage", f"{stage['name']} - Sent", str(sent_count)))
+
+    accounts_seen = sorted({(l.get("SenderAccount") or "").strip() for l in contacted
+                             if (l.get("SenderAccount") or "").strip()})
+    for acct in accounts_seen:
+        acct_leads = [l for l in contacted if (l.get("SenderAccount") or "").strip() == acct]
+        acct_sent = sum(1 for r in send_log if r.get("Status") == "sent" and r.get("SenderAccount") == acct)
+        acct_replies = sum(1 for l in acct_leads if l.get("Status") == STATUS_STOPPED_REPLIED)
+        rows.append(("Sender Performance", f"{acct} - Sent", str(acct_sent)))
+        rows.append(("Sender Performance", f"{acct} - Replies", str(acct_replies)))
+        rows.append(("Sender Performance", f"{acct} - Reply Rate", _pct(acct_replies, len(acct_leads))))
+
+    sent_today_by_account = _count_sent_today_by_account(send_log)
+    per_account_limit = campaign_cfg.get("sending", {}).get("per_account_daily_limit")
+    rotation_on = bool(campaign_cfg.get("sending", {}).get("sender_rotation"))
+    if sent_today_by_account or rotation_on:
+        rows.append(("Sender Usage Today", "Sender Rotation Enabled", "Yes" if rotation_on else "No"))
+        usage_accounts = sorted(set(sent_today_by_account.keys()) | set(accounts_seen))
+        for acct in usage_accounts:
+            used_today = sent_today_by_account.get(acct, 0)
+            if per_account_limit is not None:
+                rows.append(("Sender Usage Today", f"{acct} - Sent Today", f"{used_today} / {per_account_limit}"))
+            else:
+                rows.append(("Sender Usage Today", f"{acct} - Sent Today", f"{used_today} (no per-account cap set)"))
+
+    variant_sent_counts: Dict[str, int] = {}
+    for i, stage in enumerate(stages):
+        sent_field = stage_field_names(i)["sent_at"]
+        variant_field = stage_field_names(i)["variant"]
+        for l in leads:
+            if (l.get(sent_field) or "").strip():
+                v = (l.get(variant_field) or "").strip()
+                if v:
+                    key = f"{stage['name']}-{v}"
+                    variant_sent_counts[key] = variant_sent_counts.get(key, 0) + 1
+
+    variant_reply_counts: Dict[str, int] = {}
+    stage_name_to_index = {s["name"]: i for i, s in enumerate(stages)}
+    for l in leads:
+        if l.get("Status") == STATUS_STOPPED_REPLIED:
+            current_stage = l.get("CurrentStage", "")
+            idx = stage_name_to_index.get(current_stage)
+            if idx is not None:
+                v = (l.get(stage_field_names(idx)["variant"]) or "").strip()
+                if v:
+                    key = f"{current_stage}-{v}"
+                    variant_reply_counts[key] = variant_reply_counts.get(key, 0) + 1
+
+    for key in sorted(variant_sent_counts.keys()):
+        sent_n = variant_sent_counts[key]
+        reply_n = variant_reply_counts.get(key, 0)
+        rows.append(("Variant Performance", f"{key} - Sent", str(sent_n)))
+        rows.append(("Variant Performance", f"{key} - Replies (approx.)", str(reply_n)))
+        rows.append(("Variant Performance", f"{key} - Reply Rate (approx.)", _pct(reply_n, sent_n)))
+
+    error_counts: Dict[str, int] = {}
+    for e in error_log:
+        et = e.get("ErrorType", "Unknown")
+        error_counts[et] = error_counts.get(et, 0) + 1
+    for et in sorted(error_counts.keys()):
+        rows.append(("Errors (All Time)", et, str(error_counts[et])))
+
+    recent_errors = error_log[-10:] if error_log else []
+    for e in recent_errors:
+        label = f"{e.get('Timestamp', '')} - {e.get('ErrorType', '')}"
+        rows.append(("Recent Errors", label, str(e.get("Message", ""))[:200]))
+
+    return rows
 
 
-def test_most_recent_send_at_none_when_nothing_sent():
-    lead = _most_recent_send_at_lead()
-    assert outreach._most_recent_send_at(lead) is None
+def compute_all_campaigns_row(campaign_name: str, leads: List[Dict], responses: List[Dict],
+                               send_log: List[Dict], stages: List[Dict]) -> List[str]:
+    total_leads = sum(1 for l in leads if (l.get("Email") or "").strip())
+    contacted = sum(1 for l in leads if any((l.get(stage_field_names(i)["sent_at"]) or "").strip()
+                                             for i in range(len(stages))))
+    total_sent = sum(1 for r in send_log if r.get("Status") == "sent")
+    bounced_hard = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_BOUNCE_HARD)
+    bounced_soft = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_BOUNCE_SOFT)
+    replies = sum(1 for r in responses if r.get("Classification") == CLASSIFICATION_GENUINE)
+    delivered_est = max(total_sent - bounced_hard, 0)
+    last_stage_field = stage_field_names(len(stages) - 1)["sent_at"] if stages else None
+    completed = sum(1 for l in leads if last_stage_field and (l.get(last_stage_field) or "").strip()) \
+        if last_stage_field else 0
+
+    return [
+        campaign_name, str(total_leads), str(contacted), str(total_sent), str(delivered_est),
+        str(bounced_hard), str(bounced_soft), str(replies), _pct(replies, contacted), _pct(completed, contacted),
+    ]
 
 
-def test_check_replies_old_campaign_reply_never_stops_new_campaign_sequence(monkeypatch):
-    # This is the reported bug, reproduced directly: the lead's current
-    # (new campaign) intro was sent recently; the inbound message is an old
-    # reply whose In-Reply-To points at a DIFFERENT, unrelated Message-ID
-    # (simulating a deleted/previous campaign's thread) and whose Date
-    # predates the new campaign's intro entirely.
-    new_intro_sent_at = datetime.now().strftime(outreach.DATETIME_FMT)
-    old_message_date = datetime.now() - timedelta(days=10)  # before the new intro was ever sent
-
-    leads = [make_lead(_row=2, LeadID="L3", Email="creator@example.com",
-                        MessageID="<new_campaign_intro@mail.gmail.com>",  # current campaign's own message id
-                        IntroSentAt=new_intro_sent_at)]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<old_reply@mail.gmail.com>",
-            "in_reply_to": "<old_unrelated_campaign_intro@mail.gmail.com>",  # NOT the current campaign's id
-            "references": "<old_unrelated_campaign_intro@mail.gmail.com>",
-            "subject": "Re: old campaign", "from": "creator@example.com",  # same lead address, reused
-            "headers": {}, "body": "sounds good, let's talk", "snippet": "sounds good, let's talk",
-            "date": old_message_date,
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
-                                      campaign_name="Kelson_Creators_Licensing")
-
-    assert len(actions) == 1
-    assert actions[0]["match_method"] == "Email"  # header match correctly fails — different message id
-    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNRELATED  # date predates the new intro
-
-    updated_lead = fake_sheets._leads[0]
-    # The critical assertion: the new campaign's sequence must NOT be stopped.
-    assert updated_lead["ReplyStatus"] != "Replied"
-    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
-    assert updated_lead.get("ReplyAt", "") == ""
+def write_dashboard(dashboard_ws, rows: List[Tuple[str, str, str]]) -> None:
+    dashboard_ws.clear()
+    values = [DASHBOARD_COLUMNS] + [list(r) for r in rows]
+    dashboard_ws.update(values, "A1")
 
 
-def test_check_replies_email_match_after_contact_logged_unverified_not_stopped(monkeypatch):
-    # Sender-only match where the message date IS plausible (after the
-    # lead's most recent send) — still must not auto-stop, just logged
-    # as unverified for human review.
-    intro_sent_at = (datetime.now() - timedelta(days=2)).strftime(outreach.DATETIME_FMT)
-    plausible_date = datetime.now() - timedelta(hours=1)  # after intro was sent
-
-    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com",
-                        MessageID="<intro@mail.gmail.com>", IntroSentAt=intro_sent_at)]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<new_thread_reply@mail.gmail.com>", "in_reply_to": "", "references": "",
-            "subject": "New conversation", "from": "creator@example.com",
-            "headers": {}, "body": "hey, reaching out separately", "snippet": "hey, reaching out separately",
-            "date": plausible_date,
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
-    assert actions[0]["match_method"] == "Email"
-    assert actions[0]["action"] == outreach.ACTION_LOGGED_UNVERIFIED
-
-    updated_lead = fake_sheets._leads[0]
-    assert updated_lead["ReplyStatus"] != "Replied"
-    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_REPLIED
-    # Still visible for a human to notice, even though it didn't auto-stop:
-    assert updated_lead["LastInboundClassification"] == outreach.CLASSIFICATION_GENUINE
-
-
-def test_check_replies_header_match_genuine_reply_still_stops_sequence_after_fix(monkeypatch):
-    # Regression guard: the FIX must not have broken the legitimate,
-    # trusted path — a real reply to the current campaign's own thread
-    # must still stop the sequence exactly as before.
-    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com",
-                        MessageID="<current_campaign_intro@mail.gmail.com>")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<real_reply@mail.gmail.com>",
-            "in_reply_to": "<current_campaign_intro@mail.gmail.com>",  # matches THIS lead's tracked id
-            "references": "<current_campaign_intro@mail.gmail.com>",
-            "subject": "Re: intro", "from": "creator@example.com",
-            "headers": {}, "body": "yes, interested", "snippet": "yes, interested",
-            "date": datetime.now(),
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
-    assert actions[0]["match_method"] == "Header"
-    assert actions[0]["action"] == outreach.ACTION_STOPPED
-
-    updated_lead = fake_sheets._leads[0]
-    assert updated_lead["ReplyStatus"] == "Replied"
-    assert updated_lead["Status"] == outreach.STATUS_STOPPED_REPLIED
-
-
-def test_check_replies_email_match_hard_bounce_never_stops_sequence_either(monkeypatch):
-    # The uniform rule applies regardless of classification: sender-only
-    # match never stops the sequence, even if content looks like a bounce.
-    leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com", MessageID="")]
-    fake_sheets = FakeSheets(leads)
-
-    def fake_imap_fetch_recent(address, app_password, since_dt):
-        return [{
-            "message_id": "<weird@mail.gmail.com>", "in_reply_to": "", "references": "",
-            "subject": "undeliverable", "from": "creator@example.com",  # unusual, but same lead address
-            "headers": {}, "body": "this address does not exist", "snippet": "this address does not exist",
-            "date": datetime.now(),
-        }]
-
-    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
-
-    actions = outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
-    assert actions[0]["match_method"] == "Email"
-    assert actions[0]["action"] != outreach.ACTION_STOPPED
-
-    updated_lead = fake_sheets._leads[0]
-    assert updated_lead.get("Status", "") != outreach.STATUS_STOPPED_BOUNCED
-
-
-# =============================================================================
-# _message_to_dict — parsed date field
-# =============================================================================
-
-def test_message_to_dict_parses_date_header():
-    from email.utils import formatdate
-    msg = MIMEText("body")
-    msg["Subject"] = "has a date"
-    msg["From"] = "a@b.com"
-    msg["Message-ID"] = "<x@mail.gmail.com>"
-    msg["Date"] = formatdate(localtime=True)
-    parsed = outreach._parse_email_message(msg.as_bytes())
-    assert parsed["date"] is not None
-    assert isinstance(parsed["date"], datetime)
-
-
-def test_message_to_dict_handles_missing_date_header():
-    from email.mime.text import MIMEText
-    msg = MIMEText("body")
-    msg["Subject"] = "no date header"
-    msg["From"] = "a@b.com"
-    msg["Message-ID"] = "<x@mail.gmail.com>"
-    parsed = outreach._parse_email_message(msg.as_bytes())
-    assert parsed["date"] is None
+def write_all_campaigns_dashboard(ws, campaign_rows: List[List[str]]) -> None:
+    ws.clear()
+    values = [ALL_CAMPAIGNS_DASHBOARD_COLUMNS] + campaign_rows
+    ws.update(values, "A1")
 
 
 # =============================================================================
-# discover_stages_and_variants — direct unit tests of the auto-discovery
-# algorithm itself, independent of the full get_campaign() plumbing.
+# SECTION 14: Main CLI commands
 # =============================================================================
 
-def _write_template(dir_path, filename):
-    (pathlib.Path(dir_path) / filename).write_text("Subject: Hi\n\nBody")
+def _connect_sheets(campaign_cfg) -> SheetsConnector:
+    return SheetsConnector(
+        sheet_id=campaign_cfg["sheet_id"],
+        master_tab=campaign_cfg["master_tab"],
+        responses_tab=campaign_cfg["responses_tab"],
+        send_log_tab=campaign_cfg["send_log_tab"],
+        error_log_tab=campaign_cfg["error_log_tab"],
+        dashboard_tab=campaign_cfg["dashboard_tab"],
+    )
 
 
-def test_discover_minimal_single_file(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    _write_template(d, "intro_A.txt")
-    stages, variants = outreach.discover_stages_and_variants(str(d), {})
-    assert len(stages) == 1
-    assert stages[0]["name"] == "intro"
-    assert stages[0]["template_prefix"] == "intro"
-    assert stages[0]["wait_days_after_previous"] == 0
-    assert variants == ["A"]
+def cmd_preview(args):
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    leads = sheets.get_all_leads()
+
+    duplicates = find_duplicate_email_leads(leads)
+    if duplicates:
+        print(f"WARNING: {len(duplicates)} email address(es) appear on more than one Master Sheet row — "
+              "only the first (lowest row number) of each is ever eligible; the rest are silently excluded "
+              "from sending, but should be cleaned up:")
+        for email_addr, rows in duplicates.items():
+            lead_ids = ", ".join(str(r.get("LeadID", "?")) for r in rows)
+            print(f"  {email_addr} — rows {[r['_row'] for r in rows]} (LeadIDs: {lead_ids})")
+        print()
+
+    forced_variant = None if args.variant in (None, "Auto") else args.variant
+    plan = build_batch(campaign_cfg, leads, args.stage, args.batch_size, forced_variant=forced_variant,
+                        ignore_wait_days=args.ignore_wait_days)
+
+    if not plan:
+        print(f"No eligible leads found for stage '{args.stage}'.")
+        return
+
+    if args.ignore_wait_days:
+        print(f"NOTE: --ignore-wait-days is set — the scheduled wait for stage '{args.stage}' was skipped "
+              "for this preview. Every other eligibility rule (Approval, not already sent, previous stage "
+              "actually sent, no reply) still applied normally.\n")
+    print(f"{len(plan)} eligible lead(s) for stage '{args.stage}':\n")
+    for item in plan:
+        lead = item["lead"]
+        print("=" * 70)
+        print(f"Lead ID:  {lead.get('LeadID')}")
+        print(f"To:       {lead.get('FirstName')} {lead.get('LastName')} <{lead.get('Email')}>")
+        if not is_valid_email_format(lead.get("Email", "")):
+            print("          WARNING: this email address doesn't look correctly formatted.")
+        print(f"Variant:  {item['variant']}")
+        print(f"Subject:  {item['subject']}"
+              + ("  (continuing existing thread)" if item["is_continuation"] else ""))
+        print("-" * 70)
+        print(item["body"])
+        if item["missing_variables"]:
+            print(f"\nWARNING: unrecognized template variable(s), rendered blank: "
+                  f"{', '.join('{{' + v + '}}' for v in item['missing_variables'])}")
+    print("=" * 70)
+    print("\nNothing has been sent. Re-run with the 'send' command to actually send this batch.")
 
 
-def test_discover_two_stages_two_variants_uses_stage_wait_days(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    for stage in ["intro", "followup1"]:
-        for v in ["A", "B"]:
-            _write_template(d, f"{stage}_{v}.txt")
-    stages, variants = outreach.discover_stages_and_variants(str(d), {"intro": 0, "followup1": 3})
-    assert [s["name"] for s in stages] == ["intro", "followup1"]
-    assert stages[0]["wait_days_after_previous"] == 0
-    assert stages[1]["wait_days_after_previous"] == 3
-    assert variants == ["A", "B"]
+def apply_sending_overrides(campaign_cfg: Dict, daily_limit: Optional[int] = None,
+                             per_account_daily_limit: Optional[int] = None,
+                             sender_rotation: Optional[str] = None) -> List[str]:
+    """Applies CLI-provided overrides for a single run — never touches
+    campaigns.yaml. Replaces campaign_cfg['sending'] with a fresh copy
+    before mutating it, so nothing shared/cached elsewhere is affected.
+    Returns the list of keys that were actually overridden (for reporting).
+    Raises ValueError for an invalid override value."""
+    campaign_cfg["sending"] = dict(campaign_cfg["sending"])
+    sending = campaign_cfg["sending"]
+    overridden = []
+
+    if daily_limit is not None:
+        if daily_limit <= 0:
+            raise ValueError("--daily-limit must be a positive integer.")
+        sending["daily_limit"] = daily_limit
+        overridden.append("daily_limit")
+
+    if per_account_daily_limit is not None:
+        if per_account_daily_limit <= 0:
+            raise ValueError("--per-account-daily-limit must be a positive integer.")
+        sending["per_account_daily_limit"] = per_account_daily_limit
+        overridden.append("per_account_daily_limit")
+
+    if sender_rotation is not None:
+        sending["sender_rotation"] = (sender_rotation == "true")
+        overridden.append("sender_rotation")
+
+    return overridden
 
 
-def test_discover_missing_stage_wait_days_entry_defaults_to_zero(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    for stage in ["intro", "followup1"]:
-        _write_template(d, f"{stage}_A.txt")
-    stages, variants = outreach.discover_stages_and_variants(str(d), {})  # no wait_days configured at all
-    assert stages[1]["wait_days_after_previous"] == 0
+def cmd_send(args):
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
 
+    duplicates = find_duplicate_email_leads(sheets.get_all_leads())
+    if duplicates:
+        print(f"WARNING: {len(duplicates)} email address(es) appear on more than one Master Sheet row — "
+              "only the first (lowest row number) of each is ever eligible; the rest are silently excluded "
+              "from sending, but should be cleaned up:")
+        for email_addr, rows in duplicates.items():
+            lead_ids = ", ".join(str(r.get("LeadID", "?")) for r in rows)
+            print(f"  {email_addr} — rows {[r['_row'] for r in rows]} (LeadIDs: {lead_ids})")
+        print()
 
-def test_discover_stops_at_first_gap(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    _write_template(d, "intro_A.txt")
-    # No followup1 files at all — followup2 existing anyway must be ignored.
-    _write_template(d, "followup2_A.txt")
-    stages, variants = outreach.discover_stages_and_variants(str(d), {})
-    assert [s["name"] for s in stages] == ["intro"]
-
-
-def test_discover_all_five_stages_four_variants(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    for stage in outreach.CANONICAL_STAGE_ORDER:
-        for v in outreach.ALL_VARIANT_LETTERS:
-            _write_template(d, f"{stage}_{v}.txt")
-    stages, variants = outreach.discover_stages_and_variants(str(d), {})
-    assert len(stages) == 5
-    assert variants == ["A", "B", "C", "D"]
-
-
-def test_discover_inconsistent_variants_raises_clear_error(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
-    for v in ["A", "B", "C", "D"]:
-        _write_template(d, f"intro_{v}.txt")
-    for v in ["A", "B", "C"]:  # D missing for followup1
-        _write_template(d, f"followup1_{v}.txt")
     try:
-        outreach.discover_stages_and_variants(str(d), {})
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError as exc:
-        assert "followup1" in str(exc)
-        assert "D" in str(exc)
+        overridden = apply_sending_overrides(campaign_cfg, args.daily_limit,
+                                              args.per_account_daily_limit, args.sender_rotation)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
+    sending = campaign_cfg["sending"]
+    print(
+        f"Sending config for this run: daily_limit={sending.get('daily_limit')}"
+        f"{' [overridden]' if 'daily_limit' in overridden else ' [from config]'}, "
+        f"per_account_daily_limit={sending.get('per_account_daily_limit')}"
+        f"{' [overridden]' if 'per_account_daily_limit' in overridden else ' [from config]'}, "
+        f"sender_rotation={sending.get('sender_rotation', False)}"
+        f"{' [overridden]' if 'sender_rotation' in overridden else ' [from config]'}\n"
+    )
 
-def test_discover_no_templates_at_all_raises(tmp_path):
-    d = tmp_path / "templates"
-    d.mkdir()
+    forced_variant = None if args.variant in (None, "Auto") else args.variant
+    if args.ignore_wait_days:
+        print(f"NOTE: --ignore-wait-days is set — the scheduled wait for stage '{args.stage}' will be "
+              "skipped for this run. Every other eligibility rule (Approval, not already sent, previous "
+              "stage actually sent, no reply) still applies normally.\n")
     try:
-        outreach.discover_stages_and_variants(str(d), {})
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
+        results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size,
+                              forced_variant=forced_variant, ignore_wait_days=args.ignore_wait_days)
+    except (CampaignPausedError, OutsideSendingWindowError) as exc:
+        print(f"SKIPPED: {exc}")
+        return
+
+    if not results:
+        print(f"No eligible leads to send for stage '{args.stage}' "
+              "(none eligible, or today's sending limit already reached).")
+        return
+
+    batch_id = results[0].get("batch_id", "")
+    sent = [r for r in results if r["status"] == "sent"]
+    sent_but_sheet_error = [r for r in results if r["status"] == "sent_but_sheet_error"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+    errors = [r for r in results if r["status"] == "error"]
+
+    print(f"Batch ID: {batch_id}")
+    print(f"Sent {len(sent)} email(s), {len(sent_but_sheet_error)} sent-but-sheet-error, "
+          f"{len(skipped)} skipped (sender capacity), {len(errors)} error(s).\n")
+    for r in sent:
+        print(f"  OK    {r['email']} (variant {r['variant']}, account {r['account']})")
+    for r in sent_but_sheet_error:
+        print(f"  WARN  {r['email']}: email sent, but sheet update failed ({r['error']}) — check manually")
+    for r in skipped:
+        print(f"  SKIP  {r['email']}: {r['error']}")
+    for r in errors:
+        print(f"  ERROR {r['email']}: [{r['error_type']}] {r['error']}")
 
 
-def test_discover_nonexistent_directory_raises(tmp_path):
+def cmd_backfill_thread_subject(args):
+    """One-time migration command — see backfill_thread_subjects' docstring
+    for exactly what this does and its accuracy caveat. Defaults to
+    --dry-run in the GitHub Actions workflow (not here in the raw CLI, to
+    match every other command's behavior of doing what you asked)."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    leads = sheets.get_all_leads()
+
+    results = backfill_thread_subjects(campaign_cfg, leads)
+    to_backfill = [r for r in results if r["status"] == "backfilled"]
+    skipped = [r for r in results if r["status"] not in ("backfilled",)]
+
+    action_word = "Would backfill" if args.dry_run else "Backfilling"
+    print(f"{action_word} ThreadSubject for {len(to_backfill)} lead(s).\n")
+    for r in to_backfill:
+        print(f"  Lead {r['lead_id']} (from {r['stage']}): {r['thread_subject']!r}")
+
+    if skipped:
+        print(f"\n{len(skipped)} lead(s) skipped (no action needed/possible):")
+        for r in skipped:
+            detail = f" ({r['stage']})" if r.get("stage") else ""
+            extra = f" — {r['error']}" if r.get("error") else ""
+            print(f"  Lead {r['lead_id']}: {r['status']}{detail}{extra}")
+
+    if args.dry_run:
+        print("\nDRY RUN — nothing was written. Re-run without --dry-run to actually write these.")
+        return
+
+    for r in to_backfill:
+        sheets.update_lead_fields(r["row"], {"ThreadSubject": r["thread_subject"]})
+    print(f"\nWrote ThreadSubject for {len(to_backfill)} lead(s).")
+
+
+def cmd_import_leads(args):
+    """Reads {"leads": [{...}, ...]} from --file and appends them to the
+    Master Sheet. This is the ONLY thing that ever writes to the Master
+    Sheet from a bulk-import path — invoked by import_leads.yml after
+    Streamlit commits the mapped payload file, never called with
+    Streamlit-supplied data any other way."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    new_leads = payload.get("leads", [])
+    if not new_leads:
+        print("No leads in payload file — nothing to do.")
+        return
+    summary = import_leads(sheets, args.campaign, new_leads)
+    print(f"Imported {summary['imported']} lead(s).")
+    if summary["skipped_duplicate"]:
+        print(f"Skipped {summary['skipped_duplicate']} duplicate email(s) (already in the Master Sheet).")
+    if summary["skipped_no_email"]:
+        print(f"Skipped {summary['skipped_no_email']} row(s) with no email address.")
+
+
+def cmd_remove_leads(args):
+    """Reads {"lead_ids": ["5", "8", ...]} from --file and sets their
+    Status to Removed — never a hard delete, see remove_leads' docstring."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    lead_ids = payload.get("lead_ids", [])
+    if not lead_ids:
+        print("No lead_ids in payload file — nothing to do.")
+        return
+    summary = remove_leads(sheets, lead_ids)
+    print(f"Removed {summary['removed']} lead(s) (Status set to '{STATUS_REMOVED}').")
+    if summary["not_found"]:
+        print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
+
+
+def cmd_send_reply(args):
+    """Reads a fully-resolved reply payload from --file and sends it —
+    this command never looks anything up itself (which response, which
+    thread); Streamlit's Responses tab is expected to have already
+    resolved to/subject/in_reply_to/references from the specific inbound
+    message being replied to before ever committing this payload. See
+    send_manual_reply's docstring for exactly why that split exists.
+
+    Expected payload shape:
+        {"sender_account": "sales1", "to": "lead@abc.com",
+         "subject": "Re: ...", "body": "...", "in_reply_to": "<...>",
+         "references": "<...> <...>", "cc": [...], "bcc": [...],
+         "lead_id": "5",
+         "attachments": [{"filename": "photo.png", "content_base64": "..."}]}
+    cc/bcc/lead_id/attachments are optional. Attachment content travels
+    as base64 in the JSON payload (the payload file itself is already the
+    "big binary data over a size-limited channel" workaround — see
+    campaigns.py's Responses tab for how it's built).
+    """
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    lead_id = payload.get("lead_id", "")
+    to_email = payload.get("to", "")
+    attachments = None
+    if payload.get("attachments"):
+        attachments = [
+            {"filename": att["filename"], "content": base64.b64decode(att["content_base64"])}
+            for att in payload["attachments"]
+        ]
+
     try:
-        outreach.discover_stages_and_variants(str(tmp_path / "does_not_exist"), {})
-        assert False, "should have raised ConfigError"
-    except outreach.ConfigError:
-        pass
+        sent = send_manual_reply(
+            accounts, payload["sender_account"], to_email, payload["subject"], payload["body"],
+            in_reply_to=payload.get("in_reply_to"), references=payload.get("references"),
+            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None, attachments=attachments,
+        )
+    except Exception as exc:  # noqa: BLE001 - classify and log exactly like every other send path
+        error_type = classify_send_exception(exc)
+        now_str = datetime.now().strftime(DATETIME_FMT)
+        try:
+            sheets.append_send_log({
+                "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+                "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+                "SenderAccount": payload.get("sender_account", ""), "Status": "error",
+                "MessageID": "", "Error": str(exc)[:500],
+            })
+        except Exception:  # noqa: BLE001 - the error log entry below is the durable record either way
+            pass
+        log_error(sheets, args.campaign, error_type, str(exc), lead_id=lead_id, email_addr=to_email,
+                  stage="manual_reply", batch_id="manual-reply")
+        print(f"FAILED: {exc}")
+        raise SystemExit(1)
+
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    sheets.append_send_log({
+        "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+        "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+        "SenderAccount": payload["sender_account"], "Status": "sent",
+        "MessageID": sent["message_id"], "Error": "",
+    })
+    print(f"Sent. Message-ID: {sent['message_id']}")
+
+
+def cmd_check_account_health(args):
+    """Logs into every configured account via IMAP (a cheap connectivity
+    check, not a real mailbox scan) and writes the result to the shared
+    'Email Accounts Health' Sheet tab — never the password itself, only
+    connection status and a short failure reason. Reads shared_sheet_id
+    from settings.yaml directly since this isn't tied to any one
+    campaign's own Sheet configuration."""
+    accounts = load_email_accounts()
+    settings = load_settings()
+    results = check_account_health(accounts)
+    write_account_health(settings["shared_sheet_id"], results)
+    for r in results:
+        detail_suffix = f" — {r['Detail']}" if r["Detail"] else ""
+        print(f"{r['AccountName']} ({r['Address']}): {r['Status']}{detail_suffix}")
+
+
+def cmd_check_replies(args):
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
+    lookback_hours = campaign_cfg.get("reply_monitor", {}).get("lookback_hours", 24)
+
+    actions = check_replies(sheets, accounts, lookback_hours, campaign_name=args.campaign)
+    if not actions:
+        print("No new inbound messages matched to a lead.")
+        return
+
+    print(f"Processed {len(actions)} inbound message(s):\n")
+    for a in actions:
+        print(f"  {a['email']:<35} {a['classification']:<18} ({a['match_method']:<6}, {a['account']}) -> {a['action']}")
+
+
+def cmd_dashboard(args):
+    if not args.all and not args.campaign:
+        print("Specify --campaign NAME or --all", file=sys.stderr)
+        sys.exit(1)
+
+    if args.all:
+        settings = load_settings()
+        shared_sheet_id = settings.get("shared_sheet_id", "")
+        campaign_names = discover_campaign_names()
+        if not campaign_names:
+            print("No campaigns found — no subfolders under templates/.")
+            return
+        all_rows = []
+        for name in campaign_names:
+            campaign_cfg = get_campaign(name)
+            sheets = _connect_sheets(campaign_cfg)
+            leads = sheets.get_all_leads()
+            responses = sheets.get_all_responses()
+            send_log = sheets.get_all_send_log()
+            error_log = sheets.get_all_error_log()
+            rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
+            write_dashboard(sheets.dashboard_ws, rows)
+            all_rows.append(compute_all_campaigns_row(name, leads, responses, send_log, campaign_cfg["stages"]))
+            print(f"Updated dashboard for '{name}'")
+        if shared_sheet_id and all_rows:
+            ws = get_all_campaigns_dashboard_ws(shared_sheet_id)
+            write_all_campaigns_dashboard(ws, all_rows)
+            print("Updated combined 'All Campaigns Dashboard'")
+    else:
+        campaign_cfg = get_campaign(args.campaign)
+        sheets = _connect_sheets(campaign_cfg)
+        leads = sheets.get_all_leads()
+        responses = sheets.get_all_responses()
+        send_log = sheets.get_all_send_log()
+        error_log = sheets.get_all_error_log()
+        rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
+        write_dashboard(sheets.dashboard_ws, rows)
+        print(f"Updated dashboard for '{args.campaign}'")
+
+
+# =============================================================================
+# SECTION 15: Argument parsing / entry point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Outreach automation (SMTP/IMAP, single-file)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_preview = sub.add_parser("preview", help="Show what would be sent, without sending")
+    p_preview.add_argument("--campaign", required=True)
+    p_preview.add_argument("--stage", required=True)
+    p_preview.add_argument("--batch-size", type=int, required=True)
+    p_preview.add_argument("--variant", default="Auto",
+                            help="Force a specific variant letter for the whole batch. Default: Auto")
+    p_preview.add_argument("--ignore-wait-days", action="store_true",
+                            help="Skip the scheduled wait for this stage (e.g. followup1's 3-day wait) "
+                                 "for THIS RUN ONLY. Every other eligibility rule still applies — the "
+                                 "previous stage must actually have been sent, this stage can't already "
+                                 "be sent, Approval must be Yes, and no reply must have been received.")
+    p_preview.set_defaults(func=cmd_preview)
+
+    p_send = sub.add_parser("send", help="Actually send a batch")
+    p_send.add_argument("--campaign", required=True)
+    p_send.add_argument("--stage", required=True)
+    p_send.add_argument("--batch-size", type=int, required=True)
+    p_send.add_argument("--variant", default="Auto",
+                         help="Force a specific variant letter for the whole batch. Default: Auto")
+    p_send.add_argument("--ignore-wait-days", action="store_true",
+                         help="Skip the scheduled wait for this stage (e.g. followup1's 3-day wait) "
+                              "for THIS RUN ONLY. Every other eligibility rule still applies — the "
+                              "previous stage must actually have been sent, this stage can't already "
+                              "be sent, Approval must be Yes, and no reply must have been received.")
+    p_send.add_argument("--daily-limit", type=int, default=None,
+                         help="Override sending.daily_limit for THIS RUN ONLY — never written to "
+                              "campaigns.yaml. Omit to use the value from config.")
+    p_send.add_argument("--per-account-daily-limit", type=int, default=None,
+                         help="Override sending.per_account_daily_limit for THIS RUN ONLY — never "
+                              "written to campaigns.yaml. Omit to use the value from config.")
+    p_send.add_argument("--sender-rotation", choices=["true", "false"], default=None,
+                         help="Override sending.sender_rotation for THIS RUN ONLY — never written "
+                              "to campaigns.yaml. Omit to use the value from config.")
+    p_send.set_defaults(func=cmd_send)
+
+    p_replies = sub.add_parser("check-replies", help="Check all configured inboxes for new replies/bounces")
+    p_replies.add_argument("--campaign", required=True)
+    p_replies.set_defaults(func=cmd_check_replies)
+
+    p_backfill = sub.add_parser("backfill-thread-subject",
+                                 help="One-time migration: fill in ThreadSubject for leads already mid-sequence "
+                                      "before that feature existed (see backfill_thread_subjects docstring for "
+                                      "exactly how, and its accuracy caveat)")
+    p_backfill.add_argument("--campaign", required=True)
+    p_backfill.add_argument("--dry-run", action="store_true",
+                             help="Show what would be backfilled without writing anything")
+    p_backfill.set_defaults(func=cmd_backfill_thread_subject)
+
+    p_import = sub.add_parser("import-leads", help="Bulk-import leads from a JSON payload file")
+    p_import.add_argument("--campaign", required=True)
+    p_import.add_argument("--file", required=True, help='Path to a JSON file: {"leads": [{...}, ...]}')
+    p_import.set_defaults(func=cmd_import_leads)
+
+    p_remove = sub.add_parser("remove-leads",
+                               help="Soft-remove leads (sets Status=Removed, never a hard delete) "
+                                    "from a JSON payload file")
+    p_remove.add_argument("--campaign", required=True)
+    p_remove.add_argument("--file", required=True, help='Path to a JSON file: {"lead_ids": ["5", "8", ...]}')
+    p_remove.set_defaults(func=cmd_remove_leads)
+
+    p_reply = sub.add_parser("send-reply",
+                              help="Send a one-off manual reply from a fully-resolved JSON payload file "
+                                   "(never looks anything up itself — see cmd_send_reply's docstring)")
+    p_reply.add_argument("--campaign", required=True)
+    p_reply.add_argument("--file", required=True,
+                          help='Path to a JSON file: {"sender_account": "sales1", "to": "...", '
+                               '"subject": "...", "body": "...", "in_reply_to": "<...>", '
+                               '"references": "<...>", "cc": [...], "bcc": [...], "lead_id": "5"}')
+    p_reply.set_defaults(func=cmd_send_reply)
+
+    p_health = sub.add_parser("check-account-health",
+                               help="Check every configured account's IMAP connectivity and write results "
+                                    "to the shared 'Email Accounts Health' Sheet tab")
+    p_health.set_defaults(func=cmd_check_account_health)
+
+    p_dash = sub.add_parser("dashboard", help="Recompute and write the dashboard tab(s)")
+    p_dash.add_argument("--campaign", help="Campaign name (omit if using --all)")
+    p_dash.add_argument("--all", action="store_true",
+                         help="Update dashboards for every configured campaign, plus the combined "
+                              "All Campaigns Dashboard")
+    p_dash.set_defaults(func=cmd_dashboard)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
