@@ -1003,18 +1003,61 @@ def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
 # SECTION 8: Email accounts — multi-account SMTP/IMAP with App Passwords
 # =============================================================================
 
-def load_email_accounts() -> Dict[str, Dict[str, str]]:
-    raw = os.environ.get("EMAIL_ACCOUNTS_JSON")
-    if not raw:
-        raise RuntimeError(
-            "EMAIL_ACCOUNTS_JSON env var is not set. It should be a JSON object like "
-            '{"sales1": {"address": "sales1@gmail.com", "app_password": "xxxx xxxx xxxx xxxx"}}.'
-        )
-    accounts = json.loads(raw)
-    for name, info in accounts.items():
-        if "address" not in info or "app_password" not in info:
-            raise RuntimeError(f"Account '{name}' in EMAIL_ACCOUNTS_JSON is missing 'address' or 'app_password'.")
+EMAIL_ACCOUNT_SLOT_COUNT = 10  # start small — see check_single_account_health's docstring in the
+                                # Campaigns Hub plan for why this isn't jumped straight to 20
+
+
+def _load_email_accounts_from_slots() -> Dict[str, Dict[str, str]]:
+    """Reads EMAIL_ACCOUNT_SLOT_1..N env vars, each holding ONE account's
+    JSON ({"name": ..., "address": ..., "app_password": ...}), empty/unset
+    if that slot isn't in use. Returns {} — NOT an error — if none of the
+    slots are populated at all, since a repo mid-migration (or one that
+    hasn't started migrating) legitimately has zero slots set and relies
+    entirely on the legacy EMAIL_ACCOUNTS_JSON blob instead."""
+    accounts: Dict[str, Dict[str, str]] = {}
+    for i in range(1, EMAIL_ACCOUNT_SLOT_COUNT + 1):
+        raw = os.environ.get(f"EMAIL_ACCOUNT_SLOT_{i}")
+        if not raw or not raw.strip():
+            continue
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"EMAIL_ACCOUNT_SLOT_{i} is not valid JSON: {exc}")
+        for field in ("name", "address", "app_password"):
+            if field not in info:
+                raise RuntimeError(f"EMAIL_ACCOUNT_SLOT_{i} is missing '{field}'.")
+        accounts[info["name"]] = {"address": info["address"], "app_password": info["app_password"]}
     return accounts
+
+
+def load_email_accounts() -> Dict[str, Dict[str, str]]:
+    """Reads from the new per-account EMAIL_ACCOUNT_SLOT_1..N secrets if
+    any are populated, merged with the legacy EMAIL_ACCOUNTS_JSON blob if
+    THAT'S also still set — a slot always wins over a same-named
+    EMAIL_ACCOUNTS_JSON entry, so an in-app edit (which only ever touches
+    a slot) takes effect immediately even before the old blob is
+    eventually retired. Once every account has been migrated into a slot
+    and EMAIL_ACCOUNTS_JSON is removed, this naturally becomes
+    "slots only" with no code change needed here."""
+    slot_accounts = _load_email_accounts_from_slots()
+
+    raw_json = os.environ.get("EMAIL_ACCOUNTS_JSON")
+    json_accounts: Dict[str, Dict[str, str]] = {}
+    if raw_json:
+        json_accounts = json.loads(raw_json)
+        for name, info in json_accounts.items():
+            if "address" not in info or "app_password" not in info:
+                raise RuntimeError(f"Account '{name}' in EMAIL_ACCOUNTS_JSON is missing 'address' or 'app_password'.")
+
+    if not slot_accounts and not json_accounts:
+        raise RuntimeError(
+            "No email accounts configured — set EMAIL_ACCOUNT_SLOT_1 (etc.), the legacy "
+            "EMAIL_ACCOUNTS_JSON, or both during migration."
+        )
+
+    merged = dict(json_accounts)
+    merged.update(slot_accounts)  # slots win on a name collision
+    return merged
 
 
 def resolve_sender_account(lead: Dict, campaign_cfg: Dict, accounts: Dict[str, Dict[str, str]]) -> str:
