@@ -2,21 +2,30 @@
 
 A control surface on top of `outreach.py` + GitHub Actions — not a second
 sending system. Preview runs the exact same code in-app (read-only, no
-SMTP credentials involved). Send and Check Replies trigger the real GitHub
-Actions workflows, with the same typed-`SEND` confirmation gate. New
-Campaign opens a pull request; nothing is ever committed straight to
-`main`.
+SMTP credentials involved). Send, Check Replies, and the Backfill tool
+trigger the real GitHub Actions workflows, with the same typed-`SEND`
+confirmation gate Send always had. New Campaign / Add Stage commits
+directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **📊 Dashboard** — read-only. Uses a Viewer-scoped Google credential and
-  the exact same `outreach.compute_campaign_dashboard` math the Sheet's own
-  Dashboard tab uses, so the two always agree.
+- **📈 Overview** — every campaign at a glance: total leads, pending,
+  sent, replies, reply rate.
+- **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
+  Viewer-scoped Google credential and the exact same
+  `outreach.compute_campaign_dashboard` math the Sheet's own Dashboard tab
+  uses, so the two always agree.
 - **🚀 Controls** — Preview (instant, in-app, nothing sent/written), Send
   (triggers `send_batch.yml`, requires typing `SEND`), Check Replies
-  (triggers `check_replies.yml`).
-- **➕ New Campaign** — creates `templates/<name>/intro_*.txt` and opens a
-  PR. A human still merges it before the campaign is live.
+  (triggers `check_replies.yml`, plus a live view of recent replies read
+  straight from the Response Sheet), Maintenance (the ThreadSubject
+  backfill tool).
+- **📧 Email Accounts** — which sender accounts are configured and how
+  much each has sent today, across all campaigns. Never the actual SMTP
+  credentials — those stay in GitHub Secrets exclusively.
+- **➕ New Campaign** — create a campaign's Intro templates, or add the
+  next stage to an existing one. Commits straight to `main`; live the
+  moment you click the button, no approval step.
 
 ## One-time setup
 
@@ -48,9 +57,13 @@ Separate from the one `GOOGLE_SERVICE_ACCOUNT_JSON` (GitHub Actions) uses.
 
 Settings → Developer settings → Fine-grained personal access tokens → New
 token, scoped to **only this repository**:
-- `Actions`: Read and write (needed for Send/Check Replies/status polling)
-- `Contents`: Read and write, `Pull requests`: Read and write (only if
-  you're using the New Campaign page)
+- `Actions`: Read and write (Send, Check Replies, Backfill, status
+  polling)
+- `Contents`: Read and write (only if you're using New Campaign / Add
+  Stage — it commits template files directly)
+
+No `Pull requests` permission needed — campaign creation no longer opens
+one.
 
 ### 4. Set up login credentials
 
@@ -67,7 +80,9 @@ plaintext password is ever stored — only a salted PBKDF2 hash.
 
 Copy `secrets.toml.example`, fill in real values, paste into the app's
 Secrets settings in Streamlit Community Cloud (never commit a real
-secrets.toml to the repo).
+secrets.toml to the repo). Includes an optional `[email_accounts_directory]`
+block (names + addresses only, no passwords) that powers the Email
+Accounts page.
 
 ## Known limitations (by design, not bugs)
 
@@ -77,19 +92,27 @@ secrets.toml to the repo).
   `streamlit-authenticator` (cookie-based) or Streamlit's native
   `st.login()`/OIDC are the upgrade paths.
 - **Run status is manual-refresh, not live-streaming.** After triggering
-  Send/Check Replies, click "Refresh run status" — this app doesn't
-  auto-poll in the background. A link to the full GitHub Actions run is
-  always shown for complete logs.
-- **New Campaign only creates the Intro stage.** Auto-discovery treats a
-  single-stage campaign as fully valid. Add follow-up stages later via a
-  normal PR (by hand, or a future extension of this page).
+  Send/Check Replies/Backfill, click "Refresh run status" — this app
+  doesn't auto-poll in the background. A link to the full GitHub Actions
+  run is always shown for complete logs.
+- **New Campaign only creates the Intro stage** when starting a brand new
+  campaign. Auto-discovery treats a single-stage campaign as fully valid.
+  Use "Add the next stage to an existing campaign" (same page) to add
+  follow-ups later.
+- **Campaign creation is a direct commit, not a PR.** The in-app "I've
+  reviewed this content" checkbox is the only remaining confirmation step
+  — there's no second human review before it's live. If you want that
+  back, the previous PR-based flow is straightforward to restore (open an
+  issue/ask if you need it).
 
 ## Testing
 
 `streamlit_app/tests/` covers every non-UI module (auth, github_client,
-sheets_readonly, preview_logic's pure pieces, send_logic, campaign_builder)
-with mocked HTTP/Sheets calls — no real network, no real credentials
-needed. Run with:
+sheets_readonly, preview_logic's pure pieces, send_logic, campaign_builder,
+overview_logic, replies_logic, accounts_logic) with mocked HTTP/Sheets
+calls, plus page-level smoke tests that actually execute each page script
+via Streamlit's own `AppTest` harness — no real network, no real
+credentials needed. Run with:
 
 ```bash
 cd streamlit_app
@@ -120,8 +143,10 @@ Actions. Go through it in order; each step depends on the one before it.
 - [ ] 5 wrong attempts in a row lock you out (matches the automated test —
       confirming the real deployment behaves the same as the mocked one).
 - [ ] "Log out" in the sidebar actually requires logging in again.
+- [ ] Sidebar icons render correctly (📈 📊 🚀 📧 ➕), not as garbled text —
+      if they still look broken, hard-refresh the browser tab first.
 
-**Dashboard (read-only — safe to test freely)**
+**Overview / Dashboard (read-only — safe to test freely)**
 - [ ] Campaign selector lists your real campaign(s) from `templates/`.
 - [ ] Numbers shown match the Sheet's own Dashboard tab (run
       `dashboard.yml` manually first if it hasn't run recently, so both
@@ -147,18 +172,33 @@ Actions. Go through it in order; each step depends on the one before it.
 
 **Controls — Check Replies**
 - [ ] Triggers a real `check_replies.yml` run, visible in the Actions tab.
+- [ ] The "Recent replies" list shows real Response Sheet rows, with
+      `ActionTaken` clearly labeled when a reply did NOT stop the sequence.
 
-**New Campaign (opens a real PR — merge or close it after testing)**
-- [ ] A duplicate campaign name is rejected before any API call is made.
-- [ ] Submitting opens a real pull request with the new
-      `templates/<name>/intro_*.txt` file(s) — visible in the repo's Pull
-      Requests tab, NOT already merged.
-- [ ] The campaign does **not** appear in the Dashboard/Controls campaign
-      list until the PR is merged (confirms auto-discovery is reading
-      `main`, not the PR branch).
-- [ ] After merging, the campaign appears and Preview works against it.
+**Controls — Maintenance (Backfill)**
+- [ ] Dry run shows what would be backfilled without writing anything.
+- [ ] Turning off dry run and re-running actually writes `ThreadSubject`
+      values to the Master Sheet.
+
+**Email Accounts**
+- [ ] Shows every account listed in `[email_accounts_directory]`, with
+      today's real send count from the Send Log.
+
+**New Campaign — creates a REAL campaign, live immediately**
+- [ ] The "Create Campaign" / "Add Stage" button is disabled until the
+      confirmation checkbox is checked.
+- [ ] Submitting commits directly — check the repo's commit history, NOT
+      the Pull Requests tab (there shouldn't be one).
+- [ ] The campaign appears in Overview/Dashboard/Controls within a minute
+      or two, with its Sheet tabs already created (no "tab doesn't exist"
+      error) — this confirms the auto-triggered Dashboard-workflow tab
+      initialization worked.
+- [ ] "Add the next stage to an existing campaign" only offers variant
+      letters matching the campaign's existing ones — try it on a
+      multi-variant test campaign to confirm.
 
 If any step fails, check the specific module it exercises (`auth.py`,
-`github_client.py`, `sheets_readonly.py`) against the automated tests for
-that module first — a live-only failure usually means a secrets/permission
-mismatch, not a logic bug (the logic is what the 56 automated tests cover).
+`github_client.py`, `sheets_readonly.py`, `campaign_builder.py`) against
+the automated tests for that module first — a live-only failure usually
+means a secrets/permission mismatch, not a logic bug (the logic is what
+the automated test suite covers).
