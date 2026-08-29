@@ -7,7 +7,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
-from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS  # noqa: E402
+from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, TEMPLATES_ROOT  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
@@ -20,6 +20,14 @@ from data_import_logic import (  # noqa: E402
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping, count_valid_rows,
     build_import_payload, import_payload_path, build_removal_payload, removal_payload_path,
     payload_to_bytes, filter_leads, search_leads, KNOWN_FIELDS, FILTER_OPTIONS,
+)
+from sequences_logic import (  # noqa: E402
+    get_existing_stages_and_variants, load_variant_content, next_available_variant_letter,
+    build_variant_edit_file, build_new_variant_files_for_all_stages, validate_new_variant_contents,
+    has_content_changed,
+)
+from campaign_builder import (  # noqa: E402
+    get_next_stage_for_campaign, build_campaign_files, validate_variant_content,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -320,6 +328,153 @@ def _render_data_tab(campaign_cfg, leads):
                     st.error(f"Removal failed: {exc}")
 
 
+def _render_sequences_tab(campaign_cfg, leads):
+    campaign_name = campaign_cfg["_campaign_name"]
+
+    try:
+        stages, existing_variants = get_existing_stages_and_variants(campaign_name, TEMPLATES_ROOT)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Couldn't read templates for '{campaign_name}': {exc}")
+        return
+
+    sample_lead = leads[0] if leads else {}
+
+    # ---------- Edit existing variants ----------
+    st.subheader("Edit templates")
+    st.caption(
+        "Locked by default to prevent accidental changes. Unlock a variant to edit it, then Save Changes "
+        "at the bottom commits everything you've changed in one go."
+    )
+    pending_edits = {}  # (stage_prefix, variant) -> (subject, body)
+
+    for stage in stages:
+        prefix = stage["template_prefix"]
+        st.markdown(f"**{stage['name']}**")
+        for variant in existing_variants:
+            try:
+                original = load_variant_content(campaign_name, prefix, variant, TEMPLATES_ROOT)
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"{prefix}_{variant}: couldn't load — {exc}")
+                continue
+
+            with st.expander(f"Variant {variant}"):
+                unlocked = st.checkbox("🔓 Unlock to edit", key=f"unlock_{prefix}_{variant}")
+                subject = st.text_input(
+                    "Subject (blank continues the previous thread — not valid for the first stage)",
+                    value=original["subject"], key=f"subject_{prefix}_{variant}", disabled=not unlocked,
+                )
+                body = st.text_area("Body", value=original["body"], key=f"body_{prefix}_{variant}",
+                                     height=150, disabled=not unlocked)
+                if unlocked and has_content_changed(original, subject, body):
+                    pending_edits[(prefix, variant)] = (subject, body)
+                    st.caption("✏️ Changed — will be included in Save Changes")
+
+                if sample_lead:
+                    preview_subject = outreach.render_text(subject, sample_lead)
+                    preview_body = outreach.render_text(body, sample_lead)
+                    st.markdown("**Preview** (using your first lead)")
+                    st.write(f"Subject: {preview_subject}")
+                    st.text(preview_body)
+
+    if pending_edits:
+        if st.button(f"💾 Save Changes ({len(pending_edits)} template(s))", type="primary"):
+            try:
+                files = [build_variant_edit_file(campaign_name, prefix, variant, subject, body)
+                         for (prefix, variant), (subject, body) in pending_edits.items()]
+                client = _get_github_client()
+                client.commit_campaign_files_directly(
+                    files=files,
+                    commit_message=f"Edit {len(files)} template(s) in {campaign_name} "
+                                    f"(via Streamlit, by {current_user()})",
+                )
+                st.success(f"Saved {len(files)} template(s).")
+            except GitHubActionsError as exc:
+                st.error(f"Save failed: {exc}")
+
+    st.divider()
+
+    # ---------- Add a new variant (campaign-wide — see sequences_logic docstring) ----------
+    next_letter = next_available_variant_letter(existing_variants)
+    with st.expander(f"➕ Add variant {next_letter}" if next_letter else "➕ Add variant (maximum reached)"):
+        if not next_letter:
+            st.info("Every stage already has all 4 variants (A–D) — that's the maximum.")
+        else:
+            st.caption(f"Variant {next_letter} needs content for EVERY existing stage — variants are "
+                       "campaign-wide, not per-stage, so this adds it everywhere at once.")
+            contents_by_stage = {}
+            for stage in stages:
+                prefix = stage["template_prefix"]
+                st.markdown(f"**{stage['name']}**")
+                subject = st.text_input("Subject", key=f"newvariant_subject_{prefix}")
+                body = st.text_area("Body", key=f"newvariant_body_{prefix}", height=120)
+                contents_by_stage[prefix] = {"subject": subject, "body": body}
+
+            if st.button(f"Add Variant {next_letter}", type="primary"):
+                errors = validate_new_variant_contents(stages, contents_by_stage)
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    try:
+                        files = build_new_variant_files_for_all_stages(campaign_name, stages, next_letter,
+                                                                        contents_by_stage)
+                        client = _get_github_client()
+                        client.commit_campaign_files_directly(
+                            files=files,
+                            commit_message=f"Add variant {next_letter} to {campaign_name} "
+                                            f"(via Streamlit, by {current_user()})",
+                        )
+                        st.success(f"Variant {next_letter} added to all {len(stages)} stage(s).")
+                    except GitHubActionsError as exc:
+                        st.error(f"Failed to add variant: {exc}")
+
+    # ---------- Add a follow-up stage (reuses the exact New Campaign "Add Stage" logic) ----------
+    try:
+        next_stage = get_next_stage_for_campaign(campaign_name, TEMPLATES_ROOT)
+    except Exception as exc:  # noqa: BLE001
+        next_stage = None
+        st.error(f"Couldn't determine next stage: {exc}")
+
+    with st.expander("➕ Add a follow-up stage" if next_stage else "➕ Add a follow-up stage (none left)"):
+        if next_stage is None:
+            st.info("This campaign already has all 5 stages.")
+        else:
+            stage_prefix, required_variants = next_stage
+            st.write(f"**Next stage:** `{stage_prefix}` · **Required variants:** {', '.join(required_variants)}")
+            variant_inputs = {}
+            for letter in required_variants:
+                st.markdown(f"**Variant {letter}**")
+                subject = st.text_input(
+                    "Subject (leave blank to continue the previous thread)",
+                    key=f"followup_subject_{letter}",
+                )
+                body = st.text_area("Body", key=f"followup_body_{letter}", height=120)
+                variant_inputs[letter] = {"subject": subject, "body": body}
+
+            if st.button(f"Add {stage_prefix}", type="primary"):
+                errors = []
+                for letter, content in variant_inputs.items():
+                    content_error = validate_variant_content(content["subject"], content["body"],
+                                                               is_first_stage=False)
+                    if content_error:
+                        errors.append(f"Variant {letter}: {content_error}")
+                if errors:
+                    for e in errors:
+                        st.error(e)
+                else:
+                    try:
+                        files = build_campaign_files(campaign_name, stage_prefix, variant_inputs)
+                        client = _get_github_client()
+                        client.commit_campaign_files_directly(
+                            files=files,
+                            commit_message=f"Add {stage_prefix} to {campaign_name} "
+                                            f"(via Streamlit, by {current_user()})",
+                        )
+                        st.success(f"'{stage_prefix}' added.")
+                    except GitHubActionsError as exc:
+                        st.error(f"Failed to add stage: {exc}")
+
+
 def _render_stub_tab(tab_name: str, phase_letter: str):
     st.info(
         f"**{tab_name} isn't built yet.** This is planned as Phase {phase_letter} — see the Campaigns Hub "
@@ -363,7 +518,7 @@ def _render_campaign_detail(campaign_name: str):
     with tabs[1]:
         _render_data_tab(campaign_cfg, leads)
     with tabs[2]:
-        _render_stub_tab("Sequences (template editor)", "D")
+        _render_sequences_tab(campaign_cfg, leads)
     with tabs[3]:
         _render_stub_tab("Schedule (timezone, window, days)", "E")
     with tabs[4]:
