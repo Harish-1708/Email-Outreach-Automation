@@ -9,12 +9,12 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phases A–D and F of the Campaigns
-  Hub plan). Search, see every campaign's status at a glance, open one
-  for Analytics, Data, Sequences, and Settings (sender selection, daily
-  limits — saved to the campaign's config file, preserving everything
-  else already in it). Schedule and Responses are still honest
-  placeholders.
+- **🗂️ Campaigns** — the everyday view (Phases A–F of the Campaigns Hub
+  plan). Search, create a new campaign inline (no separate page — click
+  ＋ New Campaign, fill in name + Intro, done), see every campaign's
+  status at a glance, open one for Analytics, Data, Sequences, Schedule
+  (timezone, sending window, days — enforced by `outreach.py` itself, not
+  just cosmetic), and Settings. Only Responses is still a placeholder.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -91,6 +91,24 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **New Campaign is an inline modal now, not a separate page.** Right
+  after creating one, it deliberately does NOT auto-navigate into it —
+  Streamlit Cloud's local checkout won't have the new file until it
+  redeploys (triggered by the commit, not instant), so jumping straight
+  in would likely hit a real "No templates found" error. The same
+  redeploy delay applies more mildly to Sequences/Settings/Schedule saves
+  (you may briefly see the old values reflected here — the change is
+  already live for actual sending regardless).
+- **Schedule restricts Send Batch, never Preview.** A campaign outside
+  its configured sending window can still be freely previewed; only an
+  actual Send is blocked, with a clear reason. No schedule configured
+  (the default) means "always allowed," exactly matching every
+  campaign's behavior before this feature existed.
+- **Timezones are always real IANA names** (e.g. `America/Los_Angeles`),
+  never fixed offsets like "PST" — this is what makes Daylight Saving
+  transitions handled correctly automatically, rather than silently
+  sending an hour off twice a year.
 
 - **`create_file` now correctly handles updating files that already
   exist** (fetches the current SHA first, as GitHub's API requires) —
