@@ -1614,6 +1614,80 @@ def test_responses_tab_shows_info_when_no_responses_yet():
     assert "No responses yet" in info_texts
 
 
+def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
+    """The real end-to-end proof: an uploaded file's bytes survive
+    base64-encoding into the committed payload and decode back to the
+    exact original content."""
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        reply_uploader = next(fu for fu in at.file_uploader if fu.key and "reply_attachments" in fu.key)
+        body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
+        body_input.set_value("Here is the photo you asked for.")
+        reply_uploader.upload("photo.png", b"fake-png-bytes", "image/png")
+        at.run(timeout=15)
+
+        assert list(at.exception) == []
+        send_button = next(b for b in at.button if b.key and "send_reply" in b.key)
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Send with attachment raised: {list(at.exception)}"
+    assert list(at.error) == []
+    import json
+    import base64
+    payload = json.loads(captured["commits"][0]["content"].decode("utf-8"))
+    assert payload["attachments"] == [{"filename": "photo.png",
+                                        "content_base64": base64.b64encode(b"fake-png-bytes").decode("ascii")}]
+    assert base64.b64decode(payload["attachments"][0]["content_base64"]) == b"fake-png-bytes"
+
+
+def test_responses_tab_send_reply_without_attachment_omits_attachments_key():
+    fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
+        body_input.set_value("No attachment here.")
+        at.run(timeout=15)
+
+        send_button = next(b for b in at.button if b.key and "send_reply" in b.key)
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    import json
+    payload = json.loads(captured["commits"][0]["content"].decode("utf-8"))
+    assert "attachments" not in payload
+
+
 def test_login_lockout_after_repeated_failures():
     from auth import hash_password
 
