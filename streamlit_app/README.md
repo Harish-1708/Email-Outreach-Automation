@@ -11,10 +11,15 @@ directly — no GitHub trip, no pull request to approve.
 
 - **🗂️ Campaigns** — the everyday view. Every phase (A–H) is now real:
   search, create a campaign inline, see status at a glance, Launch/Pause/
-  Resume, and inside a campaign: Analytics, Data, Sequences, Schedule,
-  Settings, and Responses (reply directly from the app — Cc/Bcc, file
-  attachments, correctly threaded into the same conversation). A fuller
-  quoted-thread view and scheduling a reply for later are deliberately
+  Resume, and inside a campaign: Analytics, Preview, Data, Sequences
+  (+ ThreadSubject Maintenance at the bottom), Schedule, Settings
+  (+ Send at the bottom), and Responses (+ Check Replies at the top,
+  reply directly from the app — Cc/Bcc, file attachments, correctly
+  threaded into the same conversation). Each action lives with the thing
+  it's most related to, rather than grouped into its own separate tab —
+  Send sits with sending config, Check Replies sits with the replies
+  themselves. A fuller quoted-thread view and scheduling a reply for
+  later are deliberately
   not built yet — see below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
