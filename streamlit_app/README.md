@@ -9,13 +9,14 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phases A, B, and C of the Campaigns
-  Hub plan). Search, see every campaign's status at a glance, open one
-  for Analytics (per-stage, per-variant, per-sender breakdowns) and Data
-  (CSV upload with column mapping, a searchable/filterable lead table,
-  and soft-remove — never a hard delete). Sequences, Schedule, Settings,
-  and Responses are still honest placeholders — each says plainly which
-  phase it's planned for.
+- **🗂️ Campaigns** — the everyday view (Phases A–D of the Campaigns Hub
+  plan). Search, see every campaign's status at a glance, open one for
+  Analytics (per-stage/variant/sender breakdowns), Data (CSV import with
+  mapping, lead table, soft-remove), and Sequences (edit existing
+  templates — locked by default, one batched Save commit for everything
+  changed; add a new variant across every stage at once, since variants
+  are campaign-wide not per-stage; add a follow-up stage). Schedule,
+  Settings, and Responses are still honest placeholders.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -92,6 +93,16 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **Variants are campaign-wide, not per-stage.** Every stage must offer
+  the exact same variant letters (a hard rule in `outreach.py` itself —
+  see `discover_stages_and_variants`). "Add a variant" in Sequences
+  therefore always adds it to every existing stage at once, in one
+  commit, never just one stage.
+- **Template edits are locked by default.** Unlock a variant to edit it;
+  Save Changes commits everything you've unlocked and changed as ONE
+  commit, not one per field — same batching principle as everywhere else
+  writes happen in this app.
 
 - **Sheets reads on the campaign detail page are cached for 30 seconds.**
   This isn't just a performance nicety — Google's Sheets API caps reads at
