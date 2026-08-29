@@ -219,8 +219,6 @@ def test_new_campaign_dialog_creates_campaign_and_stays_on_hub():
 
         text_inputs = {ti.label: ti for ti in at.text_input}
         text_inputs["Campaign name (letters, numbers, underscores only)"].set_value("BrandNewCampaign")
-        text_inputs["Subject (Intro)"].set_value("Hello there")
-        at.text_area[0].set_value("Body content")
         at.checkbox[0].set_value(True)
         at.run(timeout=15)
 
@@ -232,10 +230,120 @@ def test_new_campaign_dialog_creates_campaign_and_stays_on_hub():
     assert list(at.error) == []
     assert len(captured["commits"]) == 1
     assert captured["commits"][0]["path"] == "templates/BrandNewCampaign/intro_A.txt"
+    # No template content was ever asked for — a placeholder is used instead.
+    assert b"Write your subject here" in captured["commits"][0]["content"]
     assert captured["dispatched"] == "dashboard.yml"  # auto tab-init was triggered
     assert "selected_campaign" not in at.session_state  # stayed on the hub, didn't auto-navigate
     titles = [t.value for t in at.title]
     assert "Campaigns" in titles  # still the hub, not a campaign detail page
+
+
+def test_new_campaign_dialog_only_asks_for_name_no_template_fields():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    dialog_text_inputs = [ti.label for ti in at.text_input if "Campaign name" in ti.label]
+    assert len(dialog_text_inputs) == 1
+    # No Subject/Body fields anywhere in the dialog.
+    assert not any("Subject" in ti.label for ti in at.text_input if ti.label)
+    assert len(at.text_area) == 0
+
+
+def test_new_campaign_dialog_does_not_reopen_after_navigating_away_and_back():
+    """The actual reported bug: opening the dialog, then visiting a
+    different page, then returning to Campaigns without ever clicking
+    Create or Cancel, was silently reopening the dialog again — because
+    the session_state flag needed to survive reruns FROM WITHIN the
+    dialog had no way to distinguish that from a genuine return visit."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+        assert at.session_state["show_new_campaign_dialog"] is True
+
+        # Simulate visiting a different page — exactly what dashboard.py /
+        # controls.py / etc. do via mark_active_page at their own top.
+        at.session_state["_active_page"] = "dashboard"
+
+        # Return to Campaigns — WITHOUT ever clicking Create or Cancel.
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert at.session_state["show_new_campaign_dialog"] is False
+    # The dialog's own fields shouldn't be showing anymore either.
+    assert not any("Campaign name" in ti.label for ti in at.text_input if ti.label)
+
+
+def test_new_campaign_dialog_stays_open_across_its_own_widget_interactions():
+    """The flip side of the above — interacting with a widget INSIDE the
+    dialog (not navigating away) must NOT close it. This is what the
+    session_state approach was originally introduced to fix; confirming
+    it still holds after adding the navigation check."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+        name_input = next(ti for ti in at.text_input if "Campaign name" in ti.label)
+        name_input.set_value("SomeName")
+        at.run(timeout=15)  # a rerun triggered by a widget INSIDE the dialog
+
+    assert list(at.exception) == []
+    assert at.session_state["show_new_campaign_dialog"] is True  # still open
+    assert any("Campaign name" in ti.label for ti in at.text_input if ti.label)
+
+
+def test_new_campaign_dialog_cancel_button_closes_it():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+        cancel_button = next(b for b in at.button if b.label == "Cancel")
+        cancel_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert at.session_state["show_new_campaign_dialog"] is False
 
 
 def test_new_campaign_dialog_rejects_duplicate_name():
@@ -257,8 +365,6 @@ def test_new_campaign_dialog_rejects_duplicate_name():
 
         text_inputs = {ti.label: ti for ti in at.text_input}
         text_inputs["Campaign name (letters, numbers, underscores only)"].set_value("Kelson_Creators_Licensing")
-        text_inputs["Subject (Intro)"].set_value("Hi")
-        at.text_area[0].set_value("Body")
         at.checkbox[0].set_value(True)
         at.run(timeout=15)
 
