@@ -9,12 +9,12 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view (Phases A–F of the Campaigns Hub
-  plan). Search, create a new campaign inline (no separate page — click
-  ＋ New Campaign, fill in name + Intro, done), see every campaign's
-  status at a glance, open one for Analytics, Data, Sequences, Schedule
-  (timezone, sending window, days — enforced by `outreach.py` itself, not
-  just cosmetic), and Settings. Only Responses is still a placeholder.
+- **🗂️ Campaigns** — the everyday view (Phases A–G of the Campaigns Hub
+  plan). Search, create a new campaign inline, see every campaign's
+  status at a glance, open one for Analytics, Data, Sequences, Schedule,
+  and Settings, and control its lifecycle directly: Launch a Draft
+  (with a confirmation step), Pause a Running campaign, Resume a Paused
+  one. Only Responses is still a placeholder.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -91,6 +91,13 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **Launch/Pause/Resume are never gated by campaign readiness.** The
+  readiness check (no sender configured, no templates, no approved
+  leads) is shown as an FYI on the Launch confirmation, never a blocker —
+  `outreach.send_batch()` already naturally does nothing if there's
+  nothing eligible to send, so blocking Launch on it would just be
+  friction with no real safety benefit.
 
 - **New Campaign is an inline modal now, not a separate page** — and
   deliberately asks for nothing but a name. Git can't store an empty
