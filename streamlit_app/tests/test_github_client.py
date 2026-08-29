@@ -96,78 +96,53 @@ def test_find_recent_run_returns_none_when_empty(monkeypatch):
     assert _client().find_recent_run("send_batch.yml") is None
 
 
-# ---------- campaign PR flow ----------
+# ---------- campaign creation — direct commit ----------
 
-def test_open_campaign_pull_request_calls_in_order(monkeypatch):
+def test_commit_campaign_files_directly_writes_every_file_to_main(monkeypatch):
     calls = []
 
-    def fake_get(url, headers=None, timeout=None, params=None):
-        calls.append(("GET", url))
-        return _fake_response(200, {"object": {"sha": "abc123"}})
-
-    def fake_post(url, json=None, headers=None, timeout=None):
-        calls.append(("POST", url, json))
-        if url.endswith("/git/refs"):
-            return _fake_response(201, {"ref": "refs/heads/add-campaign-foo"})
-        if url.endswith("/pulls"):
-            return _fake_response(201, {"html_url": "https://github.com/acme/outreach/pull/1"})
-        return _fake_response(201, {})
-
     def fake_put(url, json=None, headers=None, timeout=None):
-        calls.append(("PUT", url, json))
+        calls.append((url, json))
         return _fake_response(201, {})
 
-    monkeypatch.setattr(github_client.requests, "get", fake_get)
-    monkeypatch.setattr(github_client.requests, "post", fake_post)
     monkeypatch.setattr(github_client.requests, "put", fake_put)
 
     client = _client()
-    result = client.open_campaign_pull_request(
-        branch_name="add-campaign-foo",
-        files=[{"path": "templates/Foo/intro_A.txt", "content": b"Subject: Hi\n\nBody"}],
-        pr_title="Add campaign: Foo",
-        pr_body="body",
+    client.commit_campaign_files_directly(
+        files=[
+            {"path": "templates/Foo/intro_A.txt", "content": b"Subject: Hi\n\nBody A"},
+            {"path": "templates/Foo/intro_B.txt", "content": b"Subject: Hi\n\nBody B"},
+        ],
+        commit_message="Add campaign: Foo",
     )
 
-    assert result["html_url"] == "https://github.com/acme/outreach/pull/1"
-    # Branch created before file written, file written before PR opened.
-    kinds = [c[0] for c in calls]
-    assert kinds.index("POST") < len(calls)  # sanity: at least one POST happened
-    ref_call_idx = next(i for i, c in enumerate(calls) if c[0] == "POST" and c[1].endswith("/git/refs"))
-    put_call_idx = next(i for i, c in enumerate(calls) if c[0] == "PUT")
-    pr_call_idx = next(i for i, c in enumerate(calls) if c[0] == "POST" and c[1].endswith("/pulls"))
-    assert ref_call_idx < put_call_idx < pr_call_idx
+    assert len(calls) == 2
+    assert calls[0][0].endswith("/contents/templates/Foo/intro_A.txt")
+    assert calls[0][1]["branch"] == "main"
+    assert calls[0][1]["message"] == "Add campaign: Foo"
+    assert calls[1][0].endswith("/contents/templates/Foo/intro_B.txt")
 
 
-def test_create_branch_raises_if_ref_lookup_fails(monkeypatch):
-    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404, text="no ref"))
-    with pytest.raises(GitHubActionsError, match="404"):
-        _client().create_branch("add-campaign-foo")
+def test_commit_campaign_files_directly_raises_on_first_failure(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "put",
+                         lambda *a, **kw: _fake_response(422, text="Invalid content"))
+    with pytest.raises(GitHubActionsError, match="Failed to create file"):
+        _client().commit_campaign_files_directly(
+            files=[{"path": "templates/Foo/intro_A.txt", "content": b"bad"}],
+            commit_message="Add campaign: Foo",
+        )
 
 
-def test_create_branch_gives_actionable_message_on_already_exists_422(monkeypatch):
-    monkeypatch.setattr(github_client.requests, "get",
-                         lambda *a, **kw: _fake_response(200, {"object": {"sha": "abc123"}}))
-    monkeypatch.setattr(
-        github_client.requests, "post",
-        lambda *a, **kw: _fake_response(422, text='{"message":"Reference already exists"}'),
-    )
-    with pytest.raises(GitHubActionsError, match="leftover from a previous attempt"):
-        _client().create_branch("add-followup1-harish_testing_25aug")
+def test_create_file_defaults_to_main_branch(monkeypatch):
+    captured = {}
 
+    def fake_put(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _fake_response(201, {})
 
-def test_create_branch_non_collision_422_uses_generic_message(monkeypatch):
-    # Some OTHER 422 (e.g. malformed ref name) shouldn't get the
-    # "leftover branch" explanation — that's specifically for the
-    # already-exists case, matched on the response text.
-    monkeypatch.setattr(github_client.requests, "get",
-                         lambda *a, **kw: _fake_response(200, {"object": {"sha": "abc123"}}))
-    monkeypatch.setattr(
-        github_client.requests, "post",
-        lambda *a, **kw: _fake_response(422, text='{"message":"Invalid ref name"}'),
-    )
-    with pytest.raises(GitHubActionsError, match="Failed to create branch"):
-        _client().create_branch("bad ref name")
+    monkeypatch.setattr(github_client.requests, "put", fake_put)
+    _client().create_file("templates/Foo/intro_A.txt", b"content", "msg")  # no branch arg
+    assert captured["json"]["branch"] == "main"
 
 
 def test_create_file_encodes_content_as_base64(monkeypatch):
@@ -182,3 +157,9 @@ def test_create_file_encodes_content_as_base64(monkeypatch):
 
     import base64
     assert base64.b64decode(captured["json"]["content"]) == b"Subject: Hi\n\nBody"
+
+
+def test_create_file_raises_on_error_status(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "put", lambda *a, **kw: _fake_response(422, text="bad"))
+    with pytest.raises(GitHubActionsError, match="Failed to create file"):
+        _client().create_file("templates/Foo/intro_A.txt", b"content", "msg", "main")
