@@ -66,3 +66,11 @@ class ReadOnlySheetsConnector:
 
     def get_all_error_log(self, error_log_tab: str) -> List[Dict]:
         return self._ws(error_log_tab).get_all_records()
+
+    def get_header(self, tab_name: str) -> List[str]:
+        """The tab's actual header row — used to discover custom trailing
+        columns (Title, Website, LinkedIn, ...) that exist in the real
+        Sheet but aren't part of outreach.MASTER_COLUMNS, so the Data
+        tab's column-mapping UI can offer them as valid targets without
+        guessing."""
+        return self._ws(tab_name).row_values(1)
