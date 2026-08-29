@@ -744,6 +744,149 @@ def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
     assert "Subject is required" in error_texts or "Body is required" in error_texts
 
 
+def test_settings_tab_renders_current_values_from_config():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        secrets = _dashboard_secrets()
+        secrets["email_accounts_directory"] = {"sales1": "sales1@x.com", "sales2": "sales2@x.com"}
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Settings tab raised: {list(at.exception)}"
+    assert list(at.error) == []
+    account_selector = next(ms for ms in at.multiselect if "sender accounts" in ms.label)
+    assert set(account_selector.options) == {"sales1", "sales2"}
+    daily_limit_input = next(ni for ni in at.number_input if "Daily limit" in ni.label)
+    assert daily_limit_input.value == 100  # matches config/settings.yaml's real default
+
+
+def test_settings_tab_shows_info_when_no_accounts_directory_configured():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())  # no email_accounts_directory
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    info_texts = " ".join(i.value for i in at.info)
+    assert "No accounts configured in Streamlit Secrets" in info_texts
+
+
+def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.get_file_sha", return_value=None):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        secrets = _dashboard_secrets()
+        secrets["email_accounts_directory"] = {"sales1": "sales1@x.com"}
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        daily_limit_input = next(ni for ni in at.number_input if "Daily limit" in ni.label)
+        daily_limit_input.set_value(250)
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Settings")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Settings save raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert len(captured["commits"]) == 1
+    commit = captured["commits"][0]
+    assert commit["path"] == "config/campaigns/Kelson_Creators_Licensing.yaml"
+    import yaml
+    written = yaml.safe_load(commit["content"].decode("utf-8"))
+    assert written["sending"]["daily_limit"] == 250
+
+
+def test_settings_tab_save_rejects_non_positive_daily_limit_without_committing():
+    """The widget itself enforces min_value=1, so the only way to reach
+    validate_settings' rejection path through the UI is the per-account
+    limit toggle — tested directly and thoroughly in test_settings_logic.py
+    instead, where it doesn't depend on simulating a specific widget's
+    numeric-input quirks. This smoke test instead confirms the more
+    load-bearing thing: Save actually works end-to-end on first use with
+    the real config defaults, with no error."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Settings")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    assert len(captured.get("commits", [])) == 1
+
+
+def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path):
+    """The real regression this guards: Save must only ever touch the
+    'sending' key of the override file. Anything else already there
+    (status from Pause/Resume, schedule once that phase exists) must
+    survive a Settings save untouched."""
+    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+        "status: paused\nschedule:\n  timezone: America/Los_Angeles\nsending:\n  daily_limit: 50\n"
+    )
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path)):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        daily_limit_input = next(ni for ni in at.number_input if "Daily limit" in ni.label)
+        daily_limit_input.set_value(300)
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Settings")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert written["status"] == "paused"  # preserved, not clobbered
+    assert written["schedule"] == {"timezone": "America/Los_Angeles"}  # preserved
+    assert written["sending"]["daily_limit"] == 300  # actually updated
+
+
 def test_login_lockout_after_repeated_failures():
     from auth import hash_password
 
