@@ -5,7 +5,11 @@ without touching real GitHub.
 Token scope needed:
 - actions: read, actions: write  -> dispatch_workflow, get_run, find_recent_run
 - contents: write -> create_file / commit_campaign_files_directly (New
-  Campaign page only)
+  Campaign page, template edits, campaign settings)
+- secrets: write -> get_repo_public_key / set_secret / delete_secret (Email
+  Accounts management ONLY — a materially larger grant than anything
+  else in this app needs; see those methods' docstrings for what this
+  can and can't do)
 """
 import base64
 from typing import Dict, List, Optional
@@ -120,3 +124,61 @@ class GitHubClient:
         prior file in the list may have already landed."""
         for f in files:
             self.create_file(f["path"], f["content"], message=commit_message, branch=base)
+
+    # ---------- Repository secrets — set/delete only, NEVER read ----------
+    #
+    # GitHub Secrets are write-only by design: this API can set or delete a
+    # secret's value, but there is no endpoint that returns an existing
+    # value, to this token or any other. That's the actual security
+    # property everything here relies on — Streamlit briefly holds a
+    # plaintext password only for the instant it takes to encrypt and send
+    # it below; it's never stored, logged, or displayed anywhere by this
+    # client. Requires a token with `secrets: write` — a materially larger
+    # grant than anything else in this app needs, used ONLY by the Email
+    # Accounts management page.
+
+    def get_repo_public_key(self) -> Dict[str, str]:
+        """{'key_id': ..., 'key': <base64>} — GitHub's current public key
+        for this repo, used to encrypt every secret value before it's ever
+        sent over the wire. Fetched fresh each time rather than cached,
+        since GitHub can rotate this key."""
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/actions/secrets/public-key"
+        resp = requests.get(url, headers=self._headers, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise GitHubActionsError(f"Failed to fetch repo public key: {resp.status_code} {resp.text[:300]}")
+        return resp.json()
+
+    def encrypt_secret_value(self, plaintext: str, public_key_b64: str) -> str:
+        """Libsodium sealed-box encryption, exactly as GitHub's API
+        requires (https://docs.github.com/en/rest/actions/secrets) — a
+        one-way encryption only GitHub's own private key can open. Kept as
+        its own method (no network call) so it's directly unit-testable
+        without touching the API."""
+        from nacl import encoding, public
+        public_key = public.PublicKey(public_key_b64.encode("utf-8"), encoding.Base64Encoder())
+        sealed_box = public.SealedBox(public_key)
+        encrypted = sealed_box.encrypt(plaintext.encode("utf-8"))
+        return base64.b64encode(encrypted).decode("utf-8")
+
+    def set_secret(self, secret_name: str, plaintext_value: str) -> None:
+        """Encrypts plaintext_value with the repo's CURRENT public key
+        (fetched fresh, never cached — see get_repo_public_key) and sets
+        it as a repository secret. Creates the secret if it doesn't exist,
+        overwrites it if it does — GitHub's API doesn't distinguish the
+        two operations."""
+        key_info = self.get_repo_public_key()
+        encrypted_value = self.encrypt_secret_value(plaintext_value, key_info["key"])
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/actions/secrets/{secret_name}"
+        payload = {"encrypted_value": encrypted_value, "key_id": key_info["key_id"]}
+        resp = requests.put(url, json=payload, headers=self._headers, timeout=self.timeout)
+        if resp.status_code not in (201, 204):
+            raise GitHubActionsError(f"Failed to set secret '{secret_name}': {resp.status_code} {resp.text[:300]}")
+
+    def delete_secret(self, secret_name: str) -> None:
+        """204 means deleted; 404 means it was already gone — both count
+        as success here, since the caller's goal ("this secret should not
+        exist") is satisfied either way."""
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/actions/secrets/{secret_name}"
+        resp = requests.delete(url, headers=self._headers, timeout=self.timeout)
+        if resp.status_code not in (204, 404):
+            raise GitHubActionsError(f"Failed to delete secret '{secret_name}': {resp.status_code} {resp.text[:300]}")
