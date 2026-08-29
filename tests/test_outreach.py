@@ -4,7 +4,7 @@ import os
 import pathlib
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 import pytest
@@ -620,6 +620,138 @@ def test_backfill_stops_at_first_non_blank_walking_backward_not_earliest(tmp_pat
 def test_backfill_returns_nothing_to_write_for_empty_lead_list():
     campaign_cfg = _base_campaign_cfg()
     assert outreach.backfill_thread_subjects(campaign_cfg, []) == []
+
+
+# =============================================================================
+# is_within_sending_window — Phase E (Schedule). Every test passes an
+# explicit now_utc rather than relying on the real clock, so these are
+# fully deterministic regardless of when the suite actually runs.
+# =============================================================================
+
+def test_sending_window_empty_schedule_always_allowed():
+    within, reason = outreach.is_within_sending_window({})
+    assert within is True
+    assert reason == ""
+
+
+def test_sending_window_schedule_with_no_timezone_always_allowed():
+    # A schedule dict with only, say, send_days but no timezone can't be
+    # evaluated meaningfully — treat it as "no restriction" rather than
+    # guessing a timezone.
+    within, _ = outreach.is_within_sending_window({"send_days": ["mon"]})
+    assert within is True
+
+
+def test_sending_window_within_simple_window():
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)  # a Monday, noon UTC
+    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
+    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
+    assert within is True
+    assert reason == ""
+
+
+def test_sending_window_before_window_start():
+    now = datetime(2026, 6, 15, 6, 0, tzinfo=timezone.utc)  # 06:00 UTC, before 09:00 window
+    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
+    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
+    assert within is False
+    assert "outside the sending window" in reason
+
+
+def test_sending_window_after_window_end():
+    now = datetime(2026, 6, 15, 18, 0, tzinfo=timezone.utc)  # 18:00 UTC, after 17:00 window
+    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
+    within, reason = outreach.is_within_sending_window(schedule, now_utc=now)
+    assert within is False
+
+
+def test_sending_window_boundaries_are_inclusive():
+    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
+    at_start = datetime(2026, 6, 15, 9, 0, tzinfo=timezone.utc)
+    at_end = datetime(2026, 6, 15, 17, 0, tzinfo=timezone.utc)
+    assert outreach.is_within_sending_window(schedule, now_utc=at_start)[0] is True
+    assert outreach.is_within_sending_window(schedule, now_utc=at_end)[0] is True
+
+
+def test_sending_window_midnight_crossing_window_inside():
+    # A window like 22:00-06:00 (overnight) — 23:00 and 02:00 should both
+    # count as "inside", even though start > end numerically.
+    schedule = {"timezone": "UTC", "window_start": "22:00", "window_end": "06:00"}
+    late_night = datetime(2026, 6, 15, 23, 0, tzinfo=timezone.utc)
+    early_morning = datetime(2026, 6, 16, 2, 0, tzinfo=timezone.utc)
+    assert outreach.is_within_sending_window(schedule, now_utc=late_night)[0] is True
+    assert outreach.is_within_sending_window(schedule, now_utc=early_morning)[0] is True
+
+
+def test_sending_window_midnight_crossing_window_outside():
+    schedule = {"timezone": "UTC", "window_start": "22:00", "window_end": "06:00"}
+    midday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    within, reason = outreach.is_within_sending_window(schedule, now_utc=midday)
+    assert within is False
+
+
+def test_sending_window_send_days_restricts_correctly():
+    schedule = {"timezone": "UTC", "send_days": ["mon", "tue", "wed", "thu", "fri"]}
+    monday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)  # a Monday
+    saturday = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)  # a Saturday
+    assert outreach.is_within_sending_window(schedule, now_utc=monday)[0] is True
+    within, reason = outreach.is_within_sending_window(schedule, now_utc=saturday)
+    assert within is False
+    assert "sat" in reason.lower()
+
+
+def test_sending_window_send_days_case_and_length_insensitive():
+    schedule = {"timezone": "UTC", "send_days": ["Monday", "TUE"]}
+    monday = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    assert outreach.is_within_sending_window(schedule, now_utc=monday)[0] is True
+
+
+def test_sending_window_send_days_and_window_both_apply():
+    schedule = {"timezone": "UTC", "send_days": ["mon"], "window_start": "09:00", "window_end": "17:00"}
+    monday_in_window = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    monday_outside_window = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)
+    tuesday_in_window = datetime(2026, 6, 16, 12, 0, tzinfo=timezone.utc)
+    assert outreach.is_within_sending_window(schedule, now_utc=monday_in_window)[0] is True
+    assert outreach.is_within_sending_window(schedule, now_utc=monday_outside_window)[0] is False
+    assert outreach.is_within_sending_window(schedule, now_utc=tuesday_in_window)[0] is False
+
+
+def test_sending_window_invalid_timezone_raises_config_error():
+    with pytest.raises(outreach.ConfigError, match="Invalid timezone"):
+        outreach.is_within_sending_window({"timezone": "Not/A/Real/Zone"})
+
+
+def test_sending_window_invalid_time_format_raises_config_error():
+    with pytest.raises(outreach.ConfigError, match="window_start/window_end"):
+        outreach.is_within_sending_window({"timezone": "UTC", "window_start": "9am", "window_end": "5pm"})
+
+
+def test_sending_window_dst_transition_same_utc_moment_different_local_result():
+    """The actual point of using zoneinfo instead of a fixed offset: the
+    SAME UTC instant of day must evaluate differently on either side of a
+    DST transition, because the real local time differs. A naive
+    fixed-offset implementation would get one of these two cases wrong."""
+    schedule = {"timezone": "America/Los_Angeles", "window_start": "09:00", "window_end": "17:00"}
+    # 16:00 UTC is 08:00 PST before the US 2026 spring-forward (Mar 8) —
+    # before the window opens.
+    before_dst = datetime(2026, 3, 1, 16, 0, tzinfo=timezone.utc)
+    # The SAME 16:00 UTC is 09:00 PDT after spring-forward — right at the
+    # window's start.
+    after_dst = datetime(2026, 3, 15, 16, 0, tzinfo=timezone.utc)
+
+    assert outreach.is_within_sending_window(schedule, now_utc=before_dst)[0] is False
+    assert outreach.is_within_sending_window(schedule, now_utc=after_dst)[0] is True
+
+
+def test_sending_window_naive_datetime_treated_as_utc():
+    """now_utc without tzinfo (e.g. datetime.now() called naively) must
+    still work correctly rather than raising or silently misbehaving —
+    treated as UTC, matching the function's own default when now_utc is
+    omitted entirely."""
+    naive_within_window = datetime(2026, 6, 15, 12, 0)  # no tzinfo
+    schedule = {"timezone": "UTC", "window_start": "09:00", "window_end": "17:00"}
+    within, _ = outreach.is_within_sending_window(schedule, now_utc=naive_within_window)
+    assert within is True
 
 
 # =============================================================================
@@ -1287,6 +1419,64 @@ def test_build_batch_ignores_paused_status_preview_still_works(monkeypatch):
         "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
     campaign_cfg = _base_campaign_cfg()
     campaign_cfg["status"] = "paused"
+    lead = make_lead(_row=2)
+    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
+    assert len(plan) == 1
+
+
+def test_send_batch_raises_outside_sending_window_error_before_touching_anything(monkeypatch):
+    smtp_called = []
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1) or {"message_id": "<m>"})
+
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["schedule"] = {"timezone": "UTC"}  # content irrelevant — is_within_sending_window is mocked below
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    # Mocked rather than relying on a real "always closed" window, so this
+    # test's outcome never depends on the real wall-clock time it happens
+    # to run at — is_within_sending_window's own correctness is covered
+    # exhaustively above; this test is specifically about send_batch's
+    # handling of a False result.
+    monkeypatch.setattr(outreach, "is_within_sending_window",
+                         lambda schedule: (False, "outside for this test"))
+
+    with pytest.raises(outreach.OutsideSendingWindowError, match="outside its configured sending window"):
+        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+
+    assert smtp_called == []
+
+
+def test_send_batch_within_sending_window_sends_normally(monkeypatch):
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["schedule"] = {"timezone": "UTC", "window_start": "00:00", "window_end": "23:59"}
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+    assert results[0]["status"] == "sent"
+
+
+def test_send_batch_no_schedule_key_sends_normally(monkeypatch):
+    # _base_campaign_cfg() fixtures predate the "schedule" field entirely.
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    campaign_cfg = _base_campaign_cfg()
+    assert "schedule" not in campaign_cfg
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    try:
+        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+    except outreach.OutsideSendingWindowError:
+        pytest.fail("send_batch treated a missing 'schedule' key as a restriction")
+
+
+def test_build_batch_ignores_schedule_restriction_preview_still_works(monkeypatch):
+    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
+        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["schedule"] = {"timezone": "UTC", "window_start": "00:00", "window_end": "00:01"}
     lead = make_lead(_row=2)
     plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
     assert len(plan) == 1
