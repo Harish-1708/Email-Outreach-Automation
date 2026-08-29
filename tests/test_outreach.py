@@ -766,6 +766,30 @@ sending:
     assert cfg["variants"] == ["A"]                       # still inherited
 
 
+def test_get_campaign_status_defaults_to_active_when_unset(tmp_path):
+    # Critical backward-compat guarantee: every campaign that existed
+    # before "status" was introduced has no override for it at all, and
+    # must keep behaving exactly as it always did — never silently paused.
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path)
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["status"] == "active"
+
+
+def test_get_campaign_status_respects_explicit_override(tmp_path):
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml="status: paused\n")
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["status"] == "paused"
+
+
+def test_get_campaign_status_draft_override(tmp_path):
+    settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml="status: draft\n")
+    cfg = outreach.get_campaign("test_campaign", settings_path=settings_path,
+                                 campaigns_dir=campaigns_dir, templates_root=templates_root)
+    assert cfg["status"] == "draft"
+
+
 def test_get_campaign_explicit_tab_override_wins_over_auto_derivation(tmp_path):
     override = 'master_tab: "CustomMaster"\n'
     settings_path, campaigns_dir, templates_root = _make_config_fixture(tmp_path, override_yaml=override)
@@ -1118,7 +1142,60 @@ def _base_campaign_cfg():
     }
 
 
-def test_send_batch_writes_batch_id_message_id_and_next_eligible_at(monkeypatch):
+def test_send_batch_raises_campaign_paused_error_before_touching_anything(monkeypatch):
+    smtp_called = []
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1) or {"message_id": "<m>"})
+
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["status"] = "paused"
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    with pytest.raises(outreach.CampaignPausedError, match="paused"):
+        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+
+    assert smtp_called == []  # never even got as far as resolving eligible leads
+
+
+def test_send_batch_active_status_sends_normally(monkeypatch):
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["status"] = "active"
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    results = outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+    assert results[0]["status"] == "sent"
+
+
+def test_send_batch_missing_status_key_sends_normally(monkeypatch):
+    # _base_campaign_cfg() fixtures predate the "status" field entirely —
+    # send_batch must not KeyError on campaign_cfg.get("status") being absent.
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    campaign_cfg = _base_campaign_cfg()
+    assert "status" not in campaign_cfg
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+    # Doesn't raise CampaignPausedError just because "status" key is missing.
+    try:
+        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+    except outreach.CampaignPausedError:
+        pytest.fail("send_batch treated a missing 'status' key as paused")
+
+
+def test_build_batch_ignores_paused_status_preview_still_works(monkeypatch):
+    # Preview/build_batch must stay usable for a paused campaign — only
+    # send_batch is gated.
+    monkeypatch.setattr(outreach, "render_email", lambda *a, **kw: {
+        "subject": "S", "body": "B", "missing_variables": [], "thread_subject": "S", "is_continuation": False})
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["status"] = "paused"
+    lead = make_lead(_row=2)
+    plan = outreach.build_batch(campaign_cfg, [lead], "intro", 10)
+    assert len(plan) == 1
+
+
+
     campaign_cfg = _base_campaign_cfg()
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
     fake_sheets = FakeSheets(leads)
