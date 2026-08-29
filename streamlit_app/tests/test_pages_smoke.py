@@ -5,6 +5,7 @@ send_logic/campaign_builder/etc. can't see, since those never execute the
 page files themselves. External calls (Google, GitHub) are mocked at the
 boundary; nothing here touches a real network.
 """
+import json
 import os
 import sys
 from unittest.mock import patch
@@ -431,16 +432,19 @@ def test_email_accounts_page_renders_without_exceptions():
     assert any("sales2" in label for label in metric_labels)
 
 
-def test_email_accounts_page_warns_when_no_directory_configured():
+def test_email_accounts_page_shows_info_when_no_accounts_configured_at_all():
+    """No longer a warning — now that Add Account exists, having zero
+    accounts is just a starting state, not something wrong."""
     at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
-    at.secrets.update(_dashboard_secrets())  # no email_accounts_directory key
+    at.secrets.update(_dashboard_secrets())  # no email_accounts_directory key, no slot mapping file
     for k, v in _authed_session().items():
         at.session_state[k] = v
     at.run()
 
     assert list(at.exception) == []
-    warning_texts = " ".join(w.value for w in at.warning)
-    assert "No accounts configured" in warning_texts
+    info_texts = " ".join(i.value for i in at.info)
+    assert "No accounts configured yet" in info_texts
+    assert any(b.label == "➕ Add Account" for b in at.button)
 
 
 def test_email_accounts_page_shows_connection_status_when_health_data_exists():
@@ -523,6 +527,294 @@ def test_email_accounts_page_refresh_button_busts_caches_and_refetches():
 
     assert list(at.exception) == [], f"Refresh raised: {list(at.exception)}"
     assert list(at.error) == []
+
+
+    assert list(at.exception) == []
+
+
+def _mock_secret_writes():
+    """Returns (captured, fake_set_secret, fake_delete_secret) — same
+    class-level-patch pattern as _mock_github_writes, extended for the
+    two secret-specific methods."""
+    captured = {"set_secret_calls": [], "delete_secret_calls": []}
+
+    def fake_set_secret(self, secret_name, plaintext_value):
+        captured["set_secret_calls"].append({"name": secret_name, "value": plaintext_value})
+
+    def fake_delete_secret(self, secret_name):
+        captured["delete_secret_calls"].append(secret_name)
+
+    return captured, fake_set_secret, fake_delete_secret
+
+
+def test_add_account_dialog_disabled_until_confirmed(tmp_path):
+    (tmp_path / "config").mkdir()
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        add_button = next(b for b in at.button if b.label == "➕ Add Account")
+        add_button.click()
+        at.run()
+
+        assert list(at.exception) == []
+        submit_button = next(b for b in at.button if b.label == "Add Account")
+        assert submit_button.disabled is True
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "add_account_confirm")
+        confirm_checkbox.set_value(True)
+        at.run()
+        submit_button = next(b for b in at.button if b.label == "Add Account")
+        assert submit_button.disabled is False
+
+
+def test_add_account_happy_path_writes_secret_and_mapping_and_triggers_health_check(tmp_path):
+    (tmp_path / "config").mkdir()
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+    dispatch_captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        dispatch_captured["workflow"] = workflow_file
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        add_button = next(b for b in at.button if b.label == "➕ Add Account")
+        add_button.click()
+        at.run()
+
+        name_input = next(ti for ti in at.text_input if ti.key == "add_account_name")
+        name_input.set_value("sales1")
+        address_input = next(ti for ti in at.text_input if ti.key == "add_account_address")
+        address_input.set_value("sales1@gmail.com")
+        password_input = next(ti for ti in at.text_input if ti.key == "add_account_password")
+        password_input.set_value("aaaabbbbccccdddd")
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "add_account_confirm")
+        confirm_checkbox.set_value(True)
+        at.run()
+
+        submit_button = next(b for b in at.button if b.label == "Add Account")
+        submit_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Add Account raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert len(captured["set_secret_calls"]) == 1
+    assert captured["set_secret_calls"][0]["name"] == "EMAIL_ACCOUNT_SLOT_1"
+    payload = json.loads(captured["set_secret_calls"][0]["value"])
+    assert payload == {"name": "sales1", "address": "sales1@gmail.com", "app_password": "aaaabbbbccccdddd"}
+    assert dispatch_captured["workflow"] == "check_account_health.yml"
+
+    import yaml as _yaml
+    mapping_commit = commits_captured["commits"][0]
+    assert mapping_commit["path"] == "config/email_account_slots.yaml"
+    written_mapping = _yaml.safe_load(mapping_commit["content"].decode("utf-8"))
+    assert written_mapping == {"sales1": {"slot": 1, "address": "sales1@gmail.com"}}
+
+
+def test_add_account_rejects_blank_fields_without_writing_anything(tmp_path):
+    (tmp_path / "config").mkdir()
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        add_button = next(b for b in at.button if b.label == "➕ Add Account")
+        add_button.click()
+        at.run()
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "add_account_confirm")
+        confirm_checkbox.set_value(True)
+        at.run()
+
+        submit_button = next(b for b in at.button if b.label == "Add Account")
+        submit_button.click()
+        at.run()
+
+    assert list(at.exception) == []
+    assert captured["set_secret_calls"] == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Account name is required" in error_texts
+
+
+def test_add_account_dialog_does_not_reopen_after_navigating_away(tmp_path):
+    (tmp_path / "config").mkdir()
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        add_button = next(b for b in at.button if b.label == "➕ Add Account")
+        add_button.click()
+        at.run()
+        assert at.session_state["show_add_account_dialog"] is True
+
+        at.session_state["_active_page"] = "dashboard"  # simulate visiting another page
+        at.run()  # return, without clicking Add Account or Cancel
+
+    assert list(at.exception) == []
+    assert at.session_state["show_add_account_dialog"] is False
+
+
+def _write_slot_mapping_fixture(tmp_path, mapping_yaml):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(exist_ok=True)
+    (config_dir / "email_account_slots.yaml").write_text(mapping_yaml)
+
+
+def test_manage_section_shows_only_accounts_tracked_in_slot_mapping(tmp_path):
+    _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet({})})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        secrets = _dashboard_secrets()
+        secrets["email_accounts_directory"] = {"legacy_only": "legacy@gmail.com"}
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+    assert list(at.exception) == []
+    expander_labels = [e.label for e in at.expander]
+    assert any("sales1" in label for label in expander_labels)
+    assert not any("legacy_only" in label for label in expander_labels)  # not manageable via this app
+
+
+def test_manage_section_edit_address_commits_updated_mapping_no_secret_write(tmp_path):
+    _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: old@gmail.com\n")
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet({})})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        address_input = next(ti for ti in at.text_input if ti.key == "manage_address_sales1")
+        address_input.set_value("new@gmail.com")
+        at.run()
+
+        save_button = next(b for b in at.button if b.key == "manage_save_sales1")
+        save_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Edit raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["set_secret_calls"] == []  # no password change, no secret write
+
+    import yaml as _yaml
+    mapping_commit = commits_captured["commits"][0]
+    written_mapping = _yaml.safe_load(mapping_commit["content"].decode("utf-8"))
+    assert written_mapping["sales1"]["address"] == "new@gmail.com"
+    assert written_mapping["sales1"]["slot"] == 1  # slot never changes on an edit
+
+
+def test_manage_section_edit_with_new_password_writes_secret(tmp_path):
+    _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet({})})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        password_input = next(ti for ti in at.text_input if ti.key == "manage_password_sales1")
+        password_input.set_value("newpassword1234")
+        at.run()
+
+        save_button = next(b for b in at.button if b.key == "manage_save_sales1")
+        save_button.click()
+        at.run()
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    assert len(captured["set_secret_calls"]) == 1
+    payload = json.loads(captured["set_secret_calls"][0]["value"])
+    assert payload["app_password"] == "newpassword1234"
+
+
+def test_manage_section_remove_requires_confirmation_checkbox(tmp_path):
+    _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.delete_secret", fake_delete_secret), \
+         patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet({})})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        remove_button = next(b for b in at.button if b.key == "manage_remove_sales1")
+        assert remove_button.disabled is True  # confirm checkbox not checked yet
+
+
+def test_manage_section_remove_deletes_secret_and_updates_mapping(tmp_path):
+    _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.delete_secret", fake_delete_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: FakeSpreadsheet({})})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "manage_confirm_remove_sales1")
+        confirm_checkbox.set_value(True)
+        at.run()
+
+        remove_button = next(b for b in at.button if b.key == "manage_remove_sales1")
+        remove_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Remove raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["delete_secret_calls"] == ["EMAIL_ACCOUNT_SLOT_1"]
+
+    import yaml as _yaml
+    mapping_commit = commits_captured["commits"][0]
+    written_mapping = _yaml.safe_load(mapping_commit["content"].decode("utf-8"))
+    assert "sales1" not in written_mapping
 
 
 def _campaigns_page_fake_ws():
