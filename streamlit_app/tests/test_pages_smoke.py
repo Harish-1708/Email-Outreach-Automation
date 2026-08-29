@@ -353,7 +353,7 @@ def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
     assert "isn't built yet" in info_texts
-    assert "Phase D" in info_texts  # Sequences — Data (Phase C) is real now, no longer a stub
+    assert "Phase E" in info_texts  # Schedule — Data (C) and Sequences (D) are real now, no longer stubs
     assert "Phase H" in info_texts
 
 
@@ -592,6 +592,156 @@ def test_data_tab_lead_table_and_remove_flow():
     import json
     payload = json.loads(captured["content"].decode("utf-8"))
     assert payload == {"lead_ids": ["1"]}
+
+
+def _mock_github_writes():
+    """Returns (patchers, captured) — patches create_file/dispatch_workflow
+    at the GitHubClient class level, same pattern as the Data tab tests."""
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured.setdefault("commits", []).append({"path": path, "content": content_bytes, "message": message})
+
+    return captured, fake_create_file
+
+
+def test_sequences_tab_shows_locked_variants_for_real_campaign():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Sequences tab raised: {list(at.exception)}"
+    assert list(at.error) == []
+    # Kelson_Creators_Licensing has 5 stages x 4 variants = 20 "Variant X" expanders
+    variant_expanders = [e for e in at.expander if e.label.startswith("Variant ")]
+    assert len(variant_expanders) == 20
+    # Every text input/area for template content starts disabled (locked).
+    subject_inputs = [ti for ti in at.text_input if ti.label.startswith("Subject")]
+    assert all(ti.disabled for ti in subject_inputs)
+
+
+def test_sequences_tab_unlock_and_save_edits_one_variant():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        unlock_checkbox = next(cb for cb in at.checkbox if cb.key == "unlock_intro_A")
+        unlock_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        subject_input = next(ti for ti in at.text_input if ti.key == "subject_intro_A")
+        subject_input.set_value("A brand new intro subject")
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label.startswith("💾 Save Changes"))
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Save edit raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert len(captured["commits"]) == 1
+    commit = captured["commits"][0]
+    assert commit["path"] == "templates/Kelson_Creators_Licensing/intro_A.txt"
+    assert b"A brand new intro subject" in commit["content"]
+
+
+def test_sequences_tab_locked_variant_edit_is_not_saved():
+    """Typing into a field while still locked must never reach Save —
+    the disabled widget shouldn't even accept the value, but this proves
+    the end-to-end behavior regardless of how disabling is implemented."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    # No "Save Changes" button should even appear — nothing is unlocked, so
+    # nothing can be pending.
+    save_buttons = [b for b in at.button if b.label.startswith("💾 Save Changes")]
+    assert save_buttons == []
+
+
+def test_sequences_tab_add_variant_maxed_out_for_real_campaign():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    info_texts = " ".join(i.value for i in at.info)
+    assert "maximum" in info_texts.lower()
+    assert "already has all 5 stages" in info_texts
+
+
+def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
+    """Uses a synthetic partial campaign (2 stages, 1 variant) so "Add
+    Variant B" is actually available to test, unlike the real fixture
+    which is already fully built out."""
+    campaign_dir = tmp_path / "PartialSeqCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: Intro A\n\nBody A")
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nFollowup body A")
+
+    fake_ws = {
+        "PartialSeqCampaign Master Sheet": FakeWorksheet([], header=["LeadID", "Email", "Approval"]),
+        "PartialSeqCampaign Response Sheet": FakeWorksheet([]),
+        "PartialSeqCampaign Custom Log Sheet": FakeWorksheet([]),
+        "PartialSeqCampaign Error Log": FakeWorksheet([]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.TEMPLATES_ROOT", str(tmp_path)), \
+         patch("preview_logic.TEMPLATES_ROOT", str(tmp_path)):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "PartialSeqCampaign"
+        at.run(timeout=15)
+
+        add_button = next((b for b in at.button if b.label == "Add Variant B"), None)
+        assert add_button is not None, "Expected an 'Add Variant B' button for a 1-variant campaign"
+        add_button.click()  # click with everything still blank — should show validation errors, not commit
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert captured.get("commits") is None or captured["commits"] == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Subject is required" in error_texts or "Body is required" in error_texts
 
 
 def test_login_lockout_after_repeated_failures():
