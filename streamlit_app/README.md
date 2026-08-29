@@ -12,10 +12,10 @@ directly — no GitHub trip, no pull request to approve.
 - **🗂️ Campaigns** — the everyday view. Every phase (A–H) is now real:
   search, create a campaign inline, see status at a glance, Launch/Pause/
   Resume, and inside a campaign: Analytics, Data, Sequences, Schedule,
-  Settings, and Responses (reply directly from the app — plain text with
-  Cc/Bcc, correctly threaded into the same conversation). Images in a
-  reply, a fuller quoted-thread view, and scheduling a reply for later
-  are deliberately not built yet — see below.
+  Settings, and Responses (reply directly from the app — Cc/Bcc, file
+  attachments, correctly threaded into the same conversation). A fuller
+  quoted-thread view and scheduling a reply for later are deliberately
+  not built yet — see below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -93,11 +93,12 @@ Accounts page.
 
 ## Known limitations (by design, not bugs)
 
-- **Replying is plain text only for now.** Images and a fuller quoted
-  email-thread view (like a real inbox shows) aren't built — this only
-  shows the response's snippet and lets you send a plain-text reply. Cc,
-  Bcc, and correct threading (the lead's client shows your reply in the
-  same conversation) all work today.
+- **Replying supports file/image attachments, up to 10 MB total.** Sent
+  as regular email attachments, not inline/embedded HTML images — this
+  codebase doesn't have an HTML-email body path, so an "image in the
+  message body" the way a rich-text editor shows it isn't built. A fuller
+  quoted email-thread view (like a real inbox shows) also isn't built —
+  this only shows the response's snippet, not the full back-and-forth.
 - **No "schedule a reply for later."** Every reply sends within a minute
   or two of clicking Send — there's no deferred/scheduled send yet. That
   would need a genuinely new subsystem (a pending-sends store plus a
