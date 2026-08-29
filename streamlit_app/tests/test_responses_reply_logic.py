@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from responses_reply_logic import (
     find_lead_for_response, build_reply_defaults, build_reply_references,
     parse_email_list, validate_reply, build_reply_payload, reply_payload_path,
+    build_attachment_entries, total_attachment_size_bytes,
 )
 
 
@@ -165,6 +166,18 @@ def test_validate_reply_reports_multiple_errors_at_once():
     assert len(errors) == 5
 
 
+def test_validate_reply_rejects_oversized_attachments():
+    import outreach
+    errors = validate_reply("lead@abc.com", "Thanks!", "sales1", [], [],
+                             attachment_total_bytes=outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)
+    assert any("MB" in e for e in errors)
+
+
+def test_validate_reply_accepts_attachments_under_limit():
+    errors = validate_reply("lead@abc.com", "Thanks!", "sales1", [], [], attachment_total_bytes=100)
+    assert errors == []
+
+
 # ---------- build_reply_payload ----------
 
 def test_build_reply_payload_shape():
@@ -177,9 +190,66 @@ def test_build_reply_payload_shape():
     }
 
 
+def test_build_reply_payload_omits_attachments_key_when_none():
+    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [])
+    assert "attachments" not in payload
+
+
+def test_build_reply_payload_includes_attachments_when_given():
+    attachments = [{"filename": "photo.png", "content_base64": "ZmFrZQ=="}]
+    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [],
+                                   attachments=attachments)
+    assert payload["attachments"] == attachments
+
+
 def test_build_reply_payload_is_json_serializable():
     payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [])
     json.dumps(payload)  # raises if not serializable
+
+
+def test_build_reply_payload_with_attachments_is_json_serializable():
+    attachments = [{"filename": "photo.png", "content_base64": "ZmFrZQ=="}]
+    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [],
+                                   attachments=attachments)
+    json.dumps(payload)
+
+
+class _FakeUploadedFile:
+    def __init__(self, name, content):
+        self.name = name
+        self._content = content
+
+    def getvalue(self):
+        return self._content
+
+
+def test_build_attachment_entries_encodes_correctly():
+    files = [_FakeUploadedFile("photo.png", b"fake-png-bytes")]
+    entries = build_attachment_entries(files)
+    assert len(entries) == 1
+    assert entries[0]["filename"] == "photo.png"
+    import base64
+    assert base64.b64decode(entries[0]["content_base64"]) == b"fake-png-bytes"
+
+
+def test_build_attachment_entries_multiple_files():
+    files = [_FakeUploadedFile("a.png", b"aaa"), _FakeUploadedFile("b.png", b"bbb")]
+    entries = build_attachment_entries(files)
+    assert len(entries) == 2
+    assert {e["filename"] for e in entries} == {"a.png", "b.png"}
+
+
+def test_build_attachment_entries_empty_list():
+    assert build_attachment_entries([]) == []
+
+
+def test_total_attachment_size_bytes_sums_correctly():
+    files = [_FakeUploadedFile("a.png", b"x" * 100), _FakeUploadedFile("b.png", b"x" * 50)]
+    assert total_attachment_size_bytes(files) == 150
+
+
+def test_total_attachment_size_bytes_empty_list():
+    assert total_attachment_size_bytes([]) == 0
 
 
 # ---------- reply_payload_path ----------
