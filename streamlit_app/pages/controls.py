@@ -6,6 +6,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from page_state import mark_active_page  # noqa: E402
 from auth import login_gate, current_user  # noqa: E402
 from config import WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
@@ -18,6 +19,8 @@ from replies_logic import most_recent_responses  # noqa: E402
 
 # Page config is set once, centrally, in app.py via st.navigation/st.Page —
 # calling st.set_page_config here too would raise an error.
+
+mark_active_page("controls")
 
 if not login_gate():
     st.stop()
