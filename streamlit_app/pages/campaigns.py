@@ -38,6 +38,11 @@ from schedule_logic import (  # noqa: E402
     validate_schedule, build_updated_schedule_override, get_current_schedule,
     timezone_display_name, COMMON_TIMEZONES, DAY_OPTIONS,
 )
+from launch_logic import build_status_override  # noqa: E402
+from campaign_status_logic import (  # noqa: E402
+    compute_campaign_status, compute_campaign_readiness, status_label,
+    STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_ATTENTION,
+)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -210,7 +215,7 @@ def _new_campaign_dialog(existing_campaigns):
 # =============================================================================
 # Hub view — list, search, click into a campaign
 # =============================================================================
-def _render_hub():
+def _render_hub(just_arrived: bool):
     st.title("Campaigns")
 
     col1, col2 = st.columns([3, 1])
@@ -234,9 +239,10 @@ def _render_hub():
         # since session_state is shared across the whole app — without the
         # check below, the dialog would silently reopen every time you
         # returned to this page, even long after you closed it. Only reset
-        # it on a genuine arrival at this page (mark_active_page), never
-        # on a rerun caused by a widget inside the dialog itself.
-        if mark_active_page("campaigns"):
+        # it on a genuine arrival at this page (just_arrived, computed once
+        # at module level via mark_active_page), never on a rerun caused by
+        # a widget inside the dialog itself.
+        if just_arrived:
             st.session_state["show_new_campaign_dialog"] = False
         if st.session_state["show_new_campaign_dialog"]:
             try:
@@ -743,7 +749,82 @@ def _render_stub_tab(tab_name: str, phase_letter: str):
     )
 
 
-def _render_campaign_detail(campaign_name: str):
+def _update_campaign_status(campaign_name: str, new_status: str) -> bool:
+    """Returns True on success. Clears the hub cache too, so the status
+    badge on the campaign LIST reflects this once the redeploy delay has
+    passed — same "may take a minute" caveat as every other config write
+    in this app."""
+    try:
+        raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+        updated = build_status_override(raw_override, new_status)
+        client = _get_github_client()
+        client.create_file(
+            override_file_path(campaign_name), override_to_yaml_bytes(updated),
+            message=f"Set status={new_status} for {campaign_name} (via Streamlit, by {current_user()})",
+        )
+        _load_hub_rows.clear()
+        return True
+    except GitHubActionsError as exc:
+        st.error(f"Failed to update status: {exc}")
+        return False
+
+
+def _render_status_controls(campaign_cfg, leads, just_arrived: bool):
+    campaign_name = campaign_cfg["_campaign_name"]
+    status, problems = compute_campaign_status(campaign_cfg, leads)
+
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.subheader(status_label(status))
+        if problems:
+            st.caption("⚠️ " + " · ".join(problems))
+
+    launch_confirm_key = "show_launch_confirm"
+    if launch_confirm_key not in st.session_state:
+        st.session_state[launch_confirm_key] = False
+    if just_arrived:
+        # Same lesson as the New Campaign dialog: a confirmation box driven
+        # by a sticky session_state flag must be reset on genuine
+        # navigation, or it silently reappears on a later, unrelated visit.
+        st.session_state[launch_confirm_key] = False
+
+    with col2:
+        if status == STATUS_DRAFT:
+            if st.button("🚀 Launch", type="primary"):
+                st.session_state[launch_confirm_key] = True
+        elif status in (STATUS_RUNNING, STATUS_ATTENTION):
+            if st.button("⏸ Pause"):
+                if _update_campaign_status(campaign_name, "paused"):
+                    st.success("Paused. May take a minute to reflect here while the app redeploys.")
+        elif status == STATUS_PAUSED:
+            if st.button("▶ Resume"):
+                if _update_campaign_status(campaign_name, "active"):
+                    st.success("Resumed. May take a minute to reflect here while the app redeploys.")
+
+    if status == STATUS_DRAFT and st.session_state[launch_confirm_key]:
+        ready, launch_problems = compute_campaign_readiness(campaign_cfg, leads)
+        st.warning(
+            "**Launch this campaign?** This makes it active and allows Send Batch to run for it "
+            "(still respecting its schedule and daily limits, if any)."
+        )
+        if not ready:
+            st.caption(
+                "Heads up, not a blocker: " + ", ".join(launch_problems) +
+                " — Send simply won't do anything until this is resolved."
+            )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("Confirm Launch", type="primary", key="confirm_launch_button"):
+                if _update_campaign_status(campaign_name, "active"):
+                    st.session_state[launch_confirm_key] = False
+                    st.success("Launched. May take a minute to reflect here while the app redeploys.")
+        with confirm_col2:
+            if st.button("Cancel", key="cancel_launch_button"):
+                st.session_state[launch_confirm_key] = False
+                st.rerun()
+
+
+def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     col1, col2 = st.columns([4, 1])
     with col1:
         if st.button("← Back to Campaigns"):
@@ -773,6 +854,9 @@ def _render_campaign_detail(campaign_name: str):
             st.warning(f"Couldn't load Sheet data yet: {exc}")
             leads, responses, send_log, error_log = [], [], [], []
 
+    _render_status_controls(campaign_cfg, leads, just_arrived)
+    st.divider()
+
     tabs = st.tabs(["📊 Analytics", "📋 Data", "✉️ Sequences", "📅 Schedule", "⚙️ Settings", "💬 Responses"])
     with tabs[0]:
         _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log)
@@ -789,8 +873,15 @@ def _render_campaign_detail(campaign_name: str):
 
 
 # =============================================================================
+# Called exactly once per page visit, before branching into hub vs detail —
+# both the New Campaign dialog (hub) and the Launch confirmation (detail)
+# rely on this to tell "just arrived here from elsewhere" apart from "still
+# interacting with something on this page", regardless of which of the two
+# views is currently showing.
+_just_arrived = mark_active_page("campaigns")
+
 selected = st.session_state.get("selected_campaign")
 if selected:
-    _render_campaign_detail(selected)
+    _render_campaign_detail(selected, _just_arrived)
 else:
-    _render_hub()
+    _render_hub(_just_arrived)
