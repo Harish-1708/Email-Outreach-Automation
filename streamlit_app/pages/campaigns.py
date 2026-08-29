@@ -8,7 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
 from page_state import mark_active_page  # noqa: E402
-from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, TEMPLATES_ROOT, CAMPAIGNS_DIR  # noqa: E402
+from config import (  # noqa: E402
+    WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, WORKFLOW_SEND_REPLY,
+    TEMPLATES_ROOT, CAMPAIGNS_DIR,
+)
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
@@ -39,6 +42,10 @@ from schedule_logic import (  # noqa: E402
     timezone_display_name, COMMON_TIMEZONES, DAY_OPTIONS,
 )
 from launch_logic import build_status_override  # noqa: E402
+from responses_reply_logic import (  # noqa: E402
+    find_lead_for_response, build_reply_defaults, parse_email_list, validate_reply,
+    build_reply_payload, reply_payload_path,
+)
 from campaign_status_logic import (  # noqa: E402
     compute_campaign_status, compute_campaign_readiness, status_label,
     STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_ATTENTION,
@@ -742,11 +749,68 @@ def _render_schedule_tab(campaign_cfg):
                 st.error(f"Save failed: {exc}")
 
 
-def _render_stub_tab(tab_name: str, phase_letter: str):
-    st.info(
-        f"**{tab_name} isn't built yet.** This is planned as Phase {phase_letter} — see the Campaigns Hub "
-        "plan for what it'll do. For now, use the Controls / New Campaign pages directly for this campaign."
+def _render_responses_tab(campaign_cfg, leads, responses):
+    campaign_name = campaign_cfg["_campaign_name"]
+
+    if not responses:
+        st.info("No responses yet.")
+        return
+
+    st.caption(
+        "Replying here sends a real email, through the same threaded headers your automated sequence "
+        "uses — the lead's client will show it in the same conversation. Images and a fuller quoted-thread "
+        "view aren't built yet; this is plain text for now."
     )
+
+    sorted_responses = sorted(responses, key=lambda r: r.get("ReceivedAt", ""), reverse=True)
+    for response in sorted_responses:
+        lead = find_lead_for_response(response, leads)
+        label = f"{response.get('From', '(unknown sender)')} — {response.get('Subject', '(no subject)')}"
+        with st.container(border=True):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"**{label}**")
+                st.caption(f"{response.get('ReceivedAt', '')} · {response.get('Classification', '')}")
+            with col2:
+                st.caption(response.get("ActionTaken", ""))
+            st.write(response.get("Snippet", ""))
+
+            reply_key_suffix = response.get("ResponseID") or response.get("MessageID") or label
+            with st.expander("↩️ Reply"):
+                defaults = build_reply_defaults(response, lead)
+                to_email = st.text_input("To", value=defaults["to"], key=f"reply_to_{reply_key_suffix}")
+                subject = st.text_input("Subject", value=defaults["subject"], key=f"reply_subject_{reply_key_suffix}")
+                cc_raw = st.text_input("Cc (comma-separated)", key=f"reply_cc_{reply_key_suffix}")
+                bcc_raw = st.text_input("Bcc (comma-separated)", key=f"reply_bcc_{reply_key_suffix}")
+                body = st.text_area("Message", key=f"reply_body_{reply_key_suffix}", height=150)
+                if defaults["sender_account"]:
+                    st.caption(f"Sending as: {defaults['sender_account']}")
+                else:
+                    st.caption("⚠️ Couldn't find this lead's sender account — check the Master Sheet.")
+
+                if st.button("Send Reply", type="primary", key=f"send_reply_{reply_key_suffix}"):
+                    cc = parse_email_list(cc_raw)
+                    bcc = parse_email_list(bcc_raw)
+                    errors = validate_reply(to_email, body, defaults["sender_account"], cc, bcc)
+                    if errors:
+                        for e in errors:
+                            st.error(e)
+                    else:
+                        try:
+                            payload = build_reply_payload(response, lead, defaults["sender_account"], subject,
+                                                           body, cc, bcc)
+                            path = reply_payload_path(campaign_name, response.get("ResponseID", "unknown"))
+                            client = _get_github_client()
+                            client.create_file(
+                                path, payload_to_bytes(payload),
+                                message=f"Send reply for {campaign_name} (via Streamlit, by {current_user()})",
+                            )
+                            time.sleep(1)
+                            client.dispatch_workflow(WORKFLOW_SEND_REPLY,
+                                                      {"campaign": campaign_name, "payload_path": path})
+                            st.success("Reply queued — it'll be sent within a minute or two.")
+                        except GitHubActionsError as exc:
+                            st.error(f"Failed to send: {exc}")
 
 
 def _update_campaign_status(campaign_name: str, new_status: str) -> bool:
@@ -869,7 +933,7 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     with tabs[4]:
         _render_settings_tab(campaign_cfg)
     with tabs[5]:
-        _render_stub_tab("Responses (inbox, reply-from-app)", "H")
+        _render_responses_tab(campaign_cfg, leads, responses)
 
 
 # =============================================================================
