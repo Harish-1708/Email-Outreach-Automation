@@ -31,7 +31,6 @@ st.caption(
     "GitHub Actions; this app never has access to them."
 )
 
-
 @st.cache_resource(show_spinner=False)
 def _get_connector() -> ReadOnlySheetsConnector:
     sa_info = dict(st.secrets["google_sheets_readonly"]["service_account_json"])
@@ -73,14 +72,17 @@ def _load_send_logs(campaign_names):
     return logs, unavailable
 
 
-send_logs_by_campaign, unavailable_campaigns = _load_send_logs(tuple(campaigns))
-sent_today_by_account = aggregate_sent_today_by_account(send_logs_by_campaign)
-
-
 @st.cache_data(ttl=120, show_spinner=False)
 def _load_account_health():
     return _get_connector().get_account_health()
 
+
+if st.button("🔄 Refresh"):
+    _load_send_logs.clear()
+    _load_account_health.clear()
+
+send_logs_by_campaign, unavailable_campaigns = _load_send_logs(tuple(campaigns))
+sent_today_by_account = aggregate_sent_today_by_account(send_logs_by_campaign)
 
 health_records = _load_account_health()
 health_lookup = build_health_lookup(health_records)
