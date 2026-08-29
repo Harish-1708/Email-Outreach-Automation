@@ -79,7 +79,7 @@ def test_dashboard_page_renders_without_exceptions():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "1_📊_Dashboard.py"))
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "dashboard.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
@@ -110,7 +110,7 @@ def test_controls_page_renders_without_exceptions():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "2_🚀_Controls.py"))
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "controls.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
@@ -141,7 +141,7 @@ def test_controls_check_replies_labels_stopped_vs_logged_only_correctly():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "2_🚀_Controls.py"))
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "controls.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
@@ -153,7 +153,7 @@ def test_controls_check_replies_labels_stopped_vs_logged_only_correctly():
 
 
 def test_new_campaign_page_renders_without_exceptions():
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "3_➕_New_Campaign.py"))
+    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
     at.secrets.update(_dashboard_secrets())
     for k, v in _authed_session().items():
         at.session_state[k] = v
@@ -162,12 +162,35 @@ def test_new_campaign_page_renders_without_exceptions():
     assert list(at.exception) == [], f"New Campaign page raised: {list(at.exception)}"
     assert list(at.error) == [], f"New Campaign page showed an error: {[e.value for e in at.error]}"
     assert len(at.text_input) >= 1
+    # Direct-commit — no "go merge this" instruction should remain anywhere.
+    all_text = " ".join(m.value for m in at.markdown).lower()
+    assert "merge" not in all_text
+    assert "no github trip" in all_text
+
+
+def test_new_campaign_submit_button_disabled_until_confirmation_checked():
+    """The confirm checkbox is the ONLY remaining safety net now that
+    there's no GitHub trip — this must actually gate the button, not just
+    be decorative."""
+    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
+    at.secrets.update(_dashboard_secrets())
+    for k, v in _authed_session().items():
+        at.session_state[k] = v
+    at.run()
+
+    create_button = next(b for b in at.button if b.label == "Create Campaign")
+    assert create_button.disabled is True
+
+    at.checkbox[0].set_value(True)
+    at.run()
+    create_button = next(b for b in at.button if b.label == "Create Campaign")
+    assert create_button.disabled is False
 
 
 def test_new_campaign_page_add_stage_mode_shows_next_stage_for_real_campaign():
     """Kelson_Creators_Licensing already has all 5 stages in the repo
     fixture — selecting it in "Add stage" mode should say so, not error."""
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "3_➕_New_Campaign.py"))
+    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
     at.secrets.update(_dashboard_secrets())
     for k, v in _authed_session().items():
         at.session_state[k] = v
@@ -197,7 +220,7 @@ def test_overview_page_renders_without_exceptions():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "4_📈_Overview.py"))
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "overview.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
@@ -208,6 +231,43 @@ def test_overview_page_renders_without_exceptions():
     metric_values = [m.value for m in at.metric]
     assert "1" in metric_values  # Total Sent from the fake Send Log row
     assert "1" in metric_values  # Total Pending: 1 lead sent, 1 not yet contacted
+
+
+def test_email_accounts_page_renders_without_exceptions():
+    fake_ws = {
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+            [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
+        ),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    secrets = _dashboard_secrets()
+    secrets["email_accounts_directory"] = {"sales1": "sales1@example.com", "sales2": "sales2@example.com"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+    assert list(at.exception) == [], f"Email Accounts page raised: {list(at.exception)}"
+    assert list(at.error) == [], f"Email Accounts page showed an error: {[e.value for e in at.error]}"
+    metric_labels = [m.label for m in at.metric]
+    assert any("sales1" in label for label in metric_labels)
+    assert any("sales2" in label for label in metric_labels)
+
+
+def test_email_accounts_page_warns_when_no_directory_configured():
+    at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+    at.secrets.update(_dashboard_secrets())  # no email_accounts_directory key
+    for k, v in _authed_session().items():
+        at.session_state[k] = v
+    at.run()
+
+    assert list(at.exception) == []
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "No accounts configured" in warning_texts
 
 
 def test_login_lockout_after_repeated_failures():
@@ -240,7 +300,7 @@ def test_pages_require_login_when_not_authenticated():
     """Every page must call login_gate() and stop — verified here by NOT
     setting auth_user and confirming the page doesn't render its main
     content (Dashboard title never appears)."""
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "1_📊_Dashboard.py"))
+    at = AppTest.from_file(os.path.join(PAGES_DIR, "dashboard.py"))
     at.secrets.update(_dashboard_secrets())
     at.run()
 
