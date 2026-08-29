@@ -101,10 +101,14 @@ def test_find_recent_run_returns_none_when_empty(monkeypatch):
 def test_commit_campaign_files_directly_writes_every_file_to_main(monkeypatch):
     calls = []
 
+    def fake_get(url, headers=None, timeout=None, params=None):
+        return _fake_response(404)  # neither file exists yet — brand new
+
     def fake_put(url, json=None, headers=None, timeout=None):
         calls.append((url, json))
         return _fake_response(201, {})
 
+    monkeypatch.setattr(github_client.requests, "get", fake_get)
     monkeypatch.setattr(github_client.requests, "put", fake_put)
 
     client = _client()
@@ -120,13 +124,15 @@ def test_commit_campaign_files_directly_writes_every_file_to_main(monkeypatch):
     assert calls[0][0].endswith("/contents/templates/Foo/intro_A.txt")
     assert calls[0][1]["branch"] == "main"
     assert calls[0][1]["message"] == "Add campaign: Foo"
+    assert "sha" not in calls[0][1]  # new file — no sha should be sent
     assert calls[1][0].endswith("/contents/templates/Foo/intro_B.txt")
 
 
 def test_commit_campaign_files_directly_raises_on_first_failure(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
     monkeypatch.setattr(github_client.requests, "put",
                          lambda *a, **kw: _fake_response(422, text="Invalid content"))
-    with pytest.raises(GitHubActionsError, match="Failed to create file"):
+    with pytest.raises(GitHubActionsError, match="Failed to create/update file"):
         _client().commit_campaign_files_directly(
             files=[{"path": "templates/Foo/intro_A.txt", "content": b"bad"}],
             commit_message="Add campaign: Foo",
@@ -135,6 +141,7 @@ def test_commit_campaign_files_directly_raises_on_first_failure(monkeypatch):
 
 def test_create_file_defaults_to_main_branch(monkeypatch):
     captured = {}
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
 
     def fake_put(url, json=None, headers=None, timeout=None):
         captured["json"] = json
@@ -147,6 +154,7 @@ def test_create_file_defaults_to_main_branch(monkeypatch):
 
 def test_create_file_encodes_content_as_base64(monkeypatch):
     captured = {}
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
 
     def fake_put(url, json=None, headers=None, timeout=None):
         captured["json"] = json
@@ -160,6 +168,69 @@ def test_create_file_encodes_content_as_base64(monkeypatch):
 
 
 def test_create_file_raises_on_error_status(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
     monkeypatch.setattr(github_client.requests, "put", lambda *a, **kw: _fake_response(422, text="bad"))
-    with pytest.raises(GitHubActionsError, match="Failed to create file"):
+    with pytest.raises(GitHubActionsError, match="Failed to create/update file"):
         _client().create_file("templates/Foo/intro_A.txt", b"content", "msg", "main")
+
+
+# ---------- get_file_sha / create_file updating an EXISTING file ----------
+# The real regression this covers: editing a template or updating campaign
+# settings writes to a path that already exists. GitHub's contents API
+# requires the current file's sha for that (a create-only payload gets a
+# 422). This was missed originally because tests mocked create_file
+# wholesale rather than exercising this real API contract.
+
+def test_get_file_sha_returns_sha_when_file_exists(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(200, {"sha": "abc123"}))
+    assert _client().get_file_sha("templates/Foo/intro_A.txt") == "abc123"
+
+
+def test_get_file_sha_returns_none_when_file_does_not_exist(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
+    assert _client().get_file_sha("templates/Foo/intro_A.txt") is None
+
+
+def test_get_file_sha_raises_on_other_error_status(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(401, text="Bad credentials"))
+    with pytest.raises(GitHubActionsError, match="Failed to check existing file"):
+        _client().get_file_sha("templates/Foo/intro_A.txt")
+
+
+def test_create_file_includes_sha_when_file_already_exists(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(200, {"sha": "existing-sha"}))
+
+    def fake_put(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _fake_response(200, {})
+
+    monkeypatch.setattr(github_client.requests, "put", fake_put)
+    _client().create_file("templates/Foo/intro_A.txt", b"updated content", "Edit intro_A")
+    assert captured["json"]["sha"] == "existing-sha"
+
+
+def test_create_file_omits_sha_when_file_is_new(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
+
+    def fake_put(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _fake_response(201, {})
+
+    monkeypatch.setattr(github_client.requests, "put", fake_put)
+    _client().create_file("templates/Foo/intro_A.txt", b"new content", "Create intro_A")
+    assert "sha" not in captured["json"]
+
+
+def test_create_file_passes_correct_ref_when_checking_existing_sha(monkeypatch):
+    captured = {}
+
+    def fake_get(url, headers=None, timeout=None, params=None):
+        captured["params"] = params
+        return _fake_response(404)
+
+    monkeypatch.setattr(github_client.requests, "get", fake_get)
+    monkeypatch.setattr(github_client.requests, "put", lambda *a, **kw: _fake_response(201, {}))
+    _client().create_file("templates/Foo/intro_A.txt", b"content", "msg", branch="a-feature-branch")
+    assert captured["params"] == {"ref": "a-feature-branch"}
