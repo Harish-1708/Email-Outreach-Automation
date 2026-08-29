@@ -44,7 +44,7 @@ from schedule_logic import (  # noqa: E402
 from launch_logic import build_status_override  # noqa: E402
 from responses_reply_logic import (  # noqa: E402
     find_lead_for_response, build_reply_defaults, parse_email_list, validate_reply,
-    build_reply_payload, reply_payload_path,
+    build_reply_payload, reply_payload_path, build_attachment_entries, total_attachment_size_bytes,
 )
 from campaign_status_logic import (  # noqa: E402
     compute_campaign_status, compute_campaign_readiness, status_label,
@@ -758,8 +758,8 @@ def _render_responses_tab(campaign_cfg, leads, responses):
 
     st.caption(
         "Replying here sends a real email, through the same threaded headers your automated sequence "
-        "uses — the lead's client will show it in the same conversation. Images and a fuller quoted-thread "
-        "view aren't built yet; this is plain text for now."
+        "uses — the lead's client will show it in the same conversation. You can attach images or files; "
+        "a fuller quoted-thread view and scheduling a reply for later aren't built yet."
     )
 
     sorted_responses = sorted(responses, key=lambda r: r.get("ReceivedAt", ""), reverse=True)
@@ -783,6 +783,14 @@ def _render_responses_tab(campaign_cfg, leads, responses):
                 cc_raw = st.text_input("Cc (comma-separated)", key=f"reply_cc_{reply_key_suffix}")
                 bcc_raw = st.text_input("Bcc (comma-separated)", key=f"reply_bcc_{reply_key_suffix}")
                 body = st.text_area("Message", key=f"reply_body_{reply_key_suffix}", height=150)
+                uploaded_files = st.file_uploader(
+                    "Attach images or files (optional)", accept_multiple_files=True,
+                    key=f"reply_attachments_{reply_key_suffix}",
+                )
+                if uploaded_files:
+                    total_bytes = total_attachment_size_bytes(uploaded_files)
+                    st.caption(f"{len(uploaded_files)} file(s), {total_bytes / (1024*1024):.1f} MB total "
+                               f"(limit: {outreach.MAX_TOTAL_ATTACHMENT_BYTES / (1024*1024):.0f} MB)")
                 if defaults["sender_account"]:
                     st.caption(f"Sending as: {defaults['sender_account']}")
                 else:
@@ -791,14 +799,17 @@ def _render_responses_tab(campaign_cfg, leads, responses):
                 if st.button("Send Reply", type="primary", key=f"send_reply_{reply_key_suffix}"):
                     cc = parse_email_list(cc_raw)
                     bcc = parse_email_list(bcc_raw)
-                    errors = validate_reply(to_email, body, defaults["sender_account"], cc, bcc)
+                    attachment_bytes = total_attachment_size_bytes(uploaded_files) if uploaded_files else 0
+                    errors = validate_reply(to_email, body, defaults["sender_account"], cc, bcc,
+                                             attachment_total_bytes=attachment_bytes)
                     if errors:
                         for e in errors:
                             st.error(e)
                     else:
                         try:
+                            attachments = build_attachment_entries(uploaded_files) if uploaded_files else None
                             payload = build_reply_payload(response, lead, defaults["sender_account"], subject,
-                                                           body, cc, bcc)
+                                                           body, cc, bcc, attachments=attachments)
                             path = reply_payload_path(campaign_name, response.get("ResponseID", "unknown"))
                             client = _get_github_client()
                             client.create_file(
