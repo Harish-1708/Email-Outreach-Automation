@@ -270,6 +270,106 @@ def test_email_accounts_page_warns_when_no_directory_configured():
     assert "No accounts configured" in warning_texts
 
 
+def _campaigns_page_fake_ws():
+    return {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [{"Email": "a@abc.com", "Approval": "Yes", "IntroSentAt": "2026-08-01 09:00:00",
+              "IntroVariant": "A", "SenderAccount": "sales1",
+              "FollowUp1SentAt": "", "FollowUp1Variant": "", "Status": ""}]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+            [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
+        ),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+
+
+def test_campaigns_hub_page_renders_without_exceptions():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Campaigns hub raised: {list(at.exception)}"
+    assert list(at.error) == [], f"Campaigns hub showed an error: {[e.value for e in at.error]}"
+    titles = [t.value for t in at.title]
+    assert "Campaigns" in titles
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Kelson_Creators_Licensing" in markdown_text
+
+
+def test_campaigns_detail_view_renders_analytics_without_exceptions():
+    """Directly sets selected_campaign in session_state, bypassing the
+    click — proves the detail view + Analytics tab (Phase B, real data,
+    not a stub) work end to end against realistic Sheet data."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Campaign detail raised: {list(at.exception)}"
+    assert list(at.error) == [], f"Campaign detail showed an error: {[e.value for e in at.error]}"
+    titles = [t.value for t in at.title]
+    assert "Kelson_Creators_Licensing" in titles
+    assert len(at.tabs) == 6
+    # Real analytics data should show up as metrics, not just tab labels.
+    metric_values = [m.value for m in at.metric]
+    assert "1" in metric_values  # Total Leads == 1
+
+
+def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    info_texts = " ".join(i.value for i in at.info)
+    assert "isn't built yet" in info_texts
+    assert "Phase C" in info_texts
+    assert "Phase H" in info_texts
+
+
+def test_campaigns_back_button_clears_selected_campaign():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        back_button = next(b for b in at.button if "Back to Campaigns" in b.label)
+        back_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert "selected_campaign" not in at.session_state
+    titles = [t.value for t in at.title]
+    assert "Campaigns" in titles
+
+
 def test_login_lockout_after_repeated_failures():
     from auth import hash_password
 
