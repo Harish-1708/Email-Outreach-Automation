@@ -9,29 +9,25 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
-- **🗂️ Campaigns** — the everyday view. Every phase (A–H) is now real:
-  search, create a campaign inline, see status at a glance, Launch/Pause/
-  Resume, and inside a campaign: Analytics, Preview, Data, Sequences
-  (+ ThreadSubject Maintenance at the bottom), Schedule, Settings
-  (+ Send at the bottom), and Responses (+ Check Replies at the top,
-  reply directly from the app — Cc/Bcc, file attachments, correctly
-  threaded into the same conversation). Each action lives with the thing
-  it's most related to, rather than grouped into its own separate tab —
-  Send sits with sending config, Check Replies sits with the replies
-  themselves. A fuller quoted-thread view and scheduling a reply for
-  later are deliberately
-  not built yet — see below.
+- **🗂️ Campaigns** — the everyday view, and the only page you need for
+  day-to-day work. Every phase (A–H) is now real: search, create a
+  campaign inline, see status at a glance, Launch/Pause/Resume, and
+  inside a campaign: Analytics, Preview, Data, Sequences (+ ThreadSubject
+  Maintenance at the bottom), Schedule, Settings (+ Send at the bottom,
+  only available while the campaign is actually Running), and Responses
+  (+ Check Replies at the top, reply directly from the app — Cc/Bcc, file
+  attachments, correctly threaded into the same conversation). Each
+  action lives with the thing it's most related to, rather than grouped
+  into its own separate tab — Send sits with sending config, Check
+  Replies sits with the replies themselves. A fuller quoted-thread view
+  and scheduling a reply for later are deliberately not built yet — see
+  below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
   Viewer-scoped Google credential and the exact same
   `outreach.compute_campaign_dashboard` math the Sheet's own Dashboard tab
   uses, so the two always agree.
-- **🚀 Controls** — Preview (instant, in-app, nothing sent/written), Send
-  (triggers `send_batch.yml`, requires typing `SEND`), Check Replies
-  (triggers `check_replies.yml`, plus a live view of recent replies read
-  straight from the Response Sheet), Maintenance (the ThreadSubject
-  backfill tool).
 - **📧 Email Accounts** — which sender accounts are configured, how much
   each has sent today across all campaigns, and their live connection
   status (🟢 Connected / 🔴 Disconnected with a reason / ⚪ Unknown before
@@ -236,10 +232,6 @@ Remove buttons on the Email Accounts page instead:
   "Approval" column you didn't map — approve them in the Data tab (or the
   Master Sheet directly) before they're eligible to send.
 
-- **The Campaigns Hub's Data/Sequences/Schedule/Settings/Responses tabs
-  are placeholders.** Only Analytics is real. Use Controls/New Campaign
-  directly for anything those tabs would eventually cover — see
-  `campaigns-hub-plan.md` for the phase each one is planned for.
 - **A campaign's `status` (draft/active/paused) lives in its config
   override file** (`config/campaigns/<name>.yaml`), not the Sheet.
   Pausing/resuming currently means editing that file directly (a proper
@@ -314,28 +306,33 @@ Actions. Go through it in order; each step depends on the one before it.
 - [ ] "Refresh now" actually re-fetches (change something in the Sheet by
       hand, confirm it shows up after refresh, not just after 30s).
 
-**Controls — Preview (safe, nothing is sent)**
+**Campaigns — Preview tab (safe, nothing is sent)**
 - [ ] Preview returns the same eligible leads and rendered content you'd
       get from `python outreach.py preview` locally, for the same
       campaign/stage/batch size.
 - [ ] A lead with `Approval` blank or `No` correctly does NOT appear.
 
-**Controls — Send (uses a REAL test campaign / low batch size for this)**
+**Campaigns — Settings tab's Send section (uses a REAL test campaign /
+low daily limit for this)**
+- [ ] Send is only offered while the campaign's status is 🟢 Running —
+      switch it to Draft/Paused and confirm the Send button disappears,
+      replaced by an explanation, with nothing dispatched.
 - [ ] Submitting without typing `SEND` is rejected — no dispatch call
       happens (check the repo's Actions tab: no new run appears).
-- [ ] Typing `SEND` and clicking Send actually triggers a real
+- [ ] Typing `SEND` and clicking Send Batch actually triggers a real
       `send_batch.yml` run — confirm in the repo's Actions tab.
 - [ ] "Refresh run status" reflects real progress (queued → in_progress →
       completed).
 - [ ] The Sheet's Send Log gets the new row(s) after the run completes,
-      and the Dashboard page reflects them after "Refresh now".
+      and the Analytics tab reflects them after "🔄 Refresh data".
 
-**Controls — Check Replies**
+**Campaigns — Responses tab's Check Replies section**
 - [ ] Triggers a real `check_replies.yml` run, visible in the Actions tab.
-- [ ] The "Recent replies" list shows real Response Sheet rows, with
-      `ActionTaken` clearly labeled when a reply did NOT stop the sequence.
+- [ ] The reply list shows real Response Sheet rows, with `ActionTaken`
+      clearly labeled (🛑 vs 📝, "NOT stopped") when a reply did NOT stop
+      the sequence.
 
-**Controls — Maintenance (Backfill)**
+**Campaigns — Sequences tab's Maintenance section (Backfill)**
 - [ ] Dry run shows what would be backfilled without writing anything.
 - [ ] Turning off dry run and re-running actually writes `ThreadSubject`
       values to the Master Sheet.
