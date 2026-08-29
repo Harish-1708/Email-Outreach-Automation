@@ -79,16 +79,38 @@ class GitHubClient:
     # remaining safety net is the in-app confirmation the Streamlit page
     # requires before calling this — see campaign_builder.py.
 
+    def get_file_sha(self, path: str, ref: str = "main") -> Optional[str]:
+        """Current SHA of the file at `path` on `ref`, or None if it
+        doesn't exist yet. GitHub's contents API requires this SHA when
+        updating an existing file — omitting it (as an earlier version of
+        create_file did) works fine for brand-new files but is rejected
+        with a 422 for anything that already exists, which is exactly
+        what editing a template or updating campaign settings does."""
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/contents/{path}"
+        resp = requests.get(url, headers=self._headers, params={"ref": ref}, timeout=self.timeout)
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise GitHubActionsError(f"Failed to check existing file '{path}': {resp.status_code} {resp.text[:300]}")
+        return resp.json().get("sha")
+
     def create_file(self, path: str, content_bytes: bytes, message: str, branch: str = "main") -> None:
+        """Creates OR updates a file at `path`. Every write in this app —
+        new templates, edited templates, campaign settings — goes through
+        this one method, so fetching the current SHA here (when the file
+        already exists) fixes update-in-place for all of them at once."""
+        existing_sha = self.get_file_sha(path, ref=branch)
         url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/contents/{path}"
         payload = {
             "message": message,
             "content": base64.b64encode(content_bytes).decode("ascii"),
             "branch": branch,
         }
+        if existing_sha:
+            payload["sha"] = existing_sha
         resp = requests.put(url, json=payload, headers=self._headers, timeout=self.timeout)
         if resp.status_code not in (200, 201):
-            raise GitHubActionsError(f"Failed to create file '{path}': {resp.status_code} {resp.text[:300]}")
+            raise GitHubActionsError(f"Failed to create/update file '{path}': {resp.status_code} {resp.text[:300]}")
 
     def commit_campaign_files_directly(self, files: List[Dict[str, bytes]], commit_message: str,
                                         base: str = "main") -> None:
