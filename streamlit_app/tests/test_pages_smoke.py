@@ -578,7 +578,10 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
     assert list(at.error) == [], f"Campaign detail showed an error: {[e.value for e in at.error]}"
     titles = [t.value for t in at.title]
     assert "Kelson_Creators_Licensing" in titles
-    assert len(at.tabs) == 6
+    # 7 outer tabs (Analytics/Send/Data/Sequences/Schedule/Settings/Responses)
+    # + 4 nested sub-tabs inside Send (Preview/Send/Check Replies/Maintenance)
+    # = 11 total Tab elements AppTest sees across the whole page.
+    assert len(at.tabs) == 11
     # Real analytics data should show up as metrics, not just tab labels.
     metric_values = [m.value for m in at.metric]
     assert "1" in metric_values  # Total Leads == 1
@@ -1530,6 +1533,155 @@ def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_aw
 
     assert list(at.exception) == []
     assert not any(b.label == "Confirm Launch" for b in at.button)
+
+
+def test_send_tab_preview_shows_eligible_lead():
+    fake_ws = _campaigns_page_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Master Sheet"] = FakeWorksheet(
+        [{"LeadID": "1", "Email": "a@abc.com", "FirstName": "Sam", "Approval": "Yes",
+          "IntroSentAt": "", "Status": ""}]
+    )
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        preview_button = next(b for b in at.button if b.key == "campaigns_run_preview")
+        preview_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Preview raised: {list(at.exception)}"
+    assert list(at.error) == []
+    success_texts = " ".join(s.value for s in at.success)
+    assert "1 eligible lead" in success_texts
+
+
+def test_send_tab_send_batch_requires_typed_send_confirmation():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        # Click Send Batch WITHOUT typing SEND first.
+        send_button = next(b for b in at.button if b.key == "campaigns_send_batch_button")
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert "workflow" not in captured  # never actually dispatched
+    error_texts = " ".join(e.value for e in at.error)
+    assert 'You must type "SEND"' in error_texts
+
+
+def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 42, "html_url": "https://github.com/x/actions/runs/42"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_input = next(ti for ti in at.text_input if ti.key == "campaigns_send_confirm_text")
+        confirm_input.set_value("SEND")
+        at.run(timeout=15)
+
+        send_button = next(b for b in at.button if b.key == "campaigns_send_batch_button")
+        send_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Send raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["workflow"] == "send_batch.yml"
+    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    assert at.session_state["last_send_run_id"] == 42
+
+
+def test_send_tab_check_replies_dispatches_correct_workflow():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 7, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        check_button = next(b for b in at.button if b.key == "campaigns_check_replies_button")
+        check_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    assert captured["workflow"] == "check_replies.yml"
+    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+
+
+def test_send_tab_backfill_dispatches_correct_workflow_with_dry_run_default():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 9, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        backfill_button = next(b for b in at.button if b.key == "campaigns_run_backfill")
+        backfill_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    assert captured["workflow"] == "backfill_thread_subject.yml"
+    assert captured["inputs"]["dry_run"] == "true"  # dry_run checkbox defaults to True
 
 
 def _responses_tab_fake_ws():
