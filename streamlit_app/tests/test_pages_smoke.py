@@ -37,12 +37,15 @@ class FakeWorksheet:
     def __init__(self, records, header=None):
         self._records = records
         self._header = header or (list(records[0].keys()) if records else [])
+        self.read_call_count = 0
 
     def get_all_records(self):
+        self.read_call_count += 1
         return [dict(r) for r in self._records]
 
     def row_values(self, row_number):
         if row_number == 1:
+            self.read_call_count += 1
             return list(self._header)
         raise NotImplementedError("Fake only supports reading the header row (row 1)")
 
@@ -374,6 +377,67 @@ def test_campaigns_back_button_clears_selected_campaign():
     assert "selected_campaign" not in at.session_state
     titles = [t.value for t in at.title]
     assert "Campaigns" in titles
+
+
+def test_campaign_detail_reruns_do_not_re_fetch_sheets_data():
+    """The actual regression: Streamlit reruns the WHOLE script on nearly
+    every widget interaction. Before this was cached, each rerun on the
+    campaign detail page re-issued 4 fresh Sheets reads — easily enough
+    to exceed Google's 60-reads/minute quota during ordinary use (e.g.
+    adjusting several CSV mapping dropdowns in a row) and return a 429.
+    This proves a second rerun reuses the cache instead of re-fetching."""
+    fake_ws = _campaigns_page_fake_ws()
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    master_ws = fake_ws["Kelson_Creators_Licensing Master Sheet"]
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        assert list(at.exception) == []
+        reads_after_first_run = master_ws.read_call_count
+        assert reads_after_first_run > 0  # sanity — it did fetch at least once
+
+        # Simulate a widget interaction elsewhere on the page (a full
+        # script rerun, exactly like adjusting a filter or mapping
+        # dropdown would trigger) — this must NOT trigger a second fetch.
+        status_filter = next(sb for sb in at.selectbox if sb.label == "Filter")
+        status_filter.set_value("Removed")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert master_ws.read_call_count == reads_after_first_run, (
+        f"Expected no new Sheets reads on rerun (cached), but count went from "
+        f"{reads_after_first_run} to {master_ws.read_call_count}"
+    )
+
+
+def test_refresh_data_button_actually_busts_the_cache():
+    fake_ws = _campaigns_page_fake_ws()
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    master_ws = fake_ws["Kelson_Creators_Licensing Master Sheet"]
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+        reads_after_first_run = master_ws.read_call_count
+
+        refresh_button = next(b for b in at.button if "Refresh data" in b.label)
+        refresh_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert master_ws.read_call_count > reads_after_first_run  # the explicit refresh DID re-fetch
 
 
 def _empty_master_fake_ws():
