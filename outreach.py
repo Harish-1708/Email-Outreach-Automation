@@ -133,6 +133,9 @@ ERROR_LOG_COLUMNS = [
 
 DASHBOARD_COLUMNS = ["Section", "Metric", "Value"]
 
+ACCOUNT_HEALTH_TAB = "Email Accounts Health"
+ACCOUNT_HEALTH_COLUMNS = ["AccountName", "Address", "Status", "Detail", "CheckedAt"]
+
 ALL_CAMPAIGNS_DASHBOARD_COLUMNS = [
     "Campaign", "Total Leads", "Unique Contacted", "Total Sent",
     "Delivered (est.)", "Bounced (Hard)", "Bounced (Soft)", "Replies",
@@ -1360,6 +1363,60 @@ def classify_imap_exception(exc: Exception) -> str:
     return ERR_REPLY_CHECK
 
 
+def check_single_account_health(address: str, app_password: str) -> Tuple[str, str]:
+    """Cheap connectivity check — logs in via IMAP and immediately logs
+    out, never fetches or sends anything. Returns (status, detail):
+    status is 'Connected' or 'Disconnected'; detail is a short,
+    password-free reason on failure, empty on success. The password
+    itself never appears in the return value — only ever used locally,
+    in-process, for this one login attempt."""
+    imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+    try:
+        imap.login(address, app_password)
+        return "Connected", ""
+    except Exception as exc:  # noqa: BLE001 - any failure here means "can't currently connect", full stop
+        return "Disconnected", str(exc)[:200]
+    finally:
+        try:
+            imap.logout()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
+def check_account_health(accounts: Dict[str, Dict[str, str]]) -> List[Dict]:
+    """Checks every configured account's connectivity, one IMAP login
+    attempt each, isolated so one broken account can't block the rest.
+    Never includes app_password anywhere in the returned rows — only
+    AccountName, Address, Status, Detail, CheckedAt, matching
+    ACCOUNT_HEALTH_COLUMNS exactly, since this is written straight to a
+    Sheet Streamlit reads."""
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    results = []
+    for name, account in accounts.items():
+        status, detail = check_single_account_health(account["address"], account["app_password"])
+        results.append({
+            "AccountName": name, "Address": account["address"], "Status": status,
+            "Detail": detail, "CheckedAt": now_str,
+        })
+    return results
+
+
+def write_account_health(sheet_id: str, results: List[Dict]) -> None:
+    """Overwrites the whole Email Accounts Health tab's data rows every
+    run — this is a current-status SNAPSHOT, not an accumulating log, so
+    a since-removed account's stale row disappears on the next check
+    rather than lingering forever."""
+    client, gspread_module = _build_gspread_client()
+    spreadsheet = client.open_by_key(sheet_id)
+    ws = _get_or_create_ws(spreadsheet, gspread_module, ACCOUNT_HEALTH_TAB, ACCOUNT_HEALTH_COLUMNS)
+    existing_row_count = len(ws.get_all_values())
+    if existing_row_count > 1:
+        ws.batch_clear([f"A2:E{existing_row_count}"])
+    rows = [[r["AccountName"], r["Address"], r["Status"], r["Detail"], r["CheckedAt"]] for r in results]
+    if rows:
+        ws.append_rows(rows)
+
+
 # =============================================================================
 # SECTION 11: Batch building + sending
 # =============================================================================
@@ -2557,6 +2614,22 @@ def cmd_send_reply(args):
     print(f"Sent. Message-ID: {sent['message_id']}")
 
 
+def cmd_check_account_health(args):
+    """Logs into every configured account via IMAP (a cheap connectivity
+    check, not a real mailbox scan) and writes the result to the shared
+    'Email Accounts Health' Sheet tab — never the password itself, only
+    connection status and a short failure reason. Reads shared_sheet_id
+    from settings.yaml directly since this isn't tied to any one
+    campaign's own Sheet configuration."""
+    accounts = load_email_accounts()
+    settings = load_settings()
+    results = check_account_health(accounts)
+    write_account_health(settings["shared_sheet_id"], results)
+    for r in results:
+        detail_suffix = f" — {r['Detail']}" if r["Detail"] else ""
+        print(f"{r['AccountName']} ({r['Address']}): {r['Status']}{detail_suffix}")
+
+
 def cmd_check_replies(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
@@ -2690,6 +2763,11 @@ def main():
                                '"subject": "...", "body": "...", "in_reply_to": "<...>", '
                                '"references": "<...>", "cc": [...], "bcc": [...], "lead_id": "5"}')
     p_reply.set_defaults(func=cmd_send_reply)
+
+    p_health = sub.add_parser("check-account-health",
+                               help="Check every configured account's IMAP connectivity and write results "
+                                    "to the shared 'Email Accounts Health' Sheet tab")
+    p_health.set_defaults(func=cmd_check_account_health)
 
     p_dash = sub.add_parser("dashboard", help="Recompute and write the dashboard tab(s)")
     p_dash.add_argument("--campaign", help="Campaign name (omit if using --all)")
