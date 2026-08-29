@@ -870,10 +870,10 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
     assert list(at.error) == [], f"Campaign detail showed an error: {[e.value for e in at.error]}"
     titles = [t.value for t in at.title]
     assert "Kelson_Creators_Licensing" in titles
-    # 7 outer tabs (Analytics/Send/Data/Sequences/Schedule/Settings/Responses)
-    # + 4 nested sub-tabs inside Send (Preview/Send/Check Replies/Maintenance)
-    # = 11 total Tab elements AppTest sees across the whole page.
-    assert len(at.tabs) == 11
+    # 7 outer tabs (Analytics/Preview/Data/Sequences/Schedule/Settings/
+    # Responses), no nesting anymore — Send moved into Settings, Check
+    # Replies into Responses, Maintenance into Sequences.
+    assert len(at.tabs) == 7
     # Real analytics data should show up as metrics, not just tab labels.
     metric_values = [m.value for m in at.metric]
     assert "1" in metric_values  # Total Leads == 1
@@ -2138,6 +2138,30 @@ def test_responses_tab_shows_info_when_no_responses_yet():
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
     assert "No responses yet" in info_texts
+
+
+def test_responses_tab_check_replies_button_shows_even_with_zero_responses():
+    """The real fix worth locking in: Check Replies moved into the
+    Responses tab, but the tab used to `return` early when there were no
+    responses yet — exactly the moment you'd most want to trigger a
+    check. The trigger must render BEFORE that early return."""
+    fake_ws = _responses_tab_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert any(b.key == "campaigns_check_replies_button" for b in at.button)
+    info_texts = " ".join(i.value for i in at.info)
+    assert "No responses yet" in info_texts  # both present together
 
 
 def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
