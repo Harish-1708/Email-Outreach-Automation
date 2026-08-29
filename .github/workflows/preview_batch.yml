@@ -38,6 +38,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          set -o pipefail
           CMD=(python outreach.py preview
             --campaign "${{ github.event.inputs.campaign }}"
             --stage "${{ github.event.inputs.stage }}"
