@@ -92,14 +92,24 @@ Accounts page.
 
 ## Known limitations (by design, not bugs)
 
-- **New Campaign is an inline modal now, not a separate page.** Right
-  after creating one, it deliberately does NOT auto-navigate into it —
-  Streamlit Cloud's local checkout won't have the new file until it
-  redeploys (triggered by the commit, not instant), so jumping straight
-  in would likely hit a real "No templates found" error. The same
-  redeploy delay applies more mildly to Sequences/Settings/Schedule saves
-  (you may briefly see the old values reflected here — the change is
-  already live for actual sending regardless).
+- **New Campaign is an inline modal now, not a separate page** — and
+  deliberately asks for nothing but a name. Git can't store an empty
+  folder, so a placeholder Intro template is created automatically; write
+  the real email afterward in the Sequences tab. Right after creating a
+  campaign, it deliberately does NOT auto-navigate into it — Streamlit
+  Cloud's local checkout won't have the new file until it redeploys
+  (triggered by the commit, not instant), so jumping straight in would
+  likely hit a real "No templates found" error. The same redeploy delay
+  applies more mildly to Sequences/Settings/Schedule saves (you may
+  briefly see the old values reflected here — the change is already live
+  for actual sending regardless).
+- **Any page showing a dialog/form driven by session_state calls
+  `page_state.mark_active_page()` at its top.** Without it, a dialog left
+  open (not explicitly cancelled) would silently reopen every time you
+  returned to that page from somewhere else — session_state persists
+  across navigation, and a plain "is this open" flag has no way to tell
+  "still filling this out" apart from "came back much later." Add the
+  same call to any future page that needs this pattern.
 - **Schedule restricts Send Batch, never Preview.** A campaign outside
   its configured sending window can still be freely previewed; only an
   actual Send is blocked, with a clear reason. No schedule configured
