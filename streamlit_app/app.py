@@ -30,18 +30,17 @@ typed `SEND` confirmation gate.
 
 Use the sidebar to navigate:
 
-- **🗂️ Campaigns** — the everyday view. Search, see every campaign's
-  status (Draft/Running/Paused/Completed/Attention needed) at a glance,
-  create a new one right from here (➕ New Campaign — just a name, then
-  write the actual email afterward in Sequences), and open any campaign
-  for Analytics, Data, Sequences, Schedule, and Settings. Start here.
+- **🗂️ Campaigns** — the everyday view, and the only place you need for
+  day-to-day work. Search, see every campaign's status (Draft/Running/
+  Paused/Completed/Attention needed) at a glance, create a new one right
+  from here, and open any campaign for Analytics, Preview, Data,
+  Sequences, Schedule, Settings (with Send), and Responses (with Check
+  Replies). Start here.
 - **📈 Overview** — every campaign at a glance: sent, pending, replies.
 - **📊 Dashboard** — deep-dive into one campaign's leads, sends, replies,
   and errors.
-- **🚀 Controls** — Preview a batch instantly, trigger a real Send / Check
-  Replies run and watch its status, or run maintenance tools.
-- **📧 Email Accounts** — which sender accounts are configured and how
-  much each has sent today (never actual credentials).
+- **📧 Email Accounts** — add, edit, or remove sender accounts, see how
+  much each has sent today, and their live connection status.
         """
     )
 
@@ -54,9 +53,7 @@ home_page = st.Page(_home, title="Home", icon="📬", default=True)
 campaigns_page = st.Page("pages/campaigns.py", title="Campaigns", icon="🗂️")
 overview_page = st.Page("pages/overview.py", title="Overview", icon="📈")
 dashboard_page = st.Page("pages/dashboard.py", title="Dashboard", icon="📊")
-controls_page = st.Page("pages/controls.py", title="Controls", icon="🚀")
 email_accounts_page = st.Page("pages/email_accounts.py", title="Email Accounts", icon="📧")
 
-nav = st.navigation([home_page, campaigns_page, overview_page, dashboard_page, controls_page,
-                     email_accounts_page])
+nav = st.navigation([home_page, campaigns_page, overview_page, dashboard_page, email_accounts_page])
 nav.run()
