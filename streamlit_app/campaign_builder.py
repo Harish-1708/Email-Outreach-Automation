@@ -1,12 +1,13 @@
-"""Phase 3 — campaign creation/extension logic. Kept pure/testable: nothing
-here touches the network. The Streamlit page collects form input, calls
-these functions, and hands the result to GitHubClient.
-open_campaign_pull_request.
+"""Campaign creation/extension logic. Kept pure/testable: nothing here
+touches the network. The Streamlit page collects form input, calls these
+functions, and hands the result to GitHubClient.
+commit_campaign_files_directly.
 
-Deliberately opens a PULL REQUEST rather than committing straight to main
-(see github_client.open_campaign_pull_request) — this is the one part of
-the whole system that can introduce new files into the automation repo, so
-a human still reviews it before it goes live.
+Commits DIRECTLY to main — no branch, no PR. Creating a new campaign (or
+adding a stage) used to require going to GitHub and merging a pull
+request; that's exactly the trip this now skips. The remaining safety net
+is the in-app confirmation the Streamlit page requires before calling
+this, plus the fact that only a logged-in user of this app can reach it.
 
 Two modes, both funneling through the same file-building logic:
 - A brand NEW campaign — starts at "intro", any 1-4 variant letters.
@@ -98,38 +99,17 @@ def get_next_stage_for_campaign(campaign_name: str, templates_root: str) -> Opti
     return None  # all 5 stages already exist
 
 
-def branch_name_for_campaign(campaign_name: str, stage_prefix: str, suffix: Optional[str] = None) -> str:
-    """suffix=None gives the deterministic base name (used by tests). The
-    page's actual call site always passes a fresh random suffix — see its
-    docstring note below for why: a fully deterministic name collides with
-    any leftover branch from a PREVIOUS attempt (closed PR, abandoned
-    attempt, or a merge that didn't auto-delete its branch), and GitHub's
-    create-branch API rejects a duplicate ref with a 422. A random suffix
-    means every attempt gets its own branch, so this can never collide."""
-    base = f"add-{stage_prefix}-{campaign_name.lower()}"
-    return f"{base}-{suffix}" if suffix else base
-
-
-def pr_title_for_campaign(campaign_name: str, stage_prefix: str, is_new_campaign: bool) -> str:
+def commit_message_for_campaign(campaign_name: str, stage_prefix: str, variant_count: int,
+                                 created_by: str, is_new_campaign: bool) -> str:
+    """Commit message for the direct-to-main commit — see
+    github_client.commit_campaign_files_directly. No branch/PR involved:
+    this campaign (or stage) is live the moment this commit lands."""
     if is_new_campaign:
-        return f"Add campaign: {campaign_name}"
-    return f"Add {stage_prefix} to campaign: {campaign_name}"
-
-
-def pr_body_for_campaign(campaign_name: str, stage_prefix: str, variant_count: int,
-                          created_by: str, is_new_campaign: bool) -> str:
-    if is_new_campaign:
-        intro = (
-            f"Adds the `templates/{campaign_name}/` folder with {variant_count} "
-            f"Intro variant(s), created from the Streamlit control panel by **{created_by}**.\n\n"
-            f"Auto-discovery will pick this campaign up as soon as this PR is merged — "
-            f"no other changes needed."
+        return (
+            f"Add campaign: {campaign_name} ({variant_count} Intro variant(s), "
+            f"via Streamlit control panel by {created_by})"
         )
-    else:
-        intro = (
-            f"Adds `{stage_prefix}` ({variant_count} variant(s)) to the existing "
-            f"`{campaign_name}` campaign, created from the Streamlit control panel by "
-            f"**{created_by}**.\n\nThis stage becomes active for eligible leads as soon "
-            f"as this PR is merged."
-        )
-    return intro + "\n\nReview the template content below before merging."
+    return (
+        f"Add {stage_prefix} to campaign: {campaign_name} ({variant_count} variant(s), "
+        f"via Streamlit control panel by {created_by})"
+    )
