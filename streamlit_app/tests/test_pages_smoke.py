@@ -161,57 +161,115 @@ def test_controls_check_replies_labels_stopped_vs_logged_only_correctly():
     assert "NOT stopped" in markdown_texts
 
 
-def test_new_campaign_page_renders_without_exceptions():
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
-    at.secrets.update(_dashboard_secrets())
-    for k, v in _authed_session().items():
-        at.session_state[k] = v
-    at.run()
-
-    assert list(at.exception) == [], f"New Campaign page raised: {list(at.exception)}"
-    assert list(at.error) == [], f"New Campaign page showed an error: {[e.value for e in at.error]}"
-    assert len(at.text_input) >= 1
-    # Direct-commit — no "go merge this" instruction should remain anywhere.
-    all_text = " ".join(m.value for m in at.markdown).lower()
-    assert "merge" not in all_text
-    assert "no github trip" in all_text
-
-
-def test_new_campaign_submit_button_disabled_until_confirmation_checked():
+def test_new_campaign_dialog_disabled_until_confirmation_checked():
     """The confirm checkbox is the ONLY remaining safety net now that
     there's no GitHub trip — this must actually gate the button, not just
     be decorative."""
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
-    at.secrets.update(_dashboard_secrets())
-    for k, v in _authed_session().items():
-        at.session_state[k] = v
-    at.run()
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
-    create_button = next(b for b in at.button if b.label == "Create Campaign")
-    assert create_button.disabled is True
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
 
-    at.checkbox[0].set_value(True)
-    at.run()
-    create_button = next(b for b in at.button if b.label == "Create Campaign")
-    assert create_button.disabled is False
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+        assert list(at.exception) == []
+        create_button = next(b for b in at.button if b.label == "Create Campaign")
+        assert create_button.disabled is True
+
+        confirm_checkbox = at.checkbox[0]
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+        create_button = next(b for b in at.button if b.label == "Create Campaign")
+        assert create_button.disabled is False
 
 
-def test_new_campaign_page_add_stage_mode_shows_next_stage_for_real_campaign():
-    """Kelson_Creators_Licensing already has all 5 stages in the repo
-    fixture — selecting it in "Add stage" mode should say so, not error."""
-    at = AppTest.from_file(os.path.join(PAGES_DIR, "new_campaign.py"))
-    at.secrets.update(_dashboard_secrets())
-    for k, v in _authed_session().items():
-        at.session_state[k] = v
-    at.run()
+def test_new_campaign_dialog_creates_campaign_and_stays_on_hub():
+    """Deliberately does NOT auto-navigate into the new campaign — right
+    after committing, Streamlit Cloud's local checkout is very likely
+    still stale until it redeploys, so jumping straight to the detail
+    view would hit a real 'No templates found' error. Staying on the hub
+    with a clear message is the honest version of this UX."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
 
-    at.radio[0].set_value("Add the next stage to an existing campaign")
-    at.run()
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["dispatched"] = workflow_file
+        return {"id": 1, "html_url": "https://github.com/x"}
 
-    assert list(at.exception) == [], f"New Campaign (add-stage mode) raised: {list(at.exception)}"
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+        text_inputs = {ti.label: ti for ti in at.text_input}
+        text_inputs["Campaign name (letters, numbers, underscores only)"].set_value("BrandNewCampaign")
+        text_inputs["Subject (Intro)"].set_value("Hello there")
+        at.text_area[0].set_value("Body content")
+        at.checkbox[0].set_value(True)
+        at.run(timeout=15)
+
+        create_button = next(b for b in at.button if b.label == "Create Campaign")
+        create_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Create campaign raised: {list(at.exception)}"
     assert list(at.error) == []
-    info_texts = " ".join(i.value for i in at.info)
-    assert "already has all 5 stages" in info_texts
+    assert len(captured["commits"]) == 1
+    assert captured["commits"][0]["path"] == "templates/BrandNewCampaign/intro_A.txt"
+    assert captured["dispatched"] == "dashboard.yml"  # auto tab-init was triggered
+    assert "selected_campaign" not in at.session_state  # stayed on the hub, didn't auto-navigate
+    titles = [t.value for t in at.title]
+    assert "Campaigns" in titles  # still the hub, not a campaign detail page
+
+
+def test_new_campaign_dialog_rejects_duplicate_name():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        new_campaign_button = next(b for b in at.button if "New Campaign" in b.label)
+        new_campaign_button.click()
+        at.run(timeout=15)
+
+        text_inputs = {ti.label: ti for ti in at.text_input}
+        text_inputs["Campaign name (letters, numbers, underscores only)"].set_value("Kelson_Creators_Licensing")
+        text_inputs["Subject (Intro)"].set_value("Hi")
+        at.text_area[0].set_value("Body")
+        at.checkbox[0].set_value(True)
+        at.run(timeout=15)
+
+        create_button = next(b for b in at.button if b.label == "Create Campaign")
+        create_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert captured.get("commits") is None
+    error_texts = " ".join(e.value for e in at.error)
+    assert "already exists" in error_texts
 
 
 def test_overview_page_renders_without_exceptions():
@@ -353,8 +411,7 @@ def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
     assert "isn't built yet" in info_texts
-    assert "Phase E" in info_texts  # Schedule — Data (C) and Sequences (D) are real now, no longer stubs
-    assert "Phase H" in info_texts
+    assert "Phase H" in info_texts  # Responses — the only one left as a stub now
 
 
 def test_campaigns_back_button_clears_selected_campaign():
@@ -627,6 +684,61 @@ def test_sequences_tab_shows_locked_variants_for_real_campaign():
     assert all(ti.disabled for ti in subject_inputs)
 
 
+def test_sequences_tab_intro_subject_label_never_says_continues_thread():
+    """Regression: the blank-continues-the-thread hint was showing on
+    EVERY stage's Subject field, including Intro — self-contradictory,
+    since Intro can never actually use a blank subject (see
+    outreach.render_email's is_first_stage guard)."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    intro_subject_inputs = [ti for ti in at.text_input if ti.key and ti.key.startswith("subject_intro_")]
+    followup_subject_inputs = [ti for ti in at.text_input if ti.key and ti.key.startswith("subject_followup")]
+    assert intro_subject_inputs, "Expected at least one Intro subject field"
+    assert all("continues" not in ti.label.lower() for ti in intro_subject_inputs)
+    assert all("required" in ti.label.lower() for ti in intro_subject_inputs)
+    assert all("continues" in ti.label.lower() for ti in followup_subject_inputs)
+
+
+def test_sequences_tab_save_rejects_blank_subject_for_intro_edit():
+    """Editing Intro's subject down to blank must be caught here, before
+    Save — not left to fail later, at send time, with a TemplateError."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        unlock_checkbox = next(cb for cb in at.checkbox if cb.key == "unlock_intro_A")
+        unlock_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        subject_input = next(ti for ti in at.text_input if ti.key == "subject_intro_A")
+        subject_input.set_value("")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Subject is required" in error_texts
+    assert captured.get("commits") is None
+
+
 def test_sequences_tab_unlock_and_save_edits_one_variant():
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
@@ -885,6 +997,137 @@ def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path)
     assert written["status"] == "paused"  # preserved, not clobbered
     assert written["schedule"] == {"timezone": "America/Los_Angeles"}  # preserved
     assert written["sending"]["daily_limit"] == 300  # actually updated
+
+
+def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_save():
+    """Regression: clicking 'Select all accounts' visually appeared to
+    work but didn't actually change what got saved — the button was
+    reassigning a local Python variable, not the multiselect widget's own
+    state, so a later Save click re-read the widget fresh and silently
+    discarded the selection."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        secrets = _dashboard_secrets()
+        secrets["email_accounts_directory"] = {"sales1": "sales1@x.com", "sales2": "sales2@x.com"}
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        select_all_button = next(b for b in at.button if b.label == "Select all accounts")
+        select_all_button.click()
+        at.run(timeout=15)
+
+        account_selector = next(ms for ms in at.multiselect if "sender accounts" in ms.label)
+        assert set(account_selector.value) == {"sales1", "sales2"}  # widget itself actually shows both selected
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Settings")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert set(written["sending"]["rotation_accounts"]) == {"sales1", "sales2"}  # actually persisted
+
+
+def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Schedule tab raised: {list(at.exception)}"
+    assert list(at.error) == []
+    tz_selector = next(sb for sb in at.selectbox if sb.label == "Time zone")
+    assert tz_selector.value == "Pacific Time (US & Canada)"
+    start_input = next(ti for ti in at.text_input if "Start time" in ti.label)
+    assert start_input.value == "09:00"
+    day_checkboxes = {cb.label: cb.value for cb in at.checkbox if cb.key and cb.key.startswith("schedule_day_")}
+    assert day_checkboxes["Mon"] is True
+    assert day_checkboxes["Sat"] is False
+
+
+def test_schedule_tab_save_writes_correct_yaml_and_preserves_other_keys(tmp_path):
+    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+        "status: active\nsending:\n  daily_limit: 100\n"
+    )
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path)):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        tz_selector = next(sb for sb in at.selectbox if sb.label == "Time zone")
+        tz_selector.set_value("UTC")
+        at.run(timeout=15)
+
+        sat_checkbox = next(cb for cb in at.checkbox if cb.key == "schedule_day_sat")
+        sat_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Schedule")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Schedule save raised: {list(at.exception)}"
+    assert list(at.error) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert written["schedule"]["timezone"] == "UTC"
+    assert "sat" in written["schedule"]["send_days"]
+    assert written["status"] == "active"  # preserved
+    assert written["sending"]["daily_limit"] == 100  # preserved
+
+
+def test_schedule_tab_save_rejects_when_no_days_selected():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        # Uncheck every default-selected weekday.
+        for code in ["mon", "tue", "wed", "thu", "fri"]:
+            cb = next(c for c in at.checkbox if c.key == f"schedule_day_{code}")
+            cb.set_value(False)
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.label == "💾 Save Schedule")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert captured.get("commits") is None
+    error_texts = " ".join(e.value for e in at.error)
+    assert "at least one day" in error_texts
 
 
 def test_login_lockout_after_repeated_failures():
