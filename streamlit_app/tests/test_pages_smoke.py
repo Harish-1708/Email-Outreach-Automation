@@ -1236,6 +1236,218 @@ def test_schedule_tab_save_rejects_when_no_days_selected():
     assert "at least one day" in error_texts
 
 
+def _fake_get_campaign_with_status(status: str):
+    def fake_get_campaign(name, **kwargs):
+        return {
+            "_campaign_name": name,
+            "stages": [{"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0}],
+            "sending": {}, "status": status,
+            "master_tab": f"{name} Master Sheet", "responses_tab": f"{name} Response Sheet",
+            "send_log_tab": f"{name} Custom Log Sheet", "error_log_tab": f"{name} Error Log",
+            "variants": ["A"], "_global_default_account": "sales1",
+        }
+    return fake_get_campaign
+
+
+def test_status_controls_running_campaign_shows_pause_button():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    subheaders = [h.value for h in at.subheader]
+    assert "🟢 Running" in subheaders
+    assert any(b.label == "⏸ Pause" for b in at.button)
+    assert not any(b.label in ("🚀 Launch", "▶ Resume") for b in at.button)
+
+
+def test_status_controls_pause_button_commits_paused_status():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        pause_button = next(b for b in at.button if b.label == "⏸ Pause")
+        pause_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert written == {"status": "paused"}
+
+
+def test_status_controls_paused_campaign_shows_resume_button():
+    fake_spreadsheet = FakeSpreadsheet({})
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("paused")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "PausedCampaign"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    subheaders = [h.value for h in at.subheader]
+    assert "⏸ Paused" in subheaders
+    assert any(b.label == "▶ Resume" for b in at.button)
+
+
+def test_status_controls_resume_button_commits_active_status():
+    fake_spreadsheet = FakeSpreadsheet({})
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("paused")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "PausedCampaign"
+        at.run(timeout=15)
+
+        resume_button = next(b for b in at.button if b.label == "▶ Resume")
+        resume_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert written == {"status": "active"}
+
+
+def test_status_controls_draft_shows_launch_then_confirmation():
+    fake_spreadsheet = FakeSpreadsheet({})
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("draft")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "DraftCampaign"
+        at.run(timeout=15)
+
+        assert any(b.label == "🚀 Launch" for b in at.button)
+        assert not any(b.label == "Confirm Launch" for b in at.button)
+
+        launch_button = next(b for b in at.button if b.label == "🚀 Launch")
+        launch_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert any(b.label == "Confirm Launch" for b in at.button)
+    assert any(b.label == "Cancel" for b in at.button)
+
+
+def test_status_controls_confirm_launch_commits_active_status():
+    fake_spreadsheet = FakeSpreadsheet({})
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("draft")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "DraftCampaign"
+        at.run(timeout=15)
+
+        launch_button = next(b for b in at.button if b.label == "🚀 Launch")
+        launch_button.click()
+        at.run(timeout=15)
+
+        confirm_button = next(b for b in at.button if b.label == "Confirm Launch")
+        confirm_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    import yaml
+    written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
+    assert written == {"status": "active"}
+
+
+def test_status_controls_cancel_launch_does_not_commit():
+    fake_spreadsheet = FakeSpreadsheet({})
+    captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("draft")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "DraftCampaign"
+        at.run(timeout=15)
+
+        launch_button = next(b for b in at.button if b.label == "🚀 Launch")
+        launch_button.click()
+        at.run(timeout=15)
+
+        cancel_button = next(b for b in at.button if b.label == "Cancel")
+        cancel_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert captured.get("commits") is None
+    assert not any(b.label == "Confirm Launch" for b in at.button)
+
+
+def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_away():
+    """Same class of bug as the New Campaign dialog — a confirmation box
+    driven by session_state must reset on genuine navigation, or it
+    silently reappears on an unrelated later visit."""
+    fake_spreadsheet = FakeSpreadsheet({})
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("outreach.get_campaign", _fake_get_campaign_with_status("draft")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "DraftCampaign"
+        at.run(timeout=15)
+
+        launch_button = next(b for b in at.button if b.label == "🚀 Launch")
+        launch_button.click()
+        at.run(timeout=15)
+        assert any(b.label == "Confirm Launch" for b in at.button)
+
+        at.session_state["_active_page"] = "dashboard"  # simulate visiting another page
+        at.run(timeout=15)  # return to Campaigns, without clicking Confirm or Cancel
+
+    assert list(at.exception) == []
+    assert not any(b.label == "Confirm Launch" for b in at.button)
+
+
 def test_login_lockout_after_repeated_failures():
     from auth import hash_password
 
