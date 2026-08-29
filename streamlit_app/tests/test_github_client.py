@@ -1,3 +1,4 @@
+import base64
 import os
 import sys
 from unittest.mock import MagicMock
@@ -234,3 +235,130 @@ def test_create_file_passes_correct_ref_when_checking_existing_sha(monkeypatch):
     monkeypatch.setattr(github_client.requests, "put", lambda *a, **kw: _fake_response(201, {}))
     _client().create_file("templates/Foo/intro_A.txt", b"content", "msg", branch="a-feature-branch")
     assert captured["params"] == {"ref": "a-feature-branch"}
+
+
+# =============================================================================
+# Repository secrets — set/delete only, matching GitHub's write-only API.
+# encrypt_secret_value's tests use a REAL generated keypair and verify a
+# genuine decrypt round-trip, not just "produces some bytes" — this is the
+# one piece of crypto in the whole app, so it gets proven correct against
+# the actual algorithm, not just exercised.
+# =============================================================================
+
+def _generate_test_keypair():
+    from nacl import encoding, public
+    private_key = public.PrivateKey.generate()
+    public_key_b64 = private_key.public_key.encode(encoder=encoding.Base64Encoder).decode("utf-8")
+    return private_key, public_key_b64
+
+
+def test_encrypt_secret_value_round_trips_correctly():
+    """The real proof: what this method produces can actually be decrypted
+    back to the original plaintext by the holder of the matching private
+    key — exactly GitHub's own position when it receives this value."""
+    from nacl import public
+    private_key, public_key_b64 = _generate_test_keypair()
+
+    encrypted_b64 = _client().encrypt_secret_value("super-secret-app-password", public_key_b64)
+
+    sealed_box = public.SealedBox(private_key)
+    decrypted = sealed_box.decrypt(base64.b64decode(encrypted_b64))
+    assert decrypted.decode("utf-8") == "super-secret-app-password"
+
+
+def test_encrypt_secret_value_different_each_time():
+    """Sealed-box encryption is randomized (a fresh ephemeral key per
+    call) — encrypting the same plaintext twice must NOT produce identical
+    ciphertext, or the scheme would leak whether two secrets are equal."""
+    _, public_key_b64 = _generate_test_keypair()
+    first = _client().encrypt_secret_value("same-value", public_key_b64)
+    second = _client().encrypt_secret_value("same-value", public_key_b64)
+    assert first != second
+
+
+def test_encrypt_secret_value_handles_unicode_plaintext():
+    from nacl import public
+    private_key, public_key_b64 = _generate_test_keypair()
+    encrypted_b64 = _client().encrypt_secret_value("pässwörd-测试-🔒", public_key_b64)
+    sealed_box = public.SealedBox(private_key)
+    decrypted = sealed_box.decrypt(base64.b64decode(encrypted_b64))
+    assert decrypted.decode("utf-8") == "pässwörd-测试-🔒"
+
+
+def test_get_repo_public_key_returns_key_and_id(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get",
+                         lambda *a, **kw: _fake_response(200, {"key_id": "abc123", "key": "base64keydata"}))
+    result = _client().get_repo_public_key()
+    assert result == {"key_id": "abc123", "key": "base64keydata"}
+
+
+def test_get_repo_public_key_raises_on_failure(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(403, text="Forbidden"))
+    with pytest.raises(GitHubActionsError, match="Failed to fetch repo public key"):
+        _client().get_repo_public_key()
+
+
+def test_set_secret_fetches_fresh_key_encrypts_and_puts(monkeypatch):
+    _, public_key_b64 = _generate_test_keypair()
+    captured = {}
+
+    monkeypatch.setattr(github_client.requests, "get",
+                         lambda *a, **kw: _fake_response(200, {"key_id": "key-1", "key": public_key_b64}))
+
+    def fake_put(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _fake_response(201, {})
+
+    monkeypatch.setattr(github_client.requests, "put", fake_put)
+
+    _client().set_secret("EMAIL_ACCOUNT_SLOT_1", "my-app-password")
+
+    assert captured["url"].endswith("/actions/secrets/EMAIL_ACCOUNT_SLOT_1")
+    assert captured["json"]["key_id"] == "key-1"
+    assert "encrypted_value" in captured["json"]
+    assert "my-app-password" not in str(captured["json"])  # never sent in plaintext
+
+
+def test_set_secret_raises_on_put_failure(monkeypatch):
+    _, public_key_b64 = _generate_test_keypair()
+    monkeypatch.setattr(github_client.requests, "get",
+                         lambda *a, **kw: _fake_response(200, {"key_id": "key-1", "key": public_key_b64}))
+    monkeypatch.setattr(github_client.requests, "put", lambda *a, **kw: _fake_response(422, text="bad request"))
+    with pytest.raises(GitHubActionsError, match="Failed to set secret"):
+        _client().set_secret("EMAIL_ACCOUNT_SLOT_1", "pass")
+
+
+def test_set_secret_accepts_201_or_204():
+    for status in (201, 204):
+        _, public_key_b64 = _generate_test_keypair()
+        import unittest.mock as mock
+        with mock.patch.object(github_client.requests, "get",
+                                return_value=_fake_response(200, {"key_id": "k", "key": public_key_b64})), \
+             mock.patch.object(github_client.requests, "put", return_value=_fake_response(status, {})):
+            _client().set_secret("SLOT_1", "value")  # doesn't raise
+
+
+def test_delete_secret_success_on_204(monkeypatch):
+    captured = {}
+
+    def fake_delete(url, headers=None, timeout=None):
+        captured["url"] = url
+        return _fake_response(204)
+
+    monkeypatch.setattr(github_client.requests, "delete", fake_delete)
+    _client().delete_secret("EMAIL_ACCOUNT_SLOT_3")
+    assert captured["url"].endswith("/actions/secrets/EMAIL_ACCOUNT_SLOT_3")
+
+
+def test_delete_secret_treats_404_as_success_not_error(monkeypatch):
+    """The secret was already gone — the caller's goal ('this shouldn't
+    exist') is already satisfied, so this must NOT raise."""
+    monkeypatch.setattr(github_client.requests, "delete", lambda *a, **kw: _fake_response(404))
+    _client().delete_secret("EMAIL_ACCOUNT_SLOT_3")  # doesn't raise
+
+
+def test_delete_secret_raises_on_other_failure(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "delete", lambda *a, **kw: _fake_response(403, text="Forbidden"))
+    with pytest.raises(GitHubActionsError, match="Failed to delete secret"):
+        _client().delete_secret("EMAIL_ACCOUNT_SLOT_3")
