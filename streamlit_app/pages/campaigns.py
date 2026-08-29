@@ -10,10 +10,11 @@ from auth import login_gate, current_user  # noqa: E402
 from page_state import mark_active_page  # noqa: E402
 from config import (  # noqa: E402
     WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, WORKFLOW_SEND_REPLY,
+    WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT,
     TEMPLATES_ROOT, CAMPAIGNS_DIR,
 )
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
-from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
+from preview_logic import list_campaigns, get_campaign_cfg, run_preview  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
 from campaigns_hub_logic import build_campaigns_hub, filter_campaigns_by_search  # noqa: E402
 from campaign_analytics_logic import (  # noqa: E402
@@ -49,6 +50,9 @@ from responses_reply_logic import (  # noqa: E402
 from campaign_status_logic import (  # noqa: E402
     compute_campaign_status, compute_campaign_readiness, status_label,
     STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_ATTENTION,
+)
+from send_logic import (  # noqa: E402
+    build_send_inputs, build_check_replies_inputs, build_backfill_thread_subject_inputs, confirmation_is_valid,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -899,6 +903,187 @@ def _render_status_controls(campaign_cfg, leads, just_arrived: bool):
                 st.rerun()
 
 
+def _render_send_tab(campaign_cfg, leads):
+    campaign_name = campaign_cfg["_campaign_name"]
+    STAGES = ["intro", "followup1", "followup2", "followup3", "followup4"]
+    VARIANTS = ["Auto", "A", "B", "C", "D"]
+
+    preview_subtab, send_subtab, replies_subtab, maintenance_subtab = st.tabs(
+        ["👀 Preview", "📤 Send", "📥 Check Replies", "🔧 Maintenance"])
+
+    # ---------- Preview — runs in-app, nothing sent or written ----------
+    with preview_subtab:
+        st.caption("Runs instantly, in-app. Nothing is sent or written.")
+        stage = st.selectbox("Stage", STAGES, key="campaigns_preview_stage")
+        batch_size = st.number_input("Batch size", min_value=1, max_value=500, value=10,
+                                      key="campaigns_preview_batch_size")
+        variant = st.selectbox("Variant", VARIANTS, key="campaigns_preview_variant")
+        ignore_wait_days_preview = st.checkbox(
+            "Ignore the scheduled wait for this stage", key="campaigns_preview_ignore_wait_days",
+            help="Every other rule still applies — Approval must be Yes, the previous stage must "
+                 "actually have been sent, this stage can't already be sent, no reply received.",
+        )
+
+        if st.button("Run Preview", key="campaigns_run_preview"):
+            try:
+                plan = run_preview(campaign_name, stage, int(batch_size), leads, forced_variant=variant,
+                                    ignore_wait_days=ignore_wait_days_preview)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Preview failed: {exc}")
+                plan = None
+
+            if plan is not None:
+                if not plan:
+                    st.info(f"No eligible leads for stage '{stage}'.")
+                else:
+                    st.success(f"{len(plan)} eligible lead(s).")
+                    for item in plan:
+                        lead = item["lead"]
+                        with st.expander(f"{lead.get('FirstName', '')} {lead.get('LastName', '')} "
+                                          f"<{lead.get('Email')}> — variant {item['variant']}"):
+                            st.write(f"**Subject:** {item['subject']}"
+                                     + (" _(continuing existing thread)_" if item["is_continuation"] else ""))
+                            st.text(item["body"])
+                            if item["missing_variables"]:
+                                st.warning(f"Unrecognized template variable(s): "
+                                           f"{', '.join(item['missing_variables'])}")
+
+    # ---------- Send — always via GitHub Actions ----------
+    with send_subtab:
+        st.caption("Triggers the real `send_batch.yml` workflow — same safety checks, same typed confirmation.")
+        stage_s = st.selectbox("Stage", STAGES, key="campaigns_send_stage")
+        batch_size_s = st.number_input("Batch size", min_value=1, max_value=500, value=10,
+                                        key="campaigns_send_batch_size")
+        variant_s = st.selectbox("Variant", VARIANTS, key="campaigns_send_variant")
+
+        with st.expander("Advanced overrides (optional, this run only)"):
+            override_daily_limit = st.number_input("Override daily_limit", min_value=0, value=0,
+                                                     key="campaigns_send_daily_limit", help="0 = use config default")
+            override_per_account = st.number_input("Override per_account_daily_limit", min_value=0, value=0,
+                                                     key="campaigns_send_per_account", help="0 = use config default")
+            rotation_choice = st.selectbox("sender_rotation override", ["(use config default)", "true", "false"],
+                                            key="campaigns_send_rotation")
+            ignore_wait_days_send = st.checkbox(
+                "Ignore the scheduled wait for this stage (send now regardless of schedule)",
+                key="campaigns_send_ignore_wait_days",
+            )
+
+        st.warning("This will send real emails. Run Preview for this exact batch first if you haven't already.")
+        confirm_text = st.text_input('Type "SEND" to confirm', key="campaigns_send_confirm_text")
+
+        if st.button("Send Batch", type="primary", key="campaigns_send_batch_button"):
+            if not confirmation_is_valid(confirm_text):
+                st.error('You must type "SEND" (exact match) to confirm.')
+            else:
+                inputs = build_send_inputs(
+                    campaign=campaign_name, stage=stage_s, batch_size=int(batch_size_s), variant=variant_s,
+                    daily_limit=int(override_daily_limit) or None,
+                    per_account_daily_limit=int(override_per_account) or None,
+                    sender_rotation=(None if rotation_choice == "(use config default)"
+                                      else rotation_choice == "true"),
+                    ignore_wait_days=ignore_wait_days_send,
+                )
+                try:
+                    client = _get_github_client()
+                    run_details = client.dispatch_workflow(WORKFLOW_SEND, inputs)
+                    if run_details is None:
+                        time.sleep(2)
+                        run_details = client.find_recent_run(WORKFLOW_SEND)
+                    if run_details:
+                        st.session_state["last_send_run_id"] = run_details.get("id") or run_details.get("run_id")
+                        st.session_state["last_send_run_url"] = run_details.get("html_url", "")
+                    st.success(f"Triggered Send for '{campaign_name}' / stage '{stage_s}', by {current_user()}.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to trigger Send: {exc}")
+
+        run_id = st.session_state.get("last_send_run_id")
+        if run_id:
+            st.divider()
+            st.write(f"**Last triggered run:** [{run_id}]({st.session_state.get('last_send_run_url', '')})")
+            if st.button("🔄 Refresh run status", key="campaigns_send_refresh_status"):
+                try:
+                    run = _get_github_client().get_run(run_id)
+                    status = run.get("status", "unknown")
+                    conclusion = run.get("conclusion")
+                    st.success(f"Completed — conclusion: {conclusion}") if status == "completed" \
+                        else st.info(f"Status: {status}")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to fetch run status: {exc}")
+
+    # ---------- Check Replies — trigger only; the Responses tab shows the actual replies ----------
+    with replies_subtab:
+        st.caption("This also runs automatically every 30 minutes — use this only if you want it to check "
+                   "right now. Results show up in the Responses tab once the run completes.")
+
+        if st.button("Check Replies Now", key="campaigns_check_replies_button"):
+            try:
+                client = _get_github_client()
+                inputs = build_check_replies_inputs(campaign_name)
+                run_details = client.dispatch_workflow(WORKFLOW_CHECK_REPLIES, inputs)
+                if run_details is None:
+                    time.sleep(2)
+                    run_details = client.find_recent_run(WORKFLOW_CHECK_REPLIES)
+                if run_details:
+                    st.session_state["last_replies_run_id"] = run_details.get("id") or run_details.get("run_id")
+                    st.session_state["last_replies_run_url"] = run_details.get("html_url", "")
+                st.success(f"Triggered Check Replies for '{campaign_name}'.")
+            except GitHubActionsError as exc:
+                st.error(f"Failed to trigger Check Replies: {exc}")
+
+        replies_run_id = st.session_state.get("last_replies_run_id")
+        if replies_run_id:
+            st.write(f"**Last triggered run:** [{replies_run_id}]({st.session_state.get('last_replies_run_url', '')})")
+            if st.button("🔄 Refresh run status", key="campaigns_replies_refresh_status"):
+                try:
+                    run = _get_github_client().get_run(replies_run_id)
+                    status = run.get("status", "unknown")
+                    conclusion = run.get("conclusion")
+                    st.success(f"Completed — conclusion: {conclusion}. Check the Responses tab for results.") \
+                        if status == "completed" else st.info(f"Status: {status}")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to fetch run status: {exc}")
+
+    # ---------- Maintenance — ThreadSubject backfill ----------
+    with maintenance_subtab:
+        st.subheader("Backfill ThreadSubject")
+        st.caption(
+            "For leads already mid-sequence before ThreadSubject existed. Never overwrites an "
+            "already-set ThreadSubject — safe to run more than once, it only fills gaps."
+        )
+        dry_run = st.checkbox("Dry run (preview only, don't write anything)", value=True,
+                               key="campaigns_backfill_dry_run")
+
+        if st.button("Run Backfill", key="campaigns_run_backfill"):
+            try:
+                client = _get_github_client()
+                inputs = build_backfill_thread_subject_inputs(campaign_name, dry_run=dry_run)
+                run_details = client.dispatch_workflow(WORKFLOW_BACKFILL_THREAD_SUBJECT, inputs)
+                if run_details is None:
+                    time.sleep(2)
+                    run_details = client.find_recent_run(WORKFLOW_BACKFILL_THREAD_SUBJECT)
+                if run_details:
+                    st.session_state["last_backfill_run_id"] = run_details.get("id") or run_details.get("run_id")
+                    st.session_state["last_backfill_run_url"] = run_details.get("html_url", "")
+                st.success(f"Triggered backfill for '{campaign_name}'" + (" (dry run)" if dry_run else "") + ".")
+            except GitHubActionsError as exc:
+                st.error(f"Failed to trigger backfill: {exc}")
+
+        backfill_run_id = st.session_state.get("last_backfill_run_id")
+        if backfill_run_id:
+            st.write(f"**Last triggered run:** "
+                     f"[{backfill_run_id}]({st.session_state.get('last_backfill_run_url', '')})")
+            if st.button("🔄 Refresh run status", key="campaigns_backfill_refresh_status"):
+                try:
+                    run = _get_github_client().get_run(backfill_run_id)
+                    status = run.get("status", "unknown")
+                    conclusion = run.get("conclusion")
+                    st.success(f"Completed — conclusion: {conclusion}.") if status == "completed" \
+                        else st.info(f"Status: {status}")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to fetch run status: {exc}")
+
+
+
 def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     col1, col2 = st.columns([4, 1])
     with col1:
@@ -932,18 +1117,20 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     _render_status_controls(campaign_cfg, leads, just_arrived)
     st.divider()
 
-    tabs = st.tabs(["📊 Analytics", "📋 Data", "✉️ Sequences", "📅 Schedule", "⚙️ Settings", "💬 Responses"])
+    tabs = st.tabs(["📊 Analytics", "🚀 Send", "📋 Data", "✉️ Sequences", "📅 Schedule", "⚙️ Settings", "💬 Responses"])
     with tabs[0]:
         _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log)
     with tabs[1]:
-        _render_data_tab(campaign_cfg, leads)
+        _render_send_tab(campaign_cfg, leads)
     with tabs[2]:
-        _render_sequences_tab(campaign_cfg, leads)
+        _render_data_tab(campaign_cfg, leads)
     with tabs[3]:
-        _render_schedule_tab(campaign_cfg)
+        _render_sequences_tab(campaign_cfg, leads)
     with tabs[4]:
-        _render_settings_tab(campaign_cfg)
+        _render_schedule_tab(campaign_cfg)
     with tabs[5]:
+        _render_settings_tab(campaign_cfg)
+    with tabs[6]:
         _render_responses_tab(campaign_cfg, leads, responses)
 
 
