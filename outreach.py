@@ -1877,16 +1877,22 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     see build_batch's docstring for exactly what is and isn't skipped.
 
     Raises CampaignPausedError immediately, before touching anything, if
-    campaign_cfg["status"] == "paused", and OutsideSendingWindowError if
-    campaign_cfg["schedule"] restricts sending to specific days/hours and
-    right now doesn't qualify — Preview/build_batch are deliberately NOT
-    gated by either, so a paused or schedule-restricted campaign can
-    still be reviewed any time, just not sent.
+    campaign_cfg["status"] in ("paused", "draft"), and OutsideSendingWindowError
+    if campaign_cfg["schedule"] restricts sending to specific days/hours
+    and right now doesn't qualify — Preview/build_batch are deliberately
+    NOT gated by either, so a paused, still-draft, or schedule-restricted
+    campaign can still be reviewed any time, just not sent.
     """
-    if campaign_cfg.get("status") == "paused":
+    status = campaign_cfg.get("status") or "active"
+    if status == "paused":
         raise CampaignPausedError(
             f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is paused — no batch will be sent. "
             "Resume it (set status back to 'active') first if this was unintentional."
+        )
+    if status == "draft":
+        raise CampaignPausedError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is still a draft and hasn't been "
+            "launched — no batch will be sent. Launch it first if this was unintentional."
         )
 
     within_window, window_reason = is_within_sending_window(campaign_cfg.get("schedule") or {})
