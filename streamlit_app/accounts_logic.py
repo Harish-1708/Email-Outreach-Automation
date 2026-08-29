@@ -46,6 +46,22 @@ def build_health_lookup(health_records: List[Dict]) -> Dict[str, Dict]:
     return lookup
 
 
+def merge_account_directories(streamlit_secret_directory: Dict[str, str],
+                               slot_mapping: Dict[str, Dict]) -> Dict[str, str]:
+    """Combines the legacy Streamlit-secrets-based directory with the new
+    slot-mapping file's directory (name -> {"slot": ..., "address": ...})
+    — the slot mapping wins on a name collision, since an account managed
+    through this app always has current data there, while the Streamlit
+    secret might be stale (Streamlit can't write its own secrets, so
+    nothing keeps it in sync after an in-app edit). Same "new source
+    wins" principle as outreach.load_email_accounts merging slots over
+    EMAIL_ACCOUNTS_JSON."""
+    merged = dict(streamlit_secret_directory)
+    for name, entry in slot_mapping.items():
+        merged[name] = entry["address"]
+    return merged
+
+
 def build_account_rows(account_directory: Dict[str, str], sent_today_by_account: Dict[str, int],
                         default_account: str, health_lookup: Dict[str, Dict] = None) -> List[Dict]:
     """account_directory: {account_name: address} (no passwords — see
