@@ -1118,11 +1118,17 @@ def resolve_sender_account_for_send(lead: Dict, campaign_cfg: Dict, accounts: Di
 # =============================================================================
 
 def _build_outbound_message(sender_address: str, to: str, subject: str, body_text: str,
-                             in_reply_to: Optional[str] = None, references: Optional[str] = None):
+                             in_reply_to: Optional[str] = None, references: Optional[str] = None,
+                             cc: Optional[List[str]] = None):
     msg = MIMEText(body_text)
     msg["Subject"] = subject
     msg["From"] = sender_address
     msg["To"] = to
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    # Bcc is deliberately NEVER added as a header — that's what makes it
+    # blind. It only ever affects the SMTP envelope recipient list, in
+    # smtp_send below.
     msg["Date"] = formatdate(localtime=True)
     message_id = make_msgid()
     msg["Message-ID"] = message_id
@@ -1134,13 +1140,46 @@ def _build_outbound_message(sender_address: str, to: str, subject: str, body_tex
 
 
 def smtp_send(address: str, app_password: str, to: str, subject: str, body_text: str,
-              in_reply_to: Optional[str] = None, references: Optional[str] = None) -> Dict[str, str]:
-    msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references)
+              in_reply_to: Optional[str] = None, references: Optional[str] = None,
+              cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None) -> Dict[str, str]:
+    msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references, cc=cc)
+    envelope_recipients = [to] + list(cc or []) + list(bcc or [])
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
         server.login(address, app_password)
-        server.sendmail(address, [to], msg.as_string())
+        server.sendmail(address, envelope_recipients, msg.as_string())
     return {"message_id": message_id}
+
+
+def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, to_email: str,
+                       subject: str, body: str, in_reply_to: Optional[str] = None,
+                       references: Optional[str] = None, cc: Optional[List[str]] = None,
+                       bcc: Optional[List[str]] = None) -> Dict[str, str]:
+    """Sends a one-off manual reply from inside the app — NOT part of the
+    automated batch sequence, and never called with data Streamlit
+    computed insecurely: the caller (Streamlit's Responses tab) is
+    expected to have already resolved in_reply_to/references from the
+    specific inbound message being replied to, exactly the same
+    header-based threading every automated follow-up already relies on —
+    this function just sends what it's given, it doesn't look anything up
+    itself.
+
+    Raises MissingSenderAccountError / InvalidEmailFormatError the same
+    way the rest of this file does, so classify_send_exception and the
+    existing error-logging path both already handle it correctly with no
+    special-casing needed.
+    """
+    if sender_account not in accounts:
+        raise MissingSenderAccountError(f"Unknown SenderAccount '{sender_account}' — not in EMAIL_ACCOUNTS_JSON.")
+    if not is_valid_email_format(to_email):
+        raise InvalidEmailFormatError(f"'{to_email}' is not a valid email address format")
+    for extra in list(cc or []) + list(bcc or []):
+        if not is_valid_email_format(extra):
+            raise InvalidEmailFormatError(f"'{extra}' (Cc/Bcc) is not a valid email address format")
+
+    account = accounts[sender_account]
+    return smtp_send(account["address"], account["app_password"], to=to_email, subject=subject,
+                      body_text=body, in_reply_to=in_reply_to, references=references, cc=cc, bcc=bcc)
 
 
 def classify_send_exception(exc: Exception) -> str:
@@ -2404,6 +2443,63 @@ def cmd_remove_leads(args):
         print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
 
 
+def cmd_send_reply(args):
+    """Reads a fully-resolved reply payload from --file and sends it —
+    this command never looks anything up itself (which response, which
+    thread); Streamlit's Responses tab is expected to have already
+    resolved to/subject/in_reply_to/references from the specific inbound
+    message being replied to before ever committing this payload. See
+    send_manual_reply's docstring for exactly why that split exists.
+
+    Expected payload shape:
+        {"sender_account": "sales1", "to": "lead@abc.com",
+         "subject": "Re: ...", "body": "...", "in_reply_to": "<...>",
+         "references": "<...> <...>", "cc": [...], "bcc": [...],
+         "lead_id": "5"}
+    cc/bcc/lead_id are optional.
+    """
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    lead_id = payload.get("lead_id", "")
+    to_email = payload.get("to", "")
+
+    try:
+        sent = send_manual_reply(
+            accounts, payload["sender_account"], to_email, payload["subject"], payload["body"],
+            in_reply_to=payload.get("in_reply_to"), references=payload.get("references"),
+            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - classify and log exactly like every other send path
+        error_type = classify_send_exception(exc)
+        now_str = datetime.now().strftime(DATETIME_FMT)
+        try:
+            sheets.append_send_log({
+                "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+                "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+                "SenderAccount": payload.get("sender_account", ""), "Status": "error",
+                "MessageID": "", "Error": str(exc)[:500],
+            })
+        except Exception:  # noqa: BLE001 - the error log entry below is the durable record either way
+            pass
+        log_error(sheets, args.campaign, error_type, str(exc), lead_id=lead_id, email_addr=to_email,
+                  stage="manual_reply", batch_id="manual-reply")
+        print(f"FAILED: {exc}")
+        raise SystemExit(1)
+
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    sheets.append_send_log({
+        "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+        "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+        "SenderAccount": payload["sender_account"], "Status": "sent",
+        "MessageID": sent["message_id"], "Error": "",
+    })
+    print(f"Sent. Message-ID: {sent['message_id']}")
+
+
 def cmd_check_replies(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
@@ -2527,6 +2623,16 @@ def main():
     p_remove.add_argument("--campaign", required=True)
     p_remove.add_argument("--file", required=True, help='Path to a JSON file: {"lead_ids": ["5", "8", ...]}')
     p_remove.set_defaults(func=cmd_remove_leads)
+
+    p_reply = sub.add_parser("send-reply",
+                              help="Send a one-off manual reply from a fully-resolved JSON payload file "
+                                   "(never looks anything up itself — see cmd_send_reply's docstring)")
+    p_reply.add_argument("--campaign", required=True)
+    p_reply.add_argument("--file", required=True,
+                          help='Path to a JSON file: {"sender_account": "sales1", "to": "...", '
+                               '"subject": "...", "body": "...", "in_reply_to": "<...>", '
+                               '"references": "<...>", "cc": [...], "bcc": [...], "lead_id": "5"}')
+    p_reply.set_defaults(func=cmd_send_reply)
 
     p_dash = sub.add_parser("dashboard", help="Recompute and write the dashboard tab(s)")
     p_dash.add_argument("--campaign", help="Campaign name (omit if using --all)")
