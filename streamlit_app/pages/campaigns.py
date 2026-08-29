@@ -7,6 +7,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
+from page_state import mark_active_page  # noqa: E402
 from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, TEMPLATES_ROOT, CAMPAIGNS_DIR  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
@@ -145,28 +146,40 @@ def _initialize_campaign_tabs(campaign_name: str) -> None:
         )
 
 
+PLACEHOLDER_INTRO_SUBJECT = "Write your subject here"
+PLACEHOLDER_INTRO_BODY = (
+    "Write your intro email here.\n\n"
+    "This is placeholder text — edit it in the Sequences tab before sending anything."
+)
+
+
 @st.dialog("New Campaign")
 def _new_campaign_dialog(existing_campaigns):
+    st.caption(
+        "Just the name — you'll write the actual email in the Sequences tab once the campaign exists "
+        "(a placeholder Intro is created for you to edit there)."
+    )
     campaign_name = st.text_input("Campaign name (letters, numbers, underscores only)")
-    subject = st.text_input("Subject (Intro)")
-    body = st.text_area("Body (Intro)", height=150)
     confirm = st.checkbox("Create now — it's live immediately, no approval step")
 
-    if st.button("Create Campaign", type="primary", disabled=not confirm):
-        errors = []
+    col1, col2 = st.columns(2)
+    with col1:
+        create_clicked = st.button("Create Campaign", type="primary", disabled=not confirm)
+    with col2:
+        if st.button("Cancel"):
+            st.session_state["show_new_campaign_dialog"] = False
+            st.rerun()
+
+    if create_clicked:
         name_error = validate_campaign_name(campaign_name, existing_campaigns)
         if name_error:
-            errors.append(name_error)
-        content_error = validate_variant_content(subject, body, is_first_stage=True)
-        if content_error:
-            errors.append(content_error)
-
-        if errors:
-            for e in errors:
-                st.error(e)
+            st.error(name_error)
         else:
             try:
-                files = build_campaign_files(campaign_name, "intro", {"A": {"subject": subject, "body": body}})
+                files = build_campaign_files(
+                    campaign_name, "intro",
+                    {"A": {"subject": PLACEHOLDER_INTRO_SUBJECT, "body": PLACEHOLDER_INTRO_BODY}},
+                )
                 client = _get_github_client()
                 client.commit_campaign_files_directly(
                     files=files,
@@ -186,8 +199,9 @@ def _new_campaign_dialog(existing_campaigns):
                 # so plainly is the honest version of this UX.
                 st.session_state["show_new_campaign_dialog"] = False
                 st.success(
-                    f"'{campaign_name}' created. It'll appear in the list below within a minute or so, "
-                    "once the app finishes redeploying with the new campaign — refresh if it's not there yet."
+                    f"'{campaign_name}' created with a placeholder Intro. It'll appear in the list below "
+                    "within a minute or so, once the app finishes redeploying — open it and go to "
+                    "Sequences to write the real email."
                 )
             except GitHubActionsError as exc:
                 st.error(f"Failed to create campaign: {exc}")
@@ -214,6 +228,16 @@ def _render_hub():
         # is reached again; gating solely on the button's own return value
         # (True only on the exact rerun it was clicked) would silently
         # close the dialog the instant you touched anything inside it.
+        #
+        # But that sticky flag creates a SECOND problem on its own: it
+        # survives navigating to a completely different page and back,
+        # since session_state is shared across the whole app — without the
+        # check below, the dialog would silently reopen every time you
+        # returned to this page, even long after you closed it. Only reset
+        # it on a genuine arrival at this page (mark_active_page), never
+        # on a rerun caused by a widget inside the dialog itself.
+        if mark_active_page("campaigns"):
+            st.session_state["show_new_campaign_dialog"] = False
         if st.session_state["show_new_campaign_dialog"]:
             try:
                 existing_campaigns = list_campaigns()
