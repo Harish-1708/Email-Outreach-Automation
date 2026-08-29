@@ -74,3 +74,15 @@ class ReadOnlySheetsConnector:
         tab's column-mapping UI can offer them as valid targets without
         guessing."""
         return self._ws(tab_name).row_values(1)
+
+    def get_account_health(self, tab_name: str = "Email Accounts Health") -> List[Dict]:
+        """The shared (not per-campaign) account connectivity snapshot
+        written by check_account_health.yml. Returns [] rather than
+        raising if the tab doesn't exist yet — unlike every per-campaign
+        tab, this one has no natural "first run creates it" trigger from
+        the Streamlit side, so a brand new deployment shouldn't show an
+        error here before the periodic workflow has ever run once."""
+        try:
+            return self._ws(tab_name).get_all_records()
+        except ReadOnlySheetsError:
+            return []
