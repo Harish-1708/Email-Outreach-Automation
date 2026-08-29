@@ -1,0 +1,55 @@
+name: Import Leads
+
+# Triggered by the Streamlit Data tab right after it commits a mapped
+# import payload file — never called with data Streamlit passes directly
+# as a workflow input (payloads can be too large for that; a committed
+# file has no such limit).
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "Campaign name"
+        required: true
+      payload_path:
+        description: "Path to the committed JSON payload file, e.g. imports/Foo/2026-08-29-143012.json"
+        required: true
+
+# Two simultaneous imports for the SAME campaign could both read the
+# current max LeadID before either writes, then both assign colliding
+# IDs — the same class of race send_batch.yml/check_replies.yml already
+# guard against. Grouping by campaign lets different campaigns import
+# concurrently while serializing anything touching the same one.
+concurrency:
+  group: import-leads-${{ github.event.inputs.campaign }}
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Import leads
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python outreach.py import-leads --campaign "${{ github.event.inputs.campaign }}" \
+            --file "${{ github.event.inputs.payload_path }}" | tee import_output.txt
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat import_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove the processed payload file
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f "${{ github.event.inputs.payload_path }}"
+          git add -A
+          git commit -m "Remove processed import payload: ${{ github.event.inputs.payload_path }}" || echo "Nothing to commit"
+          git push
