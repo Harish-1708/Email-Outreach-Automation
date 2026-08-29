@@ -88,7 +88,7 @@ st.dataframe(
         "Sent Today (all campaigns)": [r["sent_today"] for r in rows],
         "Default": ["Yes" if r["is_default"] else "" for r in rows],
     },
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
