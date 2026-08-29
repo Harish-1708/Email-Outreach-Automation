@@ -5,6 +5,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from page_state import mark_active_page  # noqa: E402
 from auth import login_gate  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
@@ -12,6 +13,8 @@ from overview_logic import build_all_campaigns_overview, OVERVIEW_COLUMNS  # noq
 
 # Page config is set once, centrally, in app.py via st.navigation/st.Page —
 # calling st.set_page_config here too would raise an error.
+
+mark_active_page("overview")
 
 if not login_gate():
     st.stop()
