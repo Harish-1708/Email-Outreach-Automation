@@ -93,6 +93,15 @@ Accounts page.
 
 ## Known limitations (by design, not bugs)
 
+- **Sheets reads on the campaign detail page are cached for 30 seconds.**
+  This isn't just a performance nicety — Google's Sheets API caps reads at
+  60/minute/user, and Streamlit reruns the entire script on nearly every
+  widget interaction. Without caching, a few minutes of ordinary use
+  (adjusting several CSV mapping dropdowns in a row, for example) could
+  exceed that quota and return a `429`. If you need to see a change
+  immediately rather than waiting up to 30s, use the **🔄 Refresh data**
+  button at the top of the campaign detail page.
+
 - **Leads are imported/removed via a commit-then-trigger-workflow
   pattern**, same as template creation — Streamlit commits a JSON payload
   file (`imports/<campaign>/...` or `removals/<campaign>/...`), then
