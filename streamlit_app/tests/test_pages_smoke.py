@@ -496,6 +496,35 @@ def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
     assert "runs automatically every 2 hours" in caption_texts
 
 
+def test_email_accounts_page_refresh_button_busts_caches_and_refetches():
+    fake_ws = {
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Email Accounts Health": FakeWorksheet([
+            {"AccountName": "sales1", "Address": "sales1@x.com", "Status": "Connected",
+             "Detail": "", "CheckedAt": "2026-08-29 12:00:00"},
+        ]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    secrets = _dashboard_secrets()
+    secrets["email_accounts_directory"] = {"sales1": "sales1@x.com"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(secrets)
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        assert list(at.exception) == []
+        refresh_button = next(b for b in at.button if "Refresh" in b.label)
+        refresh_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Refresh raised: {list(at.exception)}"
+    assert list(at.error) == []
+
+
 def _campaigns_page_fake_ws():
     return {
         "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
