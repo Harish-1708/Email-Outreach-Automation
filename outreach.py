@@ -27,7 +27,8 @@ import smtplib
 import ssl
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.utils import make_msgid, formatdate, parsedate_to_datetime
@@ -215,6 +216,14 @@ class CampaignPausedError(RuntimeError):
     """Raised by send_batch when campaign_cfg["status"] == "paused" —
     never raised by build_batch/preview, which stay usable regardless of
     pause state so a paused campaign can still be reviewed."""
+    pass
+
+
+class OutsideSendingWindowError(RuntimeError):
+    """Raised by send_batch when campaign_cfg["schedule"] restricts
+    sending to specific days/hours and right now doesn't qualify — like
+    CampaignPausedError, never raised by build_batch/preview, so a
+    schedule-restricted campaign can still be reviewed any time."""
     pass
 
 
@@ -829,6 +838,83 @@ def find_duplicate_email_leads(leads: List[Dict]) -> Dict[str, List[Dict]]:
             continue
         by_email.setdefault(email, []).append(lead)
     return {email: rows for email, rows in by_email.items() if len(rows) > 1}
+
+
+VALID_SEND_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def is_within_sending_window(schedule: Dict, now_utc: Optional[datetime] = None) -> Tuple[bool, str]:
+    """schedule: {timezone, window_start, window_end, send_days} — all
+    optional, and a missing/empty schedule (or one with no timezone) means
+    "always allowed", exactly matching every campaign's behavior before
+    this feature existed. Returns (is_within, reason) — reason is only
+    ever non-empty when is_within is False.
+
+    Deliberately takes now_utc as a parameter (defaulting to the real
+    current time) rather than always calling datetime.now() internally —
+    that's what makes this testable across specific moments, including
+    DST transitions, without mocking the clock.
+
+    Uses a real IANA timezone via the stdlib zoneinfo — never a fixed
+    offset — so DST is handled correctly automatically; this is exactly
+    the category of bug (silently sending at the wrong local time, or
+    silently never sending at all) that's easy to get subtly wrong with a
+    naive UTC-offset calculation.
+    """
+    if not schedule:
+        return True, ""
+
+    tz_name = schedule.get("timezone")
+    if not tz_name:
+        return True, ""
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(
+            f"Invalid timezone '{tz_name}' in schedule config — use a real IANA name "
+            f"(e.g. 'America/Los_Angeles', not 'PST'). Error: {exc}"
+        )
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    local_now = now_utc.astimezone(tz)
+
+    send_days = schedule.get("send_days")
+    if send_days:
+        normalized_days = [d.strip().lower()[:3] for d in send_days]
+        today = VALID_SEND_DAYS[local_now.weekday()]
+        if today not in normalized_days:
+            return False, (
+                f"Today ({today}) is not one of this campaign's send_days ({', '.join(normalized_days)}) "
+                f"in {tz_name}"
+            )
+
+    window_start = schedule.get("window_start")
+    window_end = schedule.get("window_end")
+    if window_start and window_end:
+        try:
+            start_t = datetime.strptime(window_start, "%H:%M").time()
+            end_t = datetime.strptime(window_end, "%H:%M").time()
+        except ValueError as exc:
+            raise ConfigError(f"Invalid window_start/window_end in schedule config (expected HH:MM): {exc}")
+
+        current_t = local_now.time()
+        if start_t <= end_t:
+            in_window = start_t <= current_t <= end_t
+        else:
+            # A window that crosses midnight (e.g. 22:00-06:00) — "in
+            # window" means AFTER start OR BEFORE end, not between them.
+            in_window = current_t >= start_t or current_t <= end_t
+
+        if not in_window:
+            return False, (
+                f"Current time {current_t.strftime('%H:%M')} {tz_name} is outside the sending "
+                f"window ({window_start}-{window_end})"
+            )
+
+    return True, ""
 
 
 def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
@@ -1605,14 +1691,23 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     see build_batch's docstring for exactly what is and isn't skipped.
 
     Raises CampaignPausedError immediately, before touching anything, if
-    campaign_cfg["status"] == "paused" — Preview/build_batch are
-    deliberately NOT gated by this, so a paused campaign can still be
-    reviewed, just not sent.
+    campaign_cfg["status"] == "paused", and OutsideSendingWindowError if
+    campaign_cfg["schedule"] restricts sending to specific days/hours and
+    right now doesn't qualify — Preview/build_batch are deliberately NOT
+    gated by either, so a paused or schedule-restricted campaign can
+    still be reviewed any time, just not sent.
     """
     if campaign_cfg.get("status") == "paused":
         raise CampaignPausedError(
             f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is paused — no batch will be sent. "
             "Resume it (set status back to 'active') first if this was unintentional."
+        )
+
+    within_window, window_reason = is_within_sending_window(campaign_cfg.get("schedule") or {})
+    if not within_window:
+        raise OutsideSendingWindowError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is outside its configured sending "
+            f"window — no batch will be sent. {window_reason}."
         )
 
     stages = campaign_cfg["stages"]
@@ -2208,7 +2303,7 @@ def cmd_send(args):
     try:
         results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size,
                               forced_variant=forced_variant, ignore_wait_days=args.ignore_wait_days)
-    except CampaignPausedError as exc:
+    except (CampaignPausedError, OutsideSendingWindowError) as exc:
         print(f"SKIPPED: {exc}")
         return
 
