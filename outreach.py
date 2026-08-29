@@ -141,6 +141,8 @@ STATUS_STOPPED_BOUNCED = "Stopped - Bounced"
 STATUS_STOPPED_REJECTED = "Stopped - Rejected"
 STATUS_PAUSED = "Paused"
 STATUS_COMPLETED = "Completed"
+STATUS_REMOVED = "Removed"  # soft-remove from the Data tab — never a hard delete,
+                            # see import_leads/update_lead_statuses docstrings
 
 TERMINAL_STATUSES = {
     STATUS_STOPPED_REPLIED,
@@ -148,6 +150,7 @@ TERMINAL_STATUSES = {
     STATUS_STOPPED_REJECTED,
     STATUS_PAUSED,
     STATUS_COMPLETED,
+    STATUS_REMOVED,
 }
 
 CLASSIFICATION_GENUINE = "Genuine Reply"
@@ -543,6 +546,34 @@ class SheetsConnector:
                 "range": gspread.utils.rowcol_to_a1(row_number, col_index),
                 "values": [[value]],
             })
+        if updates:
+            self.master_ws.batch_update(updates)
+
+    def append_lead(self, fields: Dict[str, str]) -> None:
+        """Appends ONE new row. Unlike update_lead_fields, this is NOT
+        restricted to MASTER_COLUMNS — it builds the row against whatever
+        the sheet's ACTUAL header row currently is, so any custom trailing
+        columns (Title, Website, LinkedIn, ...) get filled in correctly
+        too. Any field not present in `fields` is left blank in that
+        column, not an error — a CSV import commonly won't map every
+        column."""
+        header = self.master_ws.row_values(1)
+        row = [str(fields.get(col, "")) for col in header]
+        self.master_ws.append_row(row, value_input_option="RAW")
+
+    def update_lead_statuses(self, row_numbers_to_status: Dict[int, str]) -> None:
+        """Bulk status update (e.g. soft-remove) — one batch_update call
+        covering every row, not one API call per row. Always stamps
+        LastActionAt alongside Status, matching every other status write
+        in this file."""
+        gspread = self._gspread
+        now_str = datetime.now().strftime(DATETIME_FMT)
+        status_col = MASTER_COLUMNS.index("Status") + 1
+        last_action_col = MASTER_COLUMNS.index("LastActionAt") + 1
+        updates = []
+        for row_number, status in row_numbers_to_status.items():
+            updates.append({"range": gspread.utils.rowcol_to_a1(row_number, status_col), "values": [[status]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(row_number, last_action_col), "values": [[now_str]]})
         if updates:
             self.master_ws.batch_update(updates)
 
@@ -1280,6 +1311,61 @@ def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict
             results.append({"lead_id": lead_id, "status": "skipped_unknown_variant",
                              "stage": stages[sent_indices[0]]["name"]})
     return results
+
+
+def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Dict[str, str]]) -> Dict[str, int]:
+    """Appends new_leads as new Master Sheet rows. Skips any row with no
+    Email (mandatory everywhere else in this system) and any row whose
+    Email already exists among current leads (case-insensitive) — the
+    same "first row wins" assumption find_duplicate_email_leads already
+    enforces elsewhere, just applied at import time instead of left for
+    that check to flag later.
+
+    Every imported lead's Approval is left BLANK (Pending) unless the
+    caller explicitly set it in that row's dict — a bulk import should
+    never default new leads straight to "Yes" and eligible to send; a
+    human needs to approve them first, same as any manually-added row.
+    """
+    existing = sheets.get_all_leads()
+    existing_ids = [int(l["LeadID"]) for l in existing if str(l.get("LeadID", "")).strip().isdigit()]
+    next_id = (max(existing_ids) + 1) if existing_ids else 1
+    existing_emails = {(l.get("Email") or "").strip().lower() for l in existing if (l.get("Email") or "").strip()}
+
+    imported = 0
+    skipped_duplicate = 0
+    skipped_no_email = 0
+    for lead in new_leads:
+        email = (lead.get("Email") or "").strip()
+        if not email:
+            skipped_no_email += 1
+            continue
+        if email.lower() in existing_emails:
+            skipped_duplicate += 1
+            continue
+        row = dict(lead)
+        row["LeadID"] = str(next_id)
+        row["Campaign"] = campaign_name
+        row.setdefault("Approval", "")
+        sheets.append_lead(row)
+        existing_emails.add(email.lower())
+        next_id += 1
+        imported += 1
+
+    return {"imported": imported, "skipped_duplicate": skipped_duplicate, "skipped_no_email": skipped_no_email}
+
+
+def remove_leads(sheets: SheetsConnector, lead_ids: List[str]) -> Dict[str, int]:
+    """Soft-remove: sets Status=Removed for every matching LeadID — NEVER
+    a hard delete. The row and everything already sent to that lead stays
+    exactly as it was; get_eligible_leads already excludes any
+    TERMINAL_STATUSES status, which Removed is now part of, so a removed
+    lead simply stops being picked up for anything further."""
+    existing = sheets.get_all_leads()
+    lead_id_set = {str(lid) for lid in lead_ids}
+    row_updates = {l["_row"]: STATUS_REMOVED for l in existing if str(l.get("LeadID", "")) in lead_id_set}
+    sheets.update_lead_statuses(row_updates)
+    found_ids = {str(l.get("LeadID", "")) for l in existing if l["_row"] in row_updates}
+    return {"removed": len(row_updates), "not_found": len(lead_id_set - found_ids)}
 
 
 def build_batch(campaign_cfg: Dict, leads: List[Dict], stage_name: str, batch_size: int,
@@ -2184,6 +2270,45 @@ def cmd_backfill_thread_subject(args):
     print(f"\nWrote ThreadSubject for {len(to_backfill)} lead(s).")
 
 
+def cmd_import_leads(args):
+    """Reads {"leads": [{...}, ...]} from --file and appends them to the
+    Master Sheet. This is the ONLY thing that ever writes to the Master
+    Sheet from a bulk-import path — invoked by import_leads.yml after
+    Streamlit commits the mapped payload file, never called with
+    Streamlit-supplied data any other way."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    new_leads = payload.get("leads", [])
+    if not new_leads:
+        print("No leads in payload file — nothing to do.")
+        return
+    summary = import_leads(sheets, args.campaign, new_leads)
+    print(f"Imported {summary['imported']} lead(s).")
+    if summary["skipped_duplicate"]:
+        print(f"Skipped {summary['skipped_duplicate']} duplicate email(s) (already in the Master Sheet).")
+    if summary["skipped_no_email"]:
+        print(f"Skipped {summary['skipped_no_email']} row(s) with no email address.")
+
+
+def cmd_remove_leads(args):
+    """Reads {"lead_ids": ["5", "8", ...]} from --file and sets their
+    Status to Removed — never a hard delete, see remove_leads' docstring."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    lead_ids = payload.get("lead_ids", [])
+    if not lead_ids:
+        print("No lead_ids in payload file — nothing to do.")
+        return
+    summary = remove_leads(sheets, lead_ids)
+    print(f"Removed {summary['removed']} lead(s) (Status set to '{STATUS_REMOVED}').")
+    if summary["not_found"]:
+        print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
+
+
 def cmd_check_replies(args):
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
@@ -2295,6 +2420,18 @@ def main():
     p_backfill.add_argument("--dry-run", action="store_true",
                              help="Show what would be backfilled without writing anything")
     p_backfill.set_defaults(func=cmd_backfill_thread_subject)
+
+    p_import = sub.add_parser("import-leads", help="Bulk-import leads from a JSON payload file")
+    p_import.add_argument("--campaign", required=True)
+    p_import.add_argument("--file", required=True, help='Path to a JSON file: {"leads": [{...}, ...]}')
+    p_import.set_defaults(func=cmd_import_leads)
+
+    p_remove = sub.add_parser("remove-leads",
+                               help="Soft-remove leads (sets Status=Removed, never a hard delete) "
+                                    "from a JSON payload file")
+    p_remove.add_argument("--campaign", required=True)
+    p_remove.add_argument("--file", required=True, help='Path to a JSON file: {"lead_ids": ["5", "8", ...]}')
+    p_remove.set_defaults(func=cmd_remove_leads)
 
     p_dash = sub.add_parser("dashboard", help="Recompute and write the dashboard tab(s)")
     p_dash.add_argument("--campaign", help="Campaign name (omit if using --all)")
