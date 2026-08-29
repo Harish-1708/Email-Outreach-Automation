@@ -34,11 +34,17 @@ def _reset_streamlit_global_caches():
 
 
 class FakeWorksheet:
-    def __init__(self, records):
+    def __init__(self, records, header=None):
         self._records = records
+        self._header = header or (list(records[0].keys()) if records else [])
 
     def get_all_records(self):
         return [dict(r) for r in self._records]
+
+    def row_values(self, row_number):
+        if row_number == 1:
+            return list(self._header)
+        raise NotImplementedError("Fake only supports reading the header row (row 1)")
 
 
 class FakeSpreadsheet:
@@ -344,7 +350,7 @@ def test_campaigns_detail_view_stub_tabs_are_honest_about_not_being_built():
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
     assert "isn't built yet" in info_texts
-    assert "Phase C" in info_texts
+    assert "Phase D" in info_texts  # Sequences — Data (Phase C) is real now, no longer a stub
     assert "Phase H" in info_texts
 
 
@@ -368,6 +374,160 @@ def test_campaigns_back_button_clears_selected_campaign():
     assert "selected_campaign" not in at.session_state
     titles = [t.value for t in at.title]
     assert "Campaigns" in titles
+
+
+def _empty_master_fake_ws():
+    return {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [], header=["LeadID", "FirstName", "LastName", "Email", "Company", "Campaign", "Approval",
+                        "SenderAccount", "RequestedAction", "CurrentStage", "ScheduledAt", "IntroSentAt",
+                        "IntroVariant", "Status", "LastActionAt"]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+
+
+def test_data_tab_upload_shows_mapping_ui_with_correct_defaults():
+    fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\nAlex,alex@abc.com\n", "text/csv")
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Data tab upload raised: {list(at.exception)}"
+    assert list(at.error) == []
+    mapping = {sb.label: sb.value for sb in at.selectbox if "maps to" in sb.label}
+    assert mapping["'First Name' maps to"] == "FirstName"
+    assert mapping["'Email' maps to"] == "Email"
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "2 of 2 row" in markdown_text
+
+
+def test_data_tab_import_commits_payload_and_triggers_workflow():
+    fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured["path"] = path
+        captured["content"] = content_bytes
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\n", "text/csv")
+        at.run(timeout=15)
+        import_button = next(b for b in at.button if b.label == "Import Leads")
+        import_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Import click raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["workflow"] == "import_leads.yml"
+    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    assert captured["path"].startswith("imports/Kelson_Creators_Licensing/")
+    import json
+    payload = json.loads(captured["content"].decode("utf-8"))
+    assert payload == {"leads": [{"FirstName": "Sam", "Email": "sam@abc.com"}]}
+
+
+def test_data_tab_shows_error_when_no_column_mapped_to_email():
+    fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"First Name,Nickname\nSam,Sammy\n", "text/csv")
+        at.run(timeout=15)
+        # Neither column auto-maps to Email — force it to stay unmapped.
+        email_selectbox = next(sb for sb in at.selectbox if "'Nickname' maps to" in sb.label)
+        email_selectbox.set_value("-- Skip --")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Email" in error_texts
+
+
+def test_data_tab_lead_table_and_remove_flow():
+    fake_ws = {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
+              "Company": "Acme", "Approval": "Yes", "Status": ""},
+             {"LeadID": "2", "FirstName": "Alex", "LastName": "Kim", "Email": "alex@abc.com",
+              "Company": "Beta", "Approval": "Yes", "Status": ""}]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured["path"] = path
+        captured["content"] = content_bytes
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        assert list(at.exception) == []
+        remove_select = next(ms for ms in at.multiselect if "Select leads to remove" in ms.label)
+        matching_option = next(opt for opt in remove_select.options if "1 —" in opt)
+        remove_select.set_value([matching_option])
+        at.run(timeout=15)
+
+        remove_button = next(b for b in at.button if b.label == "Remove Selected")
+        remove_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Remove flow raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["workflow"] == "remove_leads.yml"
+    import json
+    payload = json.loads(captured["content"].decode("utf-8"))
+    assert payload == {"lead_ids": ["1"]}
 
 
 def test_login_lockout_after_repeated_failures():
