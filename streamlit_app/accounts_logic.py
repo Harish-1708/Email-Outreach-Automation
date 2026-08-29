@@ -28,17 +28,44 @@ def aggregate_sent_today_by_account(send_logs_by_campaign: Dict[str, List[Dict]]
     return totals
 
 
+def build_health_lookup(health_records: List[Dict]) -> Dict[str, Dict]:
+    """{account_name: {"status": ..., "detail": ..., "checked_at": ...}}
+    from the raw Sheet records written by check_account_health.yml —
+    keyed by AccountName exactly as EMAIL_ACCOUNTS_JSON's own keys are,
+    so this merges directly against account_directory's keys with no
+    fuzzy matching needed."""
+    lookup: Dict[str, Dict] = {}
+    for record in health_records:
+        name = record.get("AccountName", "")
+        if name:
+            lookup[name] = {
+                "status": record.get("Status", ""),
+                "detail": record.get("Detail", ""),
+                "checked_at": record.get("CheckedAt", ""),
+            }
+    return lookup
+
+
 def build_account_rows(account_directory: Dict[str, str], sent_today_by_account: Dict[str, int],
-                        default_account: str) -> List[Dict]:
+                        default_account: str, health_lookup: Dict[str, Dict] = None) -> List[Dict]:
     """account_directory: {account_name: address} (no passwords — see
     module docstring). Returns rows sorted by account name, each with
-    today's send count and whether it's the global default."""
+    today's send count, whether it's the global default, and connection
+    status. health_lookup is optional — a brand new deployment (before
+    check_account_health.yml has ever run) shows "Unknown" rather than
+    erroring, matching ReadOnlySheetsConnector.get_account_health's own
+    "tab doesn't exist yet" -> [] behavior."""
+    health_lookup = health_lookup or {}
     rows = []
     for name in sorted(account_directory.keys()):
+        health = health_lookup.get(name, {})
         rows.append({
             "name": name,
             "address": account_directory[name],
             "sent_today": sent_today_by_account.get(name, 0),
             "is_default": name == default_account,
+            "status": health.get("status") or "Unknown",
+            "status_detail": health.get("detail", ""),
+            "checked_at": health.get("checked_at", ""),
         })
     return rows
