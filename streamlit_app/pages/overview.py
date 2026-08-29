@@ -68,7 +68,7 @@ if rows:
     st.divider()
     st.dataframe(
         {col: [row[i] for row in rows] for i, col in enumerate(OVERVIEW_COLUMNS)},
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 else:
