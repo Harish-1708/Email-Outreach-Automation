@@ -9,6 +9,15 @@ directly — no GitHub trip, no pull request to approve.
 
 ## What each page does
 
+- **🗂️ Campaigns** — the everyday view (Phase A + B of the Campaigns Hub
+  plan). Search, see every campaign's status at a glance, open one for a
+  detailed Analytics tab (per-stage, per-variant, per-sender breakdowns).
+  Status is one of: 📝 Draft, 🟢 Running, ⏸ Paused, ✅ Completed, ⚠️
+  Attention needed (readiness problems — no sender, no templates, or no
+  approved leads) — see the plan doc for exact definitions. The other
+  five tabs inside a campaign (Data, Sequences, Schedule, Settings,
+  Responses) are honest placeholders for now, not fake UI — each says
+  plainly which phase it's planned for.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -86,6 +95,16 @@ Accounts page.
 
 ## Known limitations (by design, not bugs)
 
+- **The Campaigns Hub's Data/Sequences/Schedule/Settings/Responses tabs
+  are placeholders.** Only Analytics is real. Use Controls/New Campaign
+  directly for anything those tabs would eventually cover — see
+  `campaigns-hub-plan.md` for the phase each one is planned for.
+- **A campaign's `status` (draft/active/paused) lives in its config
+  override file** (`config/campaigns/<name>.yaml`), not the Sheet.
+  Pausing/resuming currently means editing that file directly (a proper
+  Pause/Resume button is Phase G). Unset `status` always means "active" —
+  this was chosen specifically so introducing the field never silently
+  paused a pre-existing campaign.
 - **No persistent login session.** Username/password here is intentionally
   simple — no OAuth means no "forgot password" flow and no cross-session
   cookie. Closing the tab logs you out. If this becomes annoying,
