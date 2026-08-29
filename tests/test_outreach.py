@@ -1,5 +1,6 @@
 """Unit tests for outreach.py (SMTP/IMAP edition)."""
 
+import argparse
 import os
 import pathlib
 import sys
@@ -1194,6 +1195,299 @@ def test_build_outbound_message_sets_threading_headers_when_provided():
     )
     assert msg["In-Reply-To"] == "<abc@mail.gmail.com>"
     assert msg["References"] == "<abc@mail.gmail.com>"
+
+
+def test_build_outbound_message_sets_cc_header_when_provided():
+    msg, _ = outreach._build_outbound_message(
+        "me@work.com", "lead@abc.com", "Hello", "Body", cc=["a@abc.com", "b@abc.com"],
+    )
+    assert msg["Cc"] == "a@abc.com, b@abc.com"
+
+
+def test_build_outbound_message_omits_cc_header_when_not_provided():
+    msg, _ = outreach._build_outbound_message("me@work.com", "lead@abc.com", "Hello", "Body")
+    assert msg["Cc"] is None
+
+
+def test_build_outbound_message_never_adds_a_bcc_header():
+    """Bcc must never appear in the message itself — that's what makes it
+    blind. build_outbound_message doesn't even accept a bcc parameter;
+    only smtp_send does, where it can only ever affect the SMTP envelope
+    recipient list, never the message content."""
+    import inspect
+    sig = inspect.signature(outreach._build_outbound_message)
+    assert "bcc" not in sig.parameters
+
+
+def test_smtp_send_cc_recipients_included_in_envelope(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, address, password):
+            pass
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            captured["to_addrs"] = to_addrs
+            captured["msg_string"] = msg_string
+
+    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
+    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
+                        cc=["cc1@abc.com", "cc2@abc.com"])
+
+    assert captured["to_addrs"] == ["lead@abc.com", "cc1@abc.com", "cc2@abc.com"]
+    assert "Cc: cc1@abc.com, cc2@abc.com" in captured["msg_string"]
+
+
+def test_smtp_send_bcc_recipients_in_envelope_but_never_in_message_text(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, address, password):
+            pass
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            captured["to_addrs"] = to_addrs
+            captured["msg_string"] = msg_string
+
+    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
+    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
+                        bcc=["secret@abc.com"])
+
+    assert "secret@abc.com" in captured["to_addrs"]  # gets the mail
+    assert "secret@abc.com" not in captured["msg_string"]  # but invisible to every other recipient
+    assert "Bcc" not in captured["msg_string"]
+
+
+def test_smtp_send_cc_and_bcc_together(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, address, password):
+            pass
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            captured["to_addrs"] = to_addrs
+
+    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
+    outreach.smtp_send("me@work.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
+                        cc=["cc@abc.com"], bcc=["bcc@abc.com"])
+
+    assert captured["to_addrs"] == ["lead@abc.com", "cc@abc.com", "bcc@abc.com"]
+
+
+def test_smtp_send_with_no_cc_or_bcc_envelope_unchanged():
+    """Backward-compat guarantee — every existing call site (build_batch's
+    normal sends) doesn't pass cc/bcc at all; the envelope must stay
+    exactly [to], matching behavior before this feature existed."""
+    import inspect
+    sig = inspect.signature(outreach.smtp_send)
+    assert sig.parameters["cc"].default is None
+    assert sig.parameters["bcc"].default is None
+
+
+# =============================================================================
+# send_manual_reply — Phase H1. Deliberately never looks anything up
+# itself (which thread, which lead) — the caller is expected to have
+# already resolved to/subject/in_reply_to/references; this only sends
+# and validates what it's given.
+# =============================================================================
+
+ACCOUNTS_FOR_REPLY = {"sales1": {"address": "sales1@gmail.com", "app_password": "aaaa bbbb cccc dddd"}}
+
+
+def test_send_manual_reply_calls_smtp_send_with_resolved_threading(monkeypatch):
+    captured = {}
+
+    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
+                        cc=None, bcc=None):
+        captured.update(locals())
+        return {"message_id": "<reply1@mail.gmail.com>"}
+
+    monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
+
+    result = outreach.send_manual_reply(
+        ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Re: Hi", "Thanks for your interest!",
+        in_reply_to="<inbound1@mail.gmail.com>", references="<orig@mail.gmail.com> <inbound1@mail.gmail.com>",
+    )
+
+    assert result == {"message_id": "<reply1@mail.gmail.com>"}
+    assert captured["to"] == "lead@abc.com"
+    assert captured["in_reply_to"] == "<inbound1@mail.gmail.com>"
+    assert captured["references"] == "<orig@mail.gmail.com> <inbound1@mail.gmail.com>"
+    assert captured["address"] == "sales1@gmail.com"
+
+
+def test_send_manual_reply_passes_through_cc_and_bcc(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(outreach, "smtp_send",
+                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
+
+    outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                cc=["cc@abc.com"], bcc=["bcc@abc.com"])
+
+    assert captured["cc"] == ["cc@abc.com"]
+    assert captured["bcc"] == ["bcc@abc.com"]
+
+
+def test_send_manual_reply_raises_for_unknown_sender_account():
+    with pytest.raises(outreach.MissingSenderAccountError, match="ghost_account"):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "ghost_account", "lead@abc.com", "Hi", "Body")
+
+
+def test_send_manual_reply_raises_for_invalid_to_email():
+    with pytest.raises(outreach.InvalidEmailFormatError):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "not-an-email", "Hi", "Body")
+
+
+def test_send_manual_reply_raises_for_invalid_cc_email():
+    with pytest.raises(outreach.InvalidEmailFormatError, match="Cc/Bcc"):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                    cc=["not-an-email"])
+
+
+def test_send_manual_reply_raises_for_invalid_bcc_email():
+    with pytest.raises(outreach.InvalidEmailFormatError, match="Cc/Bcc"):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                    bcc=["not-an-email"])
+
+
+def test_send_manual_reply_never_calls_smtp_for_invalid_recipient(monkeypatch):
+    smtp_called = []
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1))
+    with pytest.raises(outreach.InvalidEmailFormatError):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "not-an-email", "Hi", "Body")
+    assert smtp_called == []
+
+
+def test_send_manual_reply_works_with_no_threading_info():
+    """A reply doesn't strictly require in_reply_to/references — while
+    every real use case from the Responses tab will supply them, the
+    function itself shouldn't require it (matches smtp_send's own
+    Optional parameters)."""
+    import inspect
+    sig = inspect.signature(outreach.send_manual_reply)
+    assert sig.parameters["in_reply_to"].default is None
+    assert sig.parameters["references"].default is None
+
+
+# =============================================================================
+# cmd_send_reply — the CLI/workflow entry point
+# =============================================================================
+
+def _write_reply_payload(tmp_path, **overrides):
+    import json as _json
+    payload = {
+        "sender_account": "sales1", "to": "lead@abc.com", "subject": "Re: Hi",
+        "body": "Thanks!", "in_reply_to": "<inbound1@mail.gmail.com>",
+        "references": "<orig@mail.gmail.com> <inbound1@mail.gmail.com>",
+        "lead_id": "5",
+    }
+    payload.update(overrides)
+    path = tmp_path / "reply_payload.json"
+    path.write_text(_json.dumps(payload))
+    return str(path)
+
+
+def test_cmd_send_reply_success_logs_sent_to_send_log(monkeypatch, tmp_path, capsys):
+    fake_sheets = FakeSheets([])
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<reply1@mail.gmail.com>"})
+
+    payload_path = _write_reply_payload(tmp_path)
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+    outreach.cmd_send_reply(args)
+
+    assert len(fake_sheets.send_log) == 1
+    entry = fake_sheets.send_log[0]
+    assert entry["Status"] == "sent"
+    assert entry["Stage"] == "manual_reply"
+    assert entry["MessageID"] == "<reply1@mail.gmail.com>"
+    assert entry["LeadID"] == "5"
+    assert "Sent." in capsys.readouterr().out
+
+
+def test_cmd_send_reply_failure_logs_error_and_exits_nonzero(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+
+    def failing_smtp_send(*a, **kw):
+        raise RuntimeError("SMTP boom")
+
+    monkeypatch.setattr(outreach, "smtp_send", failing_smtp_send)
+
+    payload_path = _write_reply_payload(tmp_path)
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        outreach.cmd_send_reply(args)
+    assert exc_info.value.code == 1
+
+    assert len(fake_sheets.send_log) == 1
+    assert fake_sheets.send_log[0]["Status"] == "error"
+    assert len(fake_sheets.error_log) == 1
+
+
+def test_cmd_send_reply_unknown_sender_account_isolated(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+
+    payload_path = _write_reply_payload(tmp_path, sender_account="ghost_account")
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+
+    with pytest.raises(SystemExit):
+        outreach.cmd_send_reply(args)
+
+    assert fake_sheets.error_log[0]["ErrorType"] == outreach.ERR_MISSING_SENDER_ACCOUNT
+
+
+def test_cmd_send_reply_passes_cc_bcc_through_to_send(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    captured = {}
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+    monkeypatch.setattr(outreach, "smtp_send",
+                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
+
+    payload_path = _write_reply_payload(tmp_path, cc=["cc@abc.com"], bcc=["bcc@abc.com"])
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+    outreach.cmd_send_reply(args)
+
+    assert captured["cc"] == ["cc@abc.com"]
+    assert captured["bcc"] == ["bcc@abc.com"]
 
 
 # =============================================================================
