@@ -100,3 +100,27 @@ def test_get_header_missing_tab_raises_readonly_sheets_error():
     connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({}))
     with pytest.raises(ReadOnlySheetsError, match="doesn't exist yet"):
         connector.get_header("Nonexistent Tab")
+
+
+def test_get_account_health_returns_records_when_tab_exists():
+    ws = FakeWorksheet([{"AccountName": "sales1", "Address": "sales1@x.com", "Status": "Connected",
+                          "Detail": "", "CheckedAt": "2026-08-29 09:00:00"}])
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({"Email Accounts Health": ws}))
+    records = connector.get_account_health()
+    assert len(records) == 1
+    assert records[0]["Status"] == "Connected"
+
+
+def test_get_account_health_returns_empty_list_when_tab_missing():
+    """Unlike every other tab, this one has no 'first run creates it'
+    trigger from Streamlit's side — a fresh deployment before the
+    periodic health-check workflow has ever run shouldn't show an error."""
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({}))
+    assert connector.get_account_health() == []
+
+
+def test_get_account_health_respects_custom_tab_name():
+    ws = FakeWorksheet([{"AccountName": "sales1"}])
+    connector = ReadOnlySheetsConnector(_spreadsheet=FakeSpreadsheet({"Custom Tab Name": ws}))
+    records = connector.get_account_health(tab_name="Custom Tab Name")
+    assert len(records) == 1
