@@ -1,17 +1,25 @@
 import os
 import sys
+import time
 
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from auth import login_gate  # noqa: E402
+from auth import login_gate, current_user  # noqa: E402
+from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS  # noqa: E402
+from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
 from campaigns_hub_logic import build_campaigns_hub, filter_campaigns_by_search  # noqa: E402
 from campaign_analytics_logic import (  # noqa: E402
     build_overview_summary, build_per_stage_table, build_per_variant_table,
     build_sender_table, build_error_summary,
+)
+from data_import_logic import (  # noqa: E402
+    parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping, count_valid_rows,
+    build_import_payload, import_payload_path, build_removal_payload, removal_payload_path,
+    payload_to_bytes, filter_leads, search_leads, KNOWN_FIELDS, FILTER_OPTIONS,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +29,12 @@ import outreach  # noqa: E402
 
 if not login_gate():
     st.stop()
+
+
+@st.cache_resource(show_spinner=False)
+def _get_github_client() -> GitHubClient:
+    gh = st.secrets["github"]
+    return GitHubClient(token=gh["token"], owner=gh["owner"], repo=gh["repo"])
 
 
 @st.cache_resource(show_spinner=False)
@@ -181,6 +195,113 @@ def _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log):
         )
 
 
+def _render_data_tab(campaign_cfg, leads):
+    campaign_name = campaign_cfg["_campaign_name"]
+
+    with st.expander("➕ Add Leads (upload CSV)", expanded=not leads):
+        uploaded = st.file_uploader("Upload CSV", type=["csv"], key="data_csv_upload")
+        if uploaded is not None:
+            columns, rows = parse_csv_bytes(uploaded.getvalue())
+            if not columns:
+                st.error("Couldn't read any columns from that file — is it a valid CSV?")
+            else:
+                try:
+                    connector = _get_connector()
+                    header = connector.get_header(campaign_cfg["master_tab"])
+                    custom_columns = [c for c in header if c not in outreach.MASTER_COLUMNS]
+                except Exception:  # noqa: BLE001 - tab may not exist yet for a brand new campaign
+                    custom_columns = []
+
+                st.caption(f"{len(rows)} row(s) detected. Map each column below (or leave as Skip).")
+                mapping = {}
+                default_mapping = build_default_mapping(columns, custom_columns)
+                target_options = ["-- Skip --"] + KNOWN_FIELDS + custom_columns
+                for col in columns:
+                    default = default_mapping.get(col) or "-- Skip --"
+                    default_idx = target_options.index(default) if default in target_options else 0
+                    choice = st.selectbox(f"'{col}' maps to", target_options, index=default_idx,
+                                           key=f"map_{col}")
+                    mapping[col] = "" if choice == "-- Skip --" else choice
+
+                mapped_rows = apply_mapping(rows, mapping)
+                valid_count = count_valid_rows(mapped_rows)
+                mapping_error = validate_mapping(mapping)
+
+                st.write(f"**{valid_count} of {len(rows)} row(s) have an email and will be imported** "
+                         "(others are skipped — Email is required). Duplicates against existing leads "
+                         "are also skipped automatically, checked at import time.")
+                st.caption("Imported leads start as **Pending** — approve them below before they're eligible to send.")
+
+                if mapping_error:
+                    st.error(mapping_error)
+                elif st.button("Import Leads", type="primary", key="confirm_import"):
+                    try:
+                        client = _get_github_client()
+                        payload = build_import_payload(mapped_rows)
+                        path = import_payload_path(campaign_name)
+                        client.create_file(path, payload_to_bytes(payload),
+                                            message=f"Import {valid_count} lead(s) for {campaign_name} "
+                                                     f"(via Streamlit, by {current_user()})")
+                        time.sleep(1)
+                        client.dispatch_workflow(WORKFLOW_IMPORT_LEADS,
+                                                  {"campaign": campaign_name, "payload_path": path})
+                        st.success(f"Import triggered — {valid_count} lead(s) will appear within a minute or two.")
+                    except GitHubActionsError as exc:
+                        st.error(f"Import failed: {exc}")
+
+    st.divider()
+    st.subheader("Leads")
+    if not leads:
+        st.info("No leads yet — add some above.")
+        return
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        search_query = st.text_input("Search", key="data_search", placeholder="Name, email, or company...")
+    with col2:
+        status_filter = st.selectbox("Filter", FILTER_OPTIONS, key="data_filter")
+
+    filtered = search_leads(filter_leads(leads, status_filter), search_query)
+    st.caption(f"Showing {len(filtered)} of {len(leads)} lead(s)")
+
+    if filtered:
+        st.dataframe(
+            {
+                "LeadID": [l.get("LeadID", "") for l in filtered],
+                "Name": [f"{l.get('FirstName', '')} {l.get('LastName', '')}".strip() for l in filtered],
+                "Email": [l.get("Email", "") for l in filtered],
+                "Company": [l.get("Company", "") for l in filtered],
+                "Approval": [l.get("Approval", "") or "Pending" for l in filtered],
+                "Status": [l.get("Status", "") or "—" for l in filtered],
+            },
+            width="stretch", hide_index=True,
+        )
+
+        with st.expander("🗑️ Remove leads"):
+            st.caption(
+                "Removed leads are never deleted — their row and history stay intact, they're just "
+                "marked Removed and excluded from all future sends."
+            )
+            options = {f"{l.get('LeadID', '')} — {l.get('FirstName', '')} {l.get('LastName', '')} "
+                       f"<{l.get('Email', '')}>": l.get("LeadID", "") for l in filtered}
+            selected_labels = st.multiselect("Select leads to remove", list(options.keys()), key="remove_select")
+            if selected_labels and st.button("Remove Selected", key="confirm_remove"):
+                try:
+                    lead_ids = [options[label] for label in selected_labels]
+                    client = _get_github_client()
+                    payload = build_removal_payload(lead_ids)
+                    path = removal_payload_path(campaign_name)
+                    client.create_file(path, payload_to_bytes(payload),
+                                        message=f"Remove {len(lead_ids)} lead(s) from {campaign_name} "
+                                                 f"(via Streamlit, by {current_user()})")
+                    time.sleep(1)
+                    client.dispatch_workflow(WORKFLOW_REMOVE_LEADS,
+                                              {"campaign": campaign_name, "payload_path": path})
+                    st.success(f"Removal triggered for {len(lead_ids)} lead(s).")
+                except GitHubActionsError as exc:
+                    st.error(f"Removal failed: {exc}")
+
+
 def _render_stub_tab(tab_name: str, phase_letter: str):
     st.info(
         f"**{tab_name} isn't built yet.** This is planned as Phase {phase_letter} — see the Campaigns Hub "
@@ -216,7 +337,7 @@ def _render_campaign_detail(campaign_name: str):
     with tabs[0]:
         _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log)
     with tabs[1]:
-        _render_stub_tab("Data (CSV/Sheet import, lead table, filters)", "C")
+        _render_data_tab(campaign_cfg, leads)
     with tabs[2]:
         _render_stub_tab("Sequences (template editor)", "D")
     with tabs[3]:
