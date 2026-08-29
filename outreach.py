@@ -208,6 +208,13 @@ class ConfigError(Exception):
     pass
 
 
+class CampaignPausedError(RuntimeError):
+    """Raised by send_batch when campaign_cfg["status"] == "paused" —
+    never raised by build_batch/preview, which stay usable regardless of
+    pause state so a paused campaign can still be reviewed."""
+    pass
+
+
 def load_settings(path: str = "config/settings.yaml") -> dict:
     if not os.path.exists(path):
         raise ConfigError(f"Settings file not found: {path}")
@@ -365,6 +372,13 @@ def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml"
     cfg["send_log_tab"] = cfg.get("send_log_tab") or f"{campaign_name} Custom Log Sheet"
     cfg["error_log_tab"] = cfg.get("error_log_tab") or f"{campaign_name} Error Log"
     cfg["dashboard_tab"] = cfg.get("dashboard_tab") or f"{campaign_name} Dashboard"
+    # "active" preserves every campaign's actual current behavior before
+    # this field existed — only a NEW campaign explicitly created as
+    # "draft" (via the Streamlit New Campaign flow) should ever start
+    # anywhere other than active. Never default to "draft" here; that
+    # would silently pause every pre-existing campaign the moment this
+    # ships.
+    cfg["status"] = cfg.get("status") or "active"
     cfg["_campaign_name"] = campaign_name
     cfg["_global_default_account"] = (settings.get("email_accounts") or {}).get("default_account", "")
 
@@ -1503,7 +1517,18 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     ignore_wait_days=True overrides ONLY the scheduled wait between stages
     (e.g. send followup1 today even though it's not due for 3 more days) —
     see build_batch's docstring for exactly what is and isn't skipped.
+
+    Raises CampaignPausedError immediately, before touching anything, if
+    campaign_cfg["status"] == "paused" — Preview/build_batch are
+    deliberately NOT gated by this, so a paused campaign can still be
+    reviewed, just not sent.
     """
+    if campaign_cfg.get("status") == "paused":
+        raise CampaignPausedError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is paused — no batch will be sent. "
+            "Resume it (set status back to 'active') first if this was unintentional."
+        )
+
     stages = campaign_cfg["stages"]
     sending_cfg = campaign_cfg["sending"]
     daily_limit = sending_cfg["daily_limit"]
@@ -2094,8 +2119,12 @@ def cmd_send(args):
         print(f"NOTE: --ignore-wait-days is set — the scheduled wait for stage '{args.stage}' will be "
               "skipped for this run. Every other eligibility rule (Approval, not already sent, previous "
               "stage actually sent, no reply) still applies normally.\n")
-    results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size, forced_variant=forced_variant,
-                          ignore_wait_days=args.ignore_wait_days)
+    try:
+        results = send_batch(campaign_cfg, sheets, accounts, args.stage, args.batch_size,
+                              forced_variant=forced_variant, ignore_wait_days=args.ignore_wait_days)
+    except CampaignPausedError as exc:
+        print(f"SKIPPED: {exc}")
+        return
 
     if not results:
         print(f"No eligible leads to send for stage '{args.stage}' "
