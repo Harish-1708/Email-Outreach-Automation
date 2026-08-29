@@ -1326,7 +1326,7 @@ def test_send_manual_reply_calls_smtp_send_with_resolved_threading(monkeypatch):
     captured = {}
 
     def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
-                        cc=None, bcc=None):
+                        cc=None, bcc=None, attachments=None):
         captured.update(locals())
         return {"message_id": "<reply1@mail.gmail.com>"}
 
@@ -1398,6 +1398,106 @@ def test_send_manual_reply_works_with_no_threading_info():
 
 
 # =============================================================================
+# Attachments — Phase H2
+# =============================================================================
+
+def test_build_outbound_message_no_attachments_produces_plain_mimetext():
+    """Backward-compat guarantee — every automated send (build_batch's
+    normal path) never passes attachments; the message shape must stay
+    EXACTLY the plain MIMEText it always was, not a MIMEMultipart wrapper
+    around a single part."""
+    msg, _ = outreach._build_outbound_message("me@work.com", "lead@abc.com", "Hello", "Body")
+    assert msg.get_content_maintype() == "text"
+    assert not msg.is_multipart()
+
+
+def test_build_outbound_message_with_attachments_is_multipart():
+    msg, _ = outreach._build_outbound_message(
+        "me@work.com", "lead@abc.com", "Hello", "Body",
+        attachments=[{"filename": "photo.png", "content": b"fake-png-bytes"}],
+    )
+    assert msg.is_multipart()
+    parts = msg.get_payload()
+    assert len(parts) == 2  # body + one attachment
+
+
+def test_build_outbound_message_attachment_filename_and_content_preserved():
+    msg, _ = outreach._build_outbound_message(
+        "me@work.com", "lead@abc.com", "Hello", "Body",
+        attachments=[{"filename": "photo.png", "content": b"fake-png-bytes"}],
+    )
+    attachment_part = msg.get_payload()[1]
+    assert attachment_part.get_filename() == "photo.png"
+    import base64
+    assert base64.b64decode(attachment_part.get_payload()) == b"fake-png-bytes"
+
+
+def test_build_outbound_message_multiple_attachments():
+    msg, _ = outreach._build_outbound_message(
+        "me@work.com", "lead@abc.com", "Hello", "Body",
+        attachments=[
+            {"filename": "a.png", "content": b"aaa"},
+            {"filename": "b.png", "content": b"bbb"},
+        ],
+    )
+    parts = msg.get_payload()
+    assert len(parts) == 3  # body + two attachments
+    filenames = {p.get_filename() for p in parts[1:]}
+    assert filenames == {"a.png", "b.png"}
+
+
+def test_send_manual_reply_rejects_attachments_over_size_cap():
+    oversized = [{"filename": "huge.png", "content": b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)}]
+    with pytest.raises(outreach.AttachmentTooLargeError, match="MB"):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                    attachments=oversized)
+
+
+def test_send_manual_reply_accepts_attachments_under_size_cap(monkeypatch):
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: {"message_id": "<m@mail.gmail.com>"})
+    small = [{"filename": "small.png", "content": b"x" * 100}]
+    result = outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                         attachments=small)
+    assert result == {"message_id": "<m@mail.gmail.com>"}
+
+
+def test_send_manual_reply_size_check_sums_multiple_attachments():
+    half = outreach.MAX_TOTAL_ATTACHMENT_BYTES // 2 + 1
+    oversized = [{"filename": "a.png", "content": b"x" * half}, {"filename": "b.png", "content": b"x" * half}]
+    with pytest.raises(outreach.AttachmentTooLargeError):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                    attachments=oversized)
+
+
+def test_send_manual_reply_never_calls_smtp_when_attachments_too_large(monkeypatch):
+    smtp_called = []
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1))
+    oversized = [{"filename": "huge.png", "content": b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)}]
+    with pytest.raises(outreach.AttachmentTooLargeError):
+        outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                    attachments=oversized)
+    assert smtp_called == []
+
+
+def test_send_manual_reply_passes_attachments_through_to_smtp_send(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(outreach, "smtp_send",
+                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
+    attachments = [{"filename": "photo.png", "content": b"data"}]
+    outreach.send_manual_reply(ACCOUNTS_FOR_REPLY, "sales1", "lead@abc.com", "Hi", "Body",
+                                attachments=attachments)
+    assert captured["attachments"] == attachments
+
+
+def test_smtp_send_no_attachments_backward_compatible():
+    """Same backward-compat guarantee at the smtp_send layer — no
+    attachments means attachments=None flows through unchanged, matching
+    every call site before this feature existed."""
+    import inspect
+    sig = inspect.signature(outreach.smtp_send)
+    assert sig.parameters["attachments"].default is None
+
+
 # cmd_send_reply — the CLI/workflow entry point
 # =============================================================================
 
@@ -1488,6 +1588,59 @@ def test_cmd_send_reply_passes_cc_bcc_through_to_send(monkeypatch, tmp_path):
 
     assert captured["cc"] == ["cc@abc.com"]
     assert captured["bcc"] == ["bcc@abc.com"]
+
+
+def test_cmd_send_reply_decodes_base64_attachments(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    captured = {}
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+    monkeypatch.setattr(outreach, "smtp_send",
+                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
+
+    import base64 as _b64
+    encoded = _b64.b64encode(b"fake-png-bytes").decode("ascii")
+    payload_path = _write_reply_payload(tmp_path, attachments=[{"filename": "photo.png", "content_base64": encoded}])
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+    outreach.cmd_send_reply(args)
+
+    assert captured["attachments"] == [{"filename": "photo.png", "content": b"fake-png-bytes"}]
+
+
+def test_cmd_send_reply_no_attachments_key_passes_none(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    captured = {}
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+    monkeypatch.setattr(outreach, "smtp_send",
+                         lambda *a, **kw: captured.update(kw) or {"message_id": "<m@mail.gmail.com>"})
+
+    payload_path = _write_reply_payload(tmp_path)  # no "attachments" key at all
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+    outreach.cmd_send_reply(args)
+
+    assert captured["attachments"] is None
+
+
+def test_cmd_send_reply_attachment_too_large_logs_and_exits_nonzero(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+    monkeypatch.setattr(outreach, "load_email_accounts", lambda: ACCOUNTS_FOR_REPLY)
+
+    import base64 as _b64
+    huge_encoded = _b64.b64encode(b"x" * (outreach.MAX_TOTAL_ATTACHMENT_BYTES + 1)).decode("ascii")
+    payload_path = _write_reply_payload(tmp_path,
+                                         attachments=[{"filename": "huge.png", "content_base64": huge_encoded}])
+    args = argparse.Namespace(campaign="test_campaign", file=payload_path)
+
+    with pytest.raises(SystemExit):
+        outreach.cmd_send_reply(args)
+
+    assert fake_sheets.send_log[0]["Status"] == "error"
+    assert len(fake_sheets.error_log) == 1
 
 
 # =============================================================================
