@@ -63,7 +63,8 @@ def parse_email_list(raw: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def validate_reply(to_email: str, body: str, sender_account: str, cc: List[str], bcc: List[str]) -> List[str]:
+def validate_reply(to_email: str, body: str, sender_account: str, cc: List[str], bcc: List[str],
+                    attachment_total_bytes: int = 0) -> List[str]:
     errors = []
     if not sender_account:
         errors.append("No sender account resolved for this lead — check its SenderAccount in the Master Sheet.")
@@ -75,12 +76,20 @@ def validate_reply(to_email: str, body: str, sender_account: str, cc: List[str],
         for addr in addrs:
             if not outreach.is_valid_email_format(addr):
                 errors.append(f"'{addr}' in {label} is not a valid email address.")
+    if attachment_total_bytes > outreach.MAX_TOTAL_ATTACHMENT_BYTES:
+        max_mb = outreach.MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024)
+        actual_mb = attachment_total_bytes / (1024 * 1024)
+        errors.append(f"Attachments total {actual_mb:.1f} MB, over the {max_mb:.0f} MB limit.")
     return errors
 
 
 def build_reply_payload(response: Dict, lead: Optional[Dict], sender_account: str, subject: str,
-                         body: str, cc: List[str], bcc: List[str]) -> Dict:
-    return {
+                         body: str, cc: List[str], bcc: List[str],
+                         attachments: Optional[List[Dict[str, str]]] = None) -> Dict:
+    """attachments (optional): [{"filename": str, "content_base64": str}, ...] —
+    already base64-encoded, ready to commit as JSON. See
+    build_attachment_entries for turning raw uploaded bytes into this shape."""
+    payload = {
         "sender_account": sender_account,
         "to": response.get("From", ""),
         "subject": subject,
@@ -91,6 +100,24 @@ def build_reply_payload(response: Dict, lead: Optional[Dict], sender_account: st
         "bcc": bcc,
         "lead_id": str(response.get("LeadID", "")),
     }
+    if attachments:
+        payload["attachments"] = attachments
+    return payload
+
+
+def build_attachment_entries(uploaded_files: List) -> List[Dict[str, str]]:
+    """uploaded_files: Streamlit UploadedFile objects (or anything with
+    .name and .getvalue()). Returns [{"filename": str, "content_base64": str}, ...],
+    ready to drop straight into build_reply_payload's attachments param."""
+    import base64
+    entries = []
+    for f in uploaded_files:
+        entries.append({"filename": f.name, "content_base64": base64.b64encode(f.getvalue()).decode("ascii")})
+    return entries
+
+
+def total_attachment_size_bytes(uploaded_files: List) -> int:
+    return sum(len(f.getvalue()) for f in uploaded_files)
 
 
 def reply_payload_path(campaign_name: str, response_id: str, timestamp: Optional[str] = None) -> str:
