@@ -27,12 +27,12 @@ directly — no GitHub trip, no pull request to approve.
   (triggers `check_replies.yml`, plus a live view of recent replies read
   straight from the Response Sheet), Maintenance (the ThreadSubject
   backfill tool).
-- **📧 Email Accounts** — which sender accounts are configured and how
-  much each has sent today, across all campaigns. Never the actual SMTP
-  credentials — those stay in GitHub Secrets exclusively.
-- **➕ New Campaign** — create a campaign's Intro templates, or add the
-  next stage to an existing one. Commits straight to `main`; live the
-  moment you click the button, no approval step.
+- **📧 Email Accounts** — which sender accounts are configured, how much
+  each has sent today across all campaigns, and their live connection
+  status (🟢 Connected / 🔴 Disconnected with a reason / ⚪ Unknown before
+  the first check). Never the actual SMTP credentials — those stay in
+  GitHub Secrets exclusively; the health check logs in via IMAP and
+  reports only whether it worked, nothing else.
 
 ## One-time setup
 
@@ -92,6 +92,22 @@ block (names + addresses only, no passwords) that powers the Email
 Accounts page.
 
 ## Known limitations (by design, not bugs)
+
+- **Adding, editing, or removing email accounts isn't done from this
+  app.** They're still managed directly in `EMAIL_ACCOUNTS_JSON` (a
+  GitHub Secret). This is deliberate: GitHub Secrets are write-only by
+  design (nothing, including this app, can ever read one back), so an
+  in-app "add one account" feature would need to reconstruct and rewrite
+  the *entire* secret without knowing the other accounts' current
+  passwords — solvable with one secret per account instead of one JSON
+  blob, but that requires a `secrets:write`-scoped token (materially more
+  powerful than anything this app has needed so far) and hasn't been
+  built pending an explicit decision to grant that. Connection status
+  (this page) needed no such grant, since it only ever reads results a
+  workflow already wrote to a Sheet — it never touches secrets directly.
+- **Account health is a snapshot, not a log.** Every check overwrites the
+  whole "Email Accounts Health" tab — a removed account's old row
+  disappears on the next run rather than lingering.
 
 - **Replying supports file/image attachments, up to 10 MB total.** Sent
   as regular email attachments, not inline/embedded HTML images — this
