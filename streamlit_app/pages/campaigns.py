@@ -7,7 +7,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from auth import login_gate, current_user  # noqa: E402
-from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, TEMPLATES_ROOT, CAMPAIGNS_DIR  # noqa: E402
+from config import WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, TEMPLATES_ROOT, CAMPAIGNS_DIR  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
@@ -28,9 +28,14 @@ from sequences_logic import (  # noqa: E402
 )
 from campaign_builder import (  # noqa: E402
     get_next_stage_for_campaign, build_campaign_files, validate_variant_content,
+    validate_campaign_name, commit_message_for_campaign,
 )
 from settings_logic import (  # noqa: E402
     load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
+)
+from schedule_logic import (  # noqa: E402
+    validate_schedule, build_updated_schedule_override, get_current_schedule,
+    timezone_display_name, COMMON_TIMEZONES, DAY_OPTIONS,
 )
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,6 +121,79 @@ def _relative_time(timestamp_str: str) -> str:
 
 
 # =============================================================================
+# New Campaign — inline modal, no separate page. Minimal by design: just a
+# name and one Intro variant. Everything else (more variants, follow-ups,
+# leads, schedule, settings) happens after, inside the campaign's own
+# Sequences/Data/Settings tabs — this dialog's only job is getting a new
+# campaign to the point where it can be opened at all.
+# =============================================================================
+def _initialize_campaign_tabs(campaign_name: str) -> None:
+    """Triggers the Dashboard workflow right after a commit — running it
+    connects to the Sheet, which creates every needed tab (Master,
+    Responses, Send Log, Error Log, Dashboard) with the correct header as
+    a side effect. This is what avoids the "tab doesn't exist" error on
+    the first visit to a brand new campaign — no manual Preview/Send run
+    required first."""
+    try:
+        client = _get_github_client()
+        client.dispatch_workflow(WORKFLOW_DASHBOARD, {"campaign": campaign_name})
+    except GitHubActionsError as exc:
+        st.warning(
+            f"Campaign created, but couldn't auto-initialize its Sheet tabs: {exc}. "
+            f"Run 'Update Dashboard' manually for '{campaign_name}' from the GitHub Actions "
+            "tab, or just open the campaign once — either will create them."
+        )
+
+
+@st.dialog("New Campaign")
+def _new_campaign_dialog(existing_campaigns):
+    campaign_name = st.text_input("Campaign name (letters, numbers, underscores only)")
+    subject = st.text_input("Subject (Intro)")
+    body = st.text_area("Body (Intro)", height=150)
+    confirm = st.checkbox("Create now — it's live immediately, no approval step")
+
+    if st.button("Create Campaign", type="primary", disabled=not confirm):
+        errors = []
+        name_error = validate_campaign_name(campaign_name, existing_campaigns)
+        if name_error:
+            errors.append(name_error)
+        content_error = validate_variant_content(subject, body, is_first_stage=True)
+        if content_error:
+            errors.append(content_error)
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            try:
+                files = build_campaign_files(campaign_name, "intro", {"A": {"subject": subject, "body": body}})
+                client = _get_github_client()
+                client.commit_campaign_files_directly(
+                    files=files,
+                    commit_message=commit_message_for_campaign(campaign_name, "intro", 1, current_user(),
+                                                                 is_new_campaign=True),
+                )
+                _load_hub_rows.clear()
+                with st.spinner("Initializing Sheet tabs..."):
+                    time.sleep(1)
+                    _initialize_campaign_tabs(campaign_name)
+                # Deliberately NOT auto-navigating into the new campaign:
+                # Streamlit Cloud's local checkout only picks up this commit
+                # once it redeploys (triggered by the GitHub webhook, not
+                # instant) — jumping straight to the detail view right now
+                # would very likely hit "No templates found" against the
+                # still-stale local checkout. Staying on the hub and saying
+                # so plainly is the honest version of this UX.
+                st.session_state["show_new_campaign_dialog"] = False
+                st.success(
+                    f"'{campaign_name}' created. It'll appear in the list below within a minute or so, "
+                    "once the app finishes redeploying with the new campaign — refresh if it's not there yet."
+                )
+            except GitHubActionsError as exc:
+                st.error(f"Failed to create campaign: {exc}")
+
+
+# =============================================================================
 # Hub view — list, search, click into a campaign
 # =============================================================================
 def _render_hub():
@@ -126,8 +204,22 @@ def _render_hub():
         search = st.text_input("🔍 Search campaigns...", label_visibility="collapsed",
                                 placeholder="🔍 Search campaigns...")
     with col2:
+        if "show_new_campaign_dialog" not in st.session_state:
+            st.session_state["show_new_campaign_dialog"] = False
         if st.button("＋ New Campaign", width="stretch"):
-            st.switch_page("pages/new_campaign.py")
+            st.session_state["show_new_campaign_dialog"] = True
+        # Re-checked on EVERY rerun, not just the click that opened it —
+        # st.dialog only stays visually open across a rerun triggered by a
+        # widget INSIDE it if the code path that calls the dialog function
+        # is reached again; gating solely on the button's own return value
+        # (True only on the exact rerun it was clicked) would silently
+        # close the dialog the instant you touched anything inside it.
+        if st.session_state["show_new_campaign_dialog"]:
+            try:
+                existing_campaigns = list_campaigns()
+            except Exception:  # noqa: BLE001
+                existing_campaigns = []
+            _new_campaign_dialog(existing_campaigns)
 
     try:
         rows, errors = _load_hub_rows()
@@ -350,8 +442,9 @@ def _render_sequences_tab(campaign_cfg, leads):
     )
     pending_edits = {}  # (stage_prefix, variant) -> (subject, body)
 
-    for stage in stages:
+    for idx, stage in enumerate(stages):
         prefix = stage["template_prefix"]
+        is_first_stage = (idx == 0)
         st.markdown(f"**{stage['name']}**")
         for variant in existing_variants:
             try:
@@ -362,14 +455,16 @@ def _render_sequences_tab(campaign_cfg, leads):
 
             with st.expander(f"Variant {variant}"):
                 unlocked = st.checkbox("🔓 Unlock to edit", key=f"unlock_{prefix}_{variant}")
+                subject_label = "Subject (required — this is the first stage)" if is_first_stage else \
+                    "Subject (blank continues the previous thread)"
                 subject = st.text_input(
-                    "Subject (blank continues the previous thread — not valid for the first stage)",
+                    subject_label,
                     value=original["subject"], key=f"subject_{prefix}_{variant}", disabled=not unlocked,
                 )
                 body = st.text_area("Body", value=original["body"], key=f"body_{prefix}_{variant}",
                                      height=150, disabled=not unlocked)
                 if unlocked and has_content_changed(original, subject, body):
-                    pending_edits[(prefix, variant)] = (subject, body)
+                    pending_edits[(prefix, variant)] = (subject, body, is_first_stage)
                     st.caption("✏️ Changed — will be included in Save Changes")
 
                 if sample_lead:
@@ -380,17 +475,27 @@ def _render_sequences_tab(campaign_cfg, leads):
                     st.text(preview_body)
 
     if pending_edits:
-        if st.button(f"💾 Save Changes ({len(pending_edits)} template(s))", type="primary"):
+        validation_errors = []
+        for (prefix, variant), (subject, body, is_first) in pending_edits.items():
+            err = validate_variant_content(subject, body, is_first_stage=is_first)
+            if err:
+                validation_errors.append(f"{prefix}_{variant}: {err}")
+
+        if validation_errors:
+            for e in validation_errors:
+                st.error(e)
+        elif st.button(f"💾 Save Changes ({len(pending_edits)} template(s))", type="primary"):
             try:
                 files = [build_variant_edit_file(campaign_name, prefix, variant, subject, body)
-                         for (prefix, variant), (subject, body) in pending_edits.items()]
+                         for (prefix, variant), (subject, body, _) in pending_edits.items()]
                 client = _get_github_client()
                 client.commit_campaign_files_directly(
                     files=files,
                     commit_message=f"Edit {len(files)} template(s) in {campaign_name} "
                                     f"(via Streamlit, by {current_user()})",
                 )
-                st.success(f"Saved {len(files)} template(s).")
+                st.success(f"Saved {len(files)} template(s). May take a minute to actually reflect here "
+                           "while the app redeploys — the change is live for sending immediately either way.")
             except GitHubActionsError as exc:
                 st.error(f"Save failed: {exc}")
 
@@ -427,7 +532,9 @@ def _render_sequences_tab(campaign_cfg, leads):
                             commit_message=f"Add variant {next_letter} to {campaign_name} "
                                             f"(via Streamlit, by {current_user()})",
                         )
-                        st.success(f"Variant {next_letter} added to all {len(stages)} stage(s).")
+                        st.success(f"Variant {next_letter} added to all {len(stages)} stage(s). May take a "
+                                   "minute to actually reflect here while the app redeploys — it's live for "
+                                   "sending immediately either way.")
                     except GitHubActionsError as exc:
                         st.error(f"Failed to add variant: {exc}")
 
@@ -473,7 +580,8 @@ def _render_sequences_tab(campaign_cfg, leads):
                             commit_message=f"Add {stage_prefix} to {campaign_name} "
                                             f"(via Streamlit, by {current_user()})",
                         )
-                        st.success(f"'{stage_prefix}' added.")
+                        st.success(f"'{stage_prefix}' added. May take a minute to actually reflect here while "
+                                   "the app redeploys — it's live for sending immediately either way.")
                     except GitHubActionsError as exc:
                         st.error(f"Failed to add stage: {exc}")
 
@@ -494,13 +602,27 @@ def _render_settings_tab(campaign_cfg):
         )
         rotation_accounts = list(sending.get("rotation_accounts") or [])
     else:
-        current_selection = [a for a in (sending.get("rotation_accounts") or []) if a in available_accounts]
+        # Driven entirely by session_state (keyed per campaign) rather than
+        # a `default=` argument — that's what actually lets "Select all"
+        # work. A plain `rotation_accounts = available_accounts` after the
+        # button click only reassigns a local variable for this one run;
+        # the multiselect widget's own displayed state doesn't change, and
+        # a LATER click on Save re-reads the widget fresh, silently
+        # discarding what "Select all" did. Mutating session_state before
+        # the widget is created, then rerunning, is what actually sticks.
+        ms_key = f"settings_rotation_accounts_{campaign_name}"
+        if ms_key not in st.session_state:
+            st.session_state[ms_key] = [a for a in (sending.get("rotation_accounts") or [])
+                                         if a in available_accounts]
+
+        if st.button("Select all accounts"):
+            st.session_state[ms_key] = available_accounts
+            st.rerun()
+
         rotation_accounts = st.multiselect(
-            "🔍 Search sender accounts", available_accounts, default=current_selection,
+            "🔍 Search sender accounts", available_accounts, key=ms_key,
             help="Leave empty to use every configured account for rotation.",
         )
-        if st.button("Select all accounts"):
-            rotation_accounts = available_accounts
 
     sender_rotation = st.checkbox("Rotate across multiple sender accounts", value=bool(sending.get("sender_rotation")))
 
@@ -533,7 +655,59 @@ def _render_settings_tab(campaign_cfg):
                     override_file_path(campaign_name), override_to_yaml_bytes(updated),
                     message=f"Update settings for {campaign_name} (via Streamlit, by {current_user()})",
                 )
-                st.success("Settings saved.")
+                st.success("Settings saved. May take a minute to actually reflect here while the app "
+                           "redeploys — it's in effect for sending immediately either way.")
+            except GitHubActionsError as exc:
+                st.error(f"Save failed: {exc}")
+
+
+def _render_schedule_tab(campaign_cfg):
+    campaign_name = campaign_cfg["_campaign_name"]
+    current = get_current_schedule(campaign_cfg)
+
+    st.caption(
+        "Leave this alone and your campaign sends anytime — matching how it's always worked. Setting a "
+        "schedule restricts Send Batch to only run within the window and days you choose below (Preview "
+        "still works anytime either way)."
+    )
+
+    display_names = [d for d, _ in COMMON_TIMEZONES]
+    iana_names = [i for _, i in COMMON_TIMEZONES]
+    current_display = timezone_display_name(current["timezone"]) or display_names[0]
+    selected_display = st.selectbox("Time zone", display_names, index=display_names.index(current_display))
+    selected_timezone = iana_names[display_names.index(selected_display)]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        window_start = st.text_input("Start time (24-hour, HH:MM)", value=current["window_start"])
+    with col2:
+        window_end = st.text_input("End time (24-hour, HH:MM)", value=current["window_end"])
+
+    st.write("Days")
+    day_cols = st.columns(7)
+    send_days = []
+    for col, (label, code) in zip(day_cols, DAY_OPTIONS):
+        with col:
+            if st.checkbox(label[:3], value=code in current["send_days"], key=f"schedule_day_{code}"):
+                send_days.append(code)
+
+    if st.button("💾 Save Schedule", type="primary"):
+        errors = validate_schedule(selected_timezone, window_start, window_end, send_days)
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            try:
+                raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+                updated = build_updated_schedule_override(raw_override, selected_timezone, window_start,
+                                                            window_end, send_days)
+                client = _get_github_client()
+                client.create_file(
+                    override_file_path(campaign_name), override_to_yaml_bytes(updated),
+                    message=f"Update schedule for {campaign_name} (via Streamlit, by {current_user()})",
+                )
+                st.success("Schedule saved. May take a minute to actually reflect here while the app "
+                           "redeploys — it's in effect for sending immediately either way.")
             except GitHubActionsError as exc:
                 st.error(f"Save failed: {exc}")
 
@@ -583,7 +757,7 @@ def _render_campaign_detail(campaign_name: str):
     with tabs[2]:
         _render_sequences_tab(campaign_cfg, leads)
     with tabs[3]:
-        _render_stub_tab("Schedule (timezone, window, days)", "E")
+        _render_schedule_tab(campaign_cfg)
     with tabs[4]:
         _render_settings_tab(campaign_cfg)
     with tabs[5]:
