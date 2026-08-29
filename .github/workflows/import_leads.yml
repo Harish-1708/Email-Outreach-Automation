@@ -36,6 +36,7 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          set -o pipefail
           python outreach.py import-leads --campaign "${{ github.event.inputs.campaign }}" \
             --file "${{ github.event.inputs.payload_path }}" | tee import_output.txt
       - name: Add to job summary
