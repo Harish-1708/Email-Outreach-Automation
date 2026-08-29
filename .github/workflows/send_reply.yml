@@ -1,0 +1,61 @@
+name: Send Reply
+
+# Sends a single, one-off manual reply from inside the app — NOT part of
+# the automated batch sequence. Triggered by the Streamlit Responses tab
+# right after it commits a fully-resolved payload file (to/subject/body/
+# in_reply_to/references/cc/bcc already computed from the specific
+# inbound message being replied to — this workflow does no lookup of its
+# own, see cmd_send_reply's docstring in outreach.py).
+#
+# This is the ONLY workflow in this whole app that sends an email outside
+# of the normal batch/schedule path — treat any change here with the same
+# care as send_batch.yml itself.
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "Campaign name"
+        required: true
+      payload_path:
+        description: "Path to the committed JSON payload file, e.g. replies/Foo/2026-08-29-143012.json"
+        required: true
+
+# No concurrency group restricting this to one-at-a-time per campaign is
+# needed here the way it is for import/remove — each reply is a fully
+# independent, self-contained send with no shared mutable state (no
+# LeadID counter, no row being written by two runs at once) — two replies
+# to two different leads in the same campaign are safe to send in
+# parallel. A payload is deleted after a successful send either way, so
+# it can never be sent twice.
+jobs:
+  send-reply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Send reply
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          EMAIL_ACCOUNTS_JSON: ${{ secrets.EMAIL_ACCOUNTS_JSON }}
+        run: |
+          set -o pipefail
+          python outreach.py send-reply --campaign "${{ github.event.inputs.campaign }}" \
+            --file "${{ github.event.inputs.payload_path }}" | tee reply_output.txt
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat reply_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove the processed payload file
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f "${{ github.event.inputs.payload_path }}"
+          git add -A
+          git commit -m "Remove processed reply payload: ${{ github.event.inputs.payload_path }}" || echo "Nothing to commit"
+          git push
