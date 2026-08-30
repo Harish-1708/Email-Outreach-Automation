@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 import yaml
 from dateutil import parser as dateparser
+import gspread
 
 
 # =============================================================================
@@ -498,7 +499,6 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def _build_gspread_client():
-    import gspread
     from google.oauth2.service_account import Credentials
 
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -512,14 +512,70 @@ def _build_gspread_client():
     return gspread.authorize(creds), gspread
 
 
+GSPREAD_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+GSPREAD_MAX_RETRIES = 3
+GSPREAD_RETRY_BASE_DELAY_SECONDS = 2  # doubles each retry: 2s, 4s, 8s
+
+
+def _is_retryable_gspread_error(exc) -> bool:
+    """429 (rate limit) and 5xx (Google's own service having a transient
+    issue, e.g. the 503 'service is currently unavailable' this exists
+    to fix) are worth waiting out. Anything else — 403 Forbidden (a real
+    permissions problem), 404 Not Found (wrong sheet ID) — means retrying
+    would just waste up to 14 seconds on something that will never
+    succeed, so those are raised immediately instead."""
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return status_code in GSPREAD_RETRYABLE_STATUS_CODES
+
+
+def _call_with_gspread_retries(func, *args, **kwargs):
+    """Retries a gspread call with exponential backoff, but only for
+    errors classified retryable by _is_retryable_gspread_error above."""
+    for attempt in range(GSPREAD_MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as exc:
+            if not _is_retryable_gspread_error(exc) or attempt == GSPREAD_MAX_RETRIES:
+                raise
+            time.sleep(GSPREAD_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+
+
+class _RetryingWorksheet:
+    """Thin proxy around a real gspread Worksheet — every METHOD call
+    (get_all_records, append_row, batch_update, ...) is automatically
+    retried on a transient error; every plain attribute (.id, .title, ...)
+    passes straight through untouched. Wrapping here, once, at the point
+    every worksheet gets created, means every read/write in this whole
+    file gets the same protection with no per-call-site changes needed."""
+    def __init__(self, real_worksheet):
+        self._real = real_worksheet
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if callable(attr):
+            def _retrying_call(*args, **kwargs):
+                return _call_with_gspread_retries(attr, *args, **kwargs)
+            return _retrying_call
+        return attr
+
+
+def _open_spreadsheet_with_retries(client, sheet_id: str):
+    return _call_with_gspread_retries(client.open_by_key, sheet_id)
+
+
 def _get_or_create_ws(spreadsheet, gspread_module, title: str, required_header: List[str]):
     try:
-        ws = spreadsheet.worksheet(title)
+        raw_ws = spreadsheet.worksheet(title)
     except gspread_module.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=max(len(required_header) + 5, 10))
+        raw_ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=max(len(required_header) + 5, 10))
+        ws = _RetryingWorksheet(raw_ws)
         ws.append_row(required_header)
         return ws
 
+    # Wrapped immediately, before any further calls — so even the very
+    # first read/write below (filling in a blank header) is retried too,
+    # not just everything a caller does with the returned object later.
+    ws = _RetryingWorksheet(raw_ws)
     existing_header = ws.row_values(1)
     if not existing_header:
         ws.append_row(required_header)
@@ -540,7 +596,7 @@ class SheetsConnector:
                  error_log_tab: str, dashboard_tab: str):
         self.sheet_id = sheet_id
         self._client, self._gspread = _build_gspread_client()
-        self._spreadsheet = self._client.open_by_key(sheet_id)
+        self._spreadsheet = _open_spreadsheet_with_retries(self._client, sheet_id)
 
         self.master_ws = _get_or_create_ws(self._spreadsheet, self._gspread, master_tab, MASTER_COLUMNS)
         self.responses_ws = _get_or_create_ws(self._spreadsheet, self._gspread, responses_tab, RESPONSES_COLUMNS)
@@ -638,7 +694,7 @@ def get_all_campaigns_dashboard_ws(sheet_id: str):
     """The combined cross-campaign dashboard lives in one shared tab, not
     scoped to any single campaign's connector."""
     client, gspread_module = _build_gspread_client()
-    spreadsheet = client.open_by_key(sheet_id)
+    spreadsheet = _open_spreadsheet_with_retries(client, sheet_id)
     return _get_or_create_ws(spreadsheet, gspread_module, "All Campaigns Dashboard", ALL_CAMPAIGNS_DASHBOARD_COLUMNS)
 
 
@@ -1450,7 +1506,7 @@ def write_account_health(sheet_id: str, results: List[Dict]) -> None:
     a since-removed account's stale row disappears on the next check
     rather than lingering forever."""
     client, gspread_module = _build_gspread_client()
-    spreadsheet = client.open_by_key(sheet_id)
+    spreadsheet = _open_spreadsheet_with_retries(client, sheet_id)
     ws = _get_or_create_ws(spreadsheet, gspread_module, ACCOUNT_HEALTH_TAB, ACCOUNT_HEALTH_COLUMNS)
     existing_row_count = len(ws.get_all_values())
     if existing_row_count > 1:
