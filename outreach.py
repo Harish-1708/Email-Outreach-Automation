@@ -110,6 +110,10 @@ RESPONSES_COLUMNS = [
                          # conversation view can be reconstructed without a live IMAP fetch.
                          # An existing Response Sheet auto-migrates to include this column
                          # the next time check_replies runs — see _get_or_create_ws.
+    "IsRead",            # "Yes" once marked read from the Responses page; blank/anything
+                         # else counts as unread. Written only via mark_responses_read,
+                         # triggered through the mark_responses_read.yml workflow — Streamlit
+                         # itself never writes to this or any other Sheet column directly.
 ]
 
 SEND_LOG_COLUMNS = [
@@ -689,7 +693,32 @@ class SheetsConnector:
         return set(ids[1:])  # skip header
 
     def get_all_responses(self) -> List[Dict]:
-        return self.responses_ws.get_all_records()
+        # _row tracked the same way get_all_leads does — needed so
+        # mark_responses_read can update a SPECIFIC row's IsRead cell
+        # without re-deriving row numbers from scratch.
+        records = self.responses_ws.get_all_records()
+        responses = []
+        for i, record in enumerate(records, start=2):  # row 1 is header
+            record["_row"] = i
+            responses.append(record)
+        return responses
+
+    def mark_responses_read(self, response_id_to_row: Dict[str, int]) -> int:
+        """Sets IsRead=Yes for the given {ResponseID: row_number} pairs,
+        in one batched Sheets update — the caller (cmd_mark_responses_read)
+        resolves which rows to touch by matching ResponseID against a
+        fresh get_all_responses() call; this method trusts the row
+        numbers it's given rather than re-looking anything up itself.
+        Returns how many rows were actually included in the update."""
+        gspread = self._gspread
+        col_index = RESPONSES_COLUMNS.index("IsRead") + 1
+        updates = [
+            {"range": gspread.utils.rowcol_to_a1(row_number, col_index), "values": [["Yes"]]}
+            for row_number in response_id_to_row.values()
+        ]
+        if updates:
+            self.responses_ws.batch_update(updates)
+        return len(updates)
 
     def append_response(self, fields: Dict[str, str]) -> None:
         row = [fields.get(col, "") for col in RESPONSES_COLUMNS]
@@ -2760,6 +2789,33 @@ def cmd_remove_leads(args):
         print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
 
 
+def cmd_mark_responses_read(args):
+    """Reads {"response_ids": [...]} from --file and sets IsRead=Yes for
+    each one that still exists in this campaign's Response Sheet — a
+    ResponseID no longer present (e.g. the sheet was manually edited) is
+    silently skipped, not an error; the caller's goal ("these should show
+    read") is still satisfied for everything that DID match."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    requested_ids = payload.get("response_ids", [])
+    if not requested_ids:
+        print("No response_ids in payload file — nothing to do.")
+        return
+
+    all_responses = sheets.get_all_responses()
+    requested_set = set(requested_ids)
+    id_to_row = {
+        r.get("ResponseID"): r["_row"] for r in all_responses if r.get("ResponseID") in requested_set
+    }
+    marked_count = sheets.mark_responses_read(id_to_row)
+    print(f"Marked {marked_count} of {len(requested_ids)} response(s) as read.")
+    missing = requested_set - set(id_to_row.keys())
+    if missing:
+        print(f"Not found (already gone from the sheet, or never existed): {sorted(missing)}")
+
+
 def cmd_send_reply(args):
     """Reads a fully-resolved reply payload from --file and sends it —
     this command never looks anything up itself (which response, which
@@ -2976,6 +3032,12 @@ def main():
                                '"subject": "...", "body": "...", "in_reply_to": "<...>", '
                                '"references": "<...>", "cc": [...], "bcc": [...], "lead_id": "5"}')
     p_reply.set_defaults(func=cmd_send_reply)
+
+    p_mark_read = sub.add_parser("mark-responses-read",
+                                  help="Set IsRead=Yes for the response IDs listed in a JSON payload file")
+    p_mark_read.add_argument("--campaign", required=True)
+    p_mark_read.add_argument("--file", required=True, help='Path to a JSON file: {"response_ids": ["r1", "r2"]}')
+    p_mark_read.set_defaults(func=cmd_mark_responses_read)
 
     p_health = sub.add_parser("check-account-health",
                                help="Check every configured account's IMAP connectivity and write results "
