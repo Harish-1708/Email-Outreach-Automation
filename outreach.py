@@ -105,6 +105,11 @@ RESPONSES_COLUMNS = [
     "ActionTaken",       # Stopped Sequence | Logged Only |
                          # Logged Only (Unverified Match) | Logged Only (Predates Contact)
                          # — only a Header-matched message can produce "Stopped Sequence"
+    "FullBody",          # the complete inbound message text, untruncated — Snippet stays a
+                         # short preview for existing displays; FullBody exists so a real
+                         # conversation view can be reconstructed without a live IMAP fetch.
+                         # An existing Response Sheet auto-migrates to include this column
+                         # the next time check_replies runs — see _get_or_create_ws.
 ]
 
 SEND_LOG_COLUMNS = [
@@ -579,6 +584,25 @@ def _get_or_create_ws(spreadsheet, gspread_module, title: str, required_header: 
     existing_header = ws.row_values(1)
     if not existing_header:
         ws.append_row(required_header)
+    elif len(existing_header) < len(required_header) and required_header[:len(existing_header)] == existing_header:
+        # A NEW required column was added since this tab was first
+        # created — existing_header is a valid PREFIX of what's required
+        # now, just shorter. Auto-widen by filling in the missing header
+        # cell(s) rather than erroring: every already-written row keeps
+        # its existing values in their existing positions untouched, and
+        # rows written from here on populate the new column(s) too. This
+        # is the safe, additive migration path any future new column
+        # should get, not just the one that prompted writing this.
+        missing_columns = required_header[len(existing_header):]
+        # Length captured ONCE, before the loop — if row_values() ever
+        # returns a live reference rather than a fresh copy (harmless for
+        # a real gspread client, which always returns fresh data, but not
+        # a safe assumption to bake in), re-reading len(existing_header)
+        # inside the loop after update_cell has already run once could
+        # silently drift and write columns at the wrong index.
+        original_length = len(existing_header)
+        for i, col_name in enumerate(missing_columns):
+            ws.update_cell(1, original_length + 1 + i, col_name)
     elif existing_header[:len(required_header)] != required_header:
         raise RuntimeError(
             f"Header row in tab '{title}' does not start with the expected columns.\n"
@@ -2329,7 +2353,10 @@ def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], 
                     "Campaign": campaign_name, "ReceivedAt": now_str, "From": msg["from"], "Subject": msg["subject"],
                     "Snippet": msg["snippet"], "Classification": classification, "MatchMethod": match_method,
                     "MessageID": msg["message_id"], "InReplyTo": msg.get("in_reply_to", ""),
-                    "ActionTaken": action_taken,
+                    "ActionTaken": action_taken, "FullBody": msg.get("body", "")[:49000],
+                    # Sheets caps a single cell at 50,000 characters — 49000 leaves headroom
+                    # rather than sending a request Google would reject outright for the
+                    # rare very long email.
                 })
             except Exception as sheets_exc:  # noqa: BLE001
                 log_error(sheets, campaign_name, ERR_SHEETS_API,
