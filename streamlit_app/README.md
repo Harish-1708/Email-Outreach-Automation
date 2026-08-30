@@ -35,10 +35,15 @@ directly — no GitHub trip, no pull request to approve.
   each has sent today across all campaigns, and their live connection
   status (🟢 Connected / 🔴 Disconnected with a reason / ⚪ Unknown before
   the first check). **Add, edit, and remove accounts directly here** —
-  no more editing `EMAIL_ACCOUNTS_JSON` by hand. A password only ever
-  passes through this app's memory for the instant it takes to encrypt
-  and send it to GitHub; it's never stored, logged, or displayed. See
-  "Email account management" below for the one-time setup this needs.
+  no more editing `EMAIL_ACCOUNTS_JSON` by hand. Supports Gmail (address +
+  app password) and any custom SMTP/IMAP provider (Hostinger, etc. — its
+  own host, port, and username, plus a separate IMAP password if the
+  provider issues one). Manage one account at a time, or add many at
+  once with a CSV upload (an in-app example shows the exact columns).
+  A password only ever passes through this app's memory for the instant
+  it takes to encrypt and send it to GitHub; it's never stored, logged,
+  or displayed. See "Email account management" below for the one-time
+  setup this needs.
 
 ## One-time setup
 
@@ -153,6 +158,15 @@ Remove buttons on the Email Accounts page instead:
 - **Account health is a snapshot, not a log.** Every check overwrites the
   whole "Email Accounts Health" tab — a removed account's old row
   disappears on the next run rather than lingering.
+- **A bulk CSV account upload makes one GitHub API call per account** —
+  unavoidable, since each account is its own secret and GitHub has no
+  "set several secrets at once" endpoint. A very large upload (100+ rows)
+  will take a little while; the mapping file itself is still committed
+  once for the whole batch, not once per account.
+- **Note on Delete Campaign/Stage/Variant, above: these currently remove
+  files outright** — a temporary/recoverable "soft delete" for whole
+  campaigns (move to a "Deleted Campaigns" view, restorable later) is
+  planned but not built yet.
 
 - **Replying supports file/image attachments, up to 10 MB total.** Sent
   as regular email attachments, not inline/embedded HTML images — this
