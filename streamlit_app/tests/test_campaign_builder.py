@@ -7,6 +7,7 @@ import pytest
 from campaign_builder import (
     validate_campaign_name, validate_variant_content, build_template_file_content,
     build_campaign_files, get_next_stage_for_campaign, commit_message_for_campaign,
+    confirmation_matches_campaign_name, list_campaign_files_to_delete,
 )
 
 TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
@@ -176,3 +177,87 @@ def test_commit_message_new_campaign_and_add_stage_are_distinguishable():
     new_msg = commit_message_for_campaign("Foo", "intro", 1, "bob", is_new_campaign=True)
     stage_msg = commit_message_for_campaign("Foo", "followup1", 1, "bob", is_new_campaign=False)
     assert new_msg != stage_msg
+
+
+# ---------- confirmation_matches_campaign_name ----------
+
+def test_confirmation_matches_exact_name():
+    assert confirmation_matches_campaign_name("MyCampaign", "MyCampaign") is True
+
+
+def test_confirmation_rejects_generic_word():
+    assert confirmation_matches_campaign_name("DELETE", "MyCampaign") is False
+
+
+def test_confirmation_rejects_partial_or_case_mismatch():
+    assert confirmation_matches_campaign_name("mycampaign", "MyCampaign") is False
+    assert confirmation_matches_campaign_name("MyCampaig", "MyCampaign") is False
+
+
+def test_confirmation_rejects_empty_string():
+    assert confirmation_matches_campaign_name("", "MyCampaign") is False
+
+
+# ---------- list_campaign_files_to_delete ----------
+
+def test_list_campaign_files_to_delete_includes_every_template_file(tmp_path):
+    campaign_dir = tmp_path / "templates" / "Foo"
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "intro_A.txt").write_text("Subject: Hi\n\nBody")
+    (campaign_dir / "intro_B.txt").write_text("Subject: Hi\n\nBody")
+    (campaign_dir / "followup1_A.txt").write_text("Subject: \n\nBody")
+    (campaign_dir / "followup1_B.txt").write_text("Subject: \n\nBody")
+
+    campaigns_dir = tmp_path / "config" / "campaigns"
+    campaigns_dir.mkdir(parents=True)
+
+    paths = list_campaign_files_to_delete("Foo", str(tmp_path / "templates"), str(campaigns_dir))
+    assert set(paths) == {
+        "templates/Foo/intro_A.txt", "templates/Foo/intro_B.txt",
+        "templates/Foo/followup1_A.txt", "templates/Foo/followup1_B.txt",
+    }
+
+
+def test_list_campaign_files_to_delete_includes_override_file_when_present(tmp_path):
+    campaign_dir = tmp_path / "templates" / "Foo"
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "intro_A.txt").write_text("Subject: Hi\n\nBody")
+
+    campaigns_dir = tmp_path / "config" / "campaigns"
+    campaigns_dir.mkdir(parents=True)
+    (campaigns_dir / "Foo.yaml").write_text("sending:\n  daily_limit: 50\n")
+
+    paths = list_campaign_files_to_delete("Foo", str(tmp_path / "templates"), str(campaigns_dir))
+    assert "config/campaigns/Foo.yaml" in paths
+
+
+def test_list_campaign_files_to_delete_omits_override_file_when_absent(tmp_path):
+    campaign_dir = tmp_path / "templates" / "Foo"
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "intro_A.txt").write_text("Subject: Hi\n\nBody")
+
+    campaigns_dir = tmp_path / "config" / "campaigns"
+    campaigns_dir.mkdir(parents=True)
+
+    paths = list_campaign_files_to_delete("Foo", str(tmp_path / "templates"), str(campaigns_dir))
+    assert not any("campaigns/Foo.yaml" in p for p in paths)
+
+
+def test_list_campaign_files_to_delete_never_touches_sheet_data():
+    """Not a code assertion so much as a documentation check — this
+    function's docstring must be explicit that Sheet data is untouched,
+    since that's the one thing worth being extremely clear about."""
+    assert "does NOT touch the Google Sheet" in list_campaign_files_to_delete.__doc__
+
+
+def test_list_campaign_files_to_delete_ignores_non_txt_files(tmp_path):
+    campaign_dir = tmp_path / "templates" / "Foo"
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "intro_A.txt").write_text("Subject: Hi\n\nBody")
+    (campaign_dir / ".DS_Store").write_text("junk")
+
+    campaigns_dir = tmp_path / "config" / "campaigns"
+    campaigns_dir.mkdir(parents=True)
+
+    paths = list_campaign_files_to_delete("Foo", str(tmp_path / "templates"), str(campaigns_dir))
+    assert paths == ["templates/Foo/intro_A.txt"]
