@@ -113,3 +113,36 @@ def commit_message_for_campaign(campaign_name: str, stage_prefix: str, variant_c
         f"Add {stage_prefix} to campaign: {campaign_name} ({variant_count} variant(s), "
         f"via Streamlit control panel by {created_by})"
     )
+
+
+def confirmation_matches_campaign_name(typed_text: str, campaign_name: str) -> bool:
+    """Exact match required — same deliberate friction as typing SEND,
+    but here it's the campaign's own name, so a misclick or a generic
+    confirm word can't accidentally delete the wrong campaign."""
+    return typed_text == campaign_name
+
+
+def list_campaign_files_to_delete(campaign_name: str, templates_root: str, campaigns_dir: str) -> List[str]:
+    """Every repo file that makes this campaign exist at all — every
+    template file (every stage x every variant) plus its config override
+    file, if one was ever created. Returns repo-relative paths, ready for
+    GitHubClient.delete_file, one call per path.
+
+    Deliberately does NOT touch the Google Sheet — leads, sends, and
+    replies all stay exactly where they are, still readable directly in
+    the Sheet, even after the campaign's templates are gone. Only the
+    files that make outreach.py's own auto-discovery recognize this as a
+    campaign are removed; that's what "delete" means here, same
+    soft-removal spirit as remove_leads never hard-deleting a lead row."""
+    campaign_template_dir = os.path.join(templates_root, campaign_name)
+    paths = []
+    if os.path.isdir(campaign_template_dir):
+        for filename in sorted(os.listdir(campaign_template_dir)):
+            if filename.endswith(".txt"):
+                paths.append(f"templates/{campaign_name}/{filename}")
+
+    override_path = os.path.join(campaigns_dir, f"{campaign_name}.yaml")
+    if os.path.isfile(override_path):
+        paths.append(f"config/campaigns/{campaign_name}.yaml")
+
+    return paths
