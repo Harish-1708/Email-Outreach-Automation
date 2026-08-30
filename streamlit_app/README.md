@@ -28,15 +28,15 @@ directly — no GitHub trip, no pull request to approve.
   separate Preview tab. A fuller quoted-thread view and scheduling a
   reply for later are deliberately not built yet — see below.
 - **💬 Responses** — every reply across every campaign in one place, not
-  scoped to one campaign like the tab above. Filter by status (the
-  system's own mechanical classifications — Genuine Reply, Auto-Reply,
-  Out of Office, Bounce Hard/Soft — not Instantly-style sentiment
-  "Interested/Not Interested," which this doesn't do; see Known
-  limitations), by campaign, or to unread only — plus free-text search.
+  scoped to one campaign like the tab above. Filter by status — sales
+  intent (Interested / Not Interested / Lead-Needs-Follow-up / Unclear,
+  optional, see Known limitations) alongside the system's own mechanical
+  classifications (Genuine Reply, Auto-Reply, Out of Office, Bounce
+  Hard/Soft) — by campaign, or to unread only — plus free-text search.
   Click "💬 View full conversation" on any response for the real thread:
   every stage actually sent, re-rendered live from your templates, and
   every reply, in order. Reply directly from here too. Unread tracking
-  now persists (an explicit "Mark as read" + batched sync) — see Known
+  persists (an explicit "Mark as read" + batched sync) — see Known
   limitations for exactly how.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
@@ -147,11 +147,16 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
-- **No sentiment classification (Interested / Not Interested / Lead).**
-  The system classifies mechanically (Genuine Reply, Auto-Reply, Out of
-  Office, Bounce) — it doesn't judge what a reply actually says. Adding
-  that would need a deliberate design decision (a rules engine or an
-  LLM call), not a keyword guess that could misclassify a real prospect.
+- **Intent classification (Interested / Not Interested / Lead-Needs-Follow-up
+  / Unclear) is a genuinely separate layer from mechanical classification**
+  (Genuine Reply / Auto-Reply / Out of Office / Bounce), only ever run for
+  a Genuine Reply, only once per reply ever (the same Message-ID dedup
+  that already prevents logging a reply twice also prevents re-classifying
+  it). Optional — set `ANTHROPIC_API_KEY` as a secret to enable it; leave
+  it unset and Intent columns just stay blank, exactly like before this
+  existed. A low-confidence result always shows as "Unclear" rather than
+  a specific category — never trust an uncertain guess at face value on
+  something that could affect a real business decision.
 - **Unread tracking persists across sessions now** — a response's
   `IsRead` column in the Response Sheet is the source of truth, marked
   via an explicit "✓ Mark as read" button. Marking is batched: click
