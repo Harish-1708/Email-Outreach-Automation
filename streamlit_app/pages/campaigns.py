@@ -46,7 +46,7 @@ from schedule_logic import (  # noqa: E402
     validate_schedule, build_updated_schedule_override, get_current_schedule,
     timezone_display_name, COMMON_TIMEZONES, DAY_OPTIONS,
 )
-from launch_logic import build_status_override  # noqa: E402
+from launch_logic import build_status_override, build_delete_override, build_restore_override  # noqa: E402
 from responses_reply_logic import (  # noqa: E402
     find_lead_for_response, build_reply_defaults, parse_email_list, validate_reply,
     build_reply_payload, reply_payload_path, build_attachment_entries, total_attachment_size_bytes,
@@ -233,11 +233,17 @@ def _new_campaign_dialog(existing_campaigns):
 def _render_hub(just_arrived: bool):
     st.title("Campaigns")
 
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         search = st.text_input("🔍 Search campaigns...", label_visibility="collapsed",
                                 placeholder="🔍 Search campaigns...")
     with col2:
+        if st.button("🔄 Refresh", width="stretch", key="refresh_hub_button"):
+            _load_hub_rows.clear()
+            _fetch_full_campaign_data_cached.clear()
+            _get_master_header_cached.clear()
+            st.rerun()
+    with col3:
         if "show_new_campaign_dialog" not in st.session_state:
             st.session_state["show_new_campaign_dialog"] = False
         if st.button("＋ New Campaign", width="stretch"):
@@ -300,15 +306,16 @@ def _render_hub(just_arrived: bool):
     if deleted_rows:
         with st.expander(f"🗑️ Deleted Campaigns ({len(deleted_rows)})"):
             st.caption(
-                "Temporarily removed — hidden from the list above, but nothing about them was deleted. "
-                "Restore brings a campaign back as a Draft."
+                "Temporarily removed — hidden from the list above, but nothing about them changed. "
+                "Restore brings a campaign back exactly as it was, including whether it was Running, "
+                "Paused, or still a Draft."
             )
             for row in deleted_rows:
                 col1, col2 = st.columns([4, 1])
                 col1.write(f"**{row['name']}**")
                 if col2.button("↩️ Restore", key=f"restore_{row['name']}"):
-                    if _update_campaign_status(row["name"], "draft"):
-                        st.success(f"'{row['name']}' restored as a Draft.")
+                    if _restore_campaign(row["name"]):
+                        st.success(f"'{row['name']}' restored.")
                         st.rerun()
 
 
@@ -812,13 +819,16 @@ def _render_delete_campaign_section(campaign_cfg):
     with st.expander("🗑️ Danger Zone"):
         st.subheader("Temporarily Remove")
         st.caption(
-            "Hides this campaign from the everyday Campaigns list — nothing is deleted. Find it again "
-            "any time in Deleted Campaigns (on the Campaigns Hub page) and Restore it as a Draft."
+            "Hides this campaign from the everyday Campaigns list — nothing about it changes (leads, "
+            "sends, replies, templates, settings all stay exactly as they are). Find it in Deleted "
+            "Campaigns (on the Campaigns Hub page) and Restore it any time — it comes back exactly how "
+            "it was, including its Running/Paused/Draft state."
         )
         if st.button("Temporarily Remove Campaign", key="temp_remove_campaign_button"):
-            if _update_campaign_status(campaign_name, "deleted"):
+            current_status = campaign_cfg.get("status") or "active"
+            if _temporarily_remove_campaign(campaign_name, current_status):
                 st.success(f"'{campaign_name}' temporarily removed. Find it in Deleted Campaigns on the "
-                           "Campaigns Hub page to restore it later.")
+                           "Campaigns Hub page to restore it later, exactly as it is now.")
                 st.session_state["selected_campaign"] = None
                 st.rerun()
 
@@ -1002,6 +1012,43 @@ def _update_campaign_status(campaign_name: str, new_status: str) -> bool:
         return True
     except GitHubActionsError as exc:
         st.error(f"Failed to update status: {exc}")
+        return False
+
+
+def _temporarily_remove_campaign(campaign_name: str, current_status: str) -> bool:
+    """Records current_status (draft/active/paused) so Restore can bring
+    the campaign back exactly as it was — see
+    launch_logic.build_delete_override's docstring."""
+    try:
+        raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+        updated = build_delete_override(raw_override, current_status)
+        client = _get_github_client()
+        client.create_file(
+            override_file_path(campaign_name), override_to_yaml_bytes(updated),
+            message=f"Temporarily remove {campaign_name} (via Streamlit, by {current_user()})",
+        )
+        _load_hub_rows.clear()
+        return True
+    except GitHubActionsError as exc:
+        st.error(f"Failed to remove: {exc}")
+        return False
+
+
+def _restore_campaign(campaign_name: str) -> bool:
+    """Restores whatever status was recorded at Temporarily Remove time —
+    see launch_logic.build_restore_override's docstring."""
+    try:
+        raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+        updated = build_restore_override(raw_override)
+        client = _get_github_client()
+        client.create_file(
+            override_file_path(campaign_name), override_to_yaml_bytes(updated),
+            message=f"Restore {campaign_name} (via Streamlit, by {current_user()})",
+        )
+        _load_hub_rows.clear()
+        return True
+    except GitHubActionsError as exc:
+        st.error(f"Failed to restore: {exc}")
         return False
 
 
