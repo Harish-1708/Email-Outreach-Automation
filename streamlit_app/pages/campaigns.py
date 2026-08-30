@@ -31,11 +31,13 @@ from data_import_logic import (  # noqa: E402
 from sequences_logic import (  # noqa: E402
     get_existing_stages_and_variants, load_variant_content, next_available_variant_letter,
     build_variant_edit_file, build_new_variant_files_for_all_stages, validate_new_variant_contents,
-    has_content_changed,
+    has_content_changed, can_delete_stage, build_stage_deletion_paths, can_delete_variant,
+    build_variant_deletion_paths,
 )
 from campaign_builder import (  # noqa: E402
     get_next_stage_for_campaign, build_campaign_files, validate_variant_content,
-    validate_campaign_name, commit_message_for_campaign,
+    validate_campaign_name, commit_message_for_campaign, confirmation_matches_campaign_name,
+    list_campaign_files_to_delete,
 )
 from settings_logic import (  # noqa: E402
     load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
@@ -628,6 +630,55 @@ def _render_sequences_tab(campaign_cfg, leads):
                     except GitHubActionsError as exc:
                         st.error(f"Failed to add stage: {exc}")
 
+    # ---------- Delete a variant (campaign-wide, matching how add works) ----------
+    with st.expander("🗑️ Delete a variant"):
+        variant_to_delete = st.selectbox("Variant to delete", existing_variants, key="delete_variant_select")
+        can_delete_v, block_reason_v = can_delete_variant(existing_variants, variant_to_delete)
+        if can_delete_v:
+            st.warning(f"This permanently removes variant {variant_to_delete} from EVERY stage "
+                       f"({len(stages)} file(s)) — not recoverable from this app.")
+            confirm_variant_delete = st.checkbox(f"I understand, delete variant {variant_to_delete}",
+                                                  key="confirm_delete_variant")
+            if st.button(f"Delete Variant {variant_to_delete}", disabled=not confirm_variant_delete,
+                         key="delete_variant_button"):
+                try:
+                    paths = build_variant_deletion_paths(campaign_name, stages, variant_to_delete)
+                    client = _get_github_client()
+                    for path in paths:
+                        client.delete_file(path, message=f"Delete variant {variant_to_delete} from "
+                                                           f"{campaign_name} (via Streamlit, by {current_user()})")
+                    st.success(f"Variant {variant_to_delete} deleted from all {len(paths)} stage(s). May "
+                               "take a minute to actually reflect here while the app redeploys.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to delete variant: {exc}")
+        else:
+            st.info(block_reason_v)
+
+    # ---------- Delete the last stage (stages must stay contiguous) ----------
+    with st.expander("🗑️ Delete the last stage"):
+        last_stage = stages[-1]
+        can_delete_s, block_reason_s = can_delete_stage(stages, last_stage["template_prefix"])
+        if can_delete_s:
+            st.warning(f"This permanently removes '{last_stage['name']}' — all {len(existing_variants)} "
+                       "variant file(s) for it — not recoverable from this app.")
+            confirm_stage_delete = st.checkbox(f"I understand, delete {last_stage['name']}",
+                                                key="confirm_delete_stage")
+            if st.button(f"Delete {last_stage['name']}", disabled=not confirm_stage_delete,
+                         key="delete_stage_button"):
+                try:
+                    paths = build_stage_deletion_paths(campaign_name, last_stage["template_prefix"],
+                                                        existing_variants)
+                    client = _get_github_client()
+                    for path in paths:
+                        client.delete_file(path, message=f"Delete stage {last_stage['name']} from "
+                                                           f"{campaign_name} (via Streamlit, by {current_user()})")
+                    st.success(f"'{last_stage['name']}' deleted. May take a minute to actually reflect "
+                               "here while the app redeploys.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to delete stage: {exc}")
+        else:
+            st.info(block_reason_s)
+
     _render_maintenance_section_in_sequences(campaign_cfg)
 
 
@@ -712,6 +763,41 @@ def _render_settings_tab(campaign_cfg, leads):
                 st.error(f"Save failed: {exc}")
 
     _render_send_section_in_settings(campaign_cfg, leads)
+    _render_delete_campaign_section(campaign_cfg)
+
+
+def _render_delete_campaign_section(campaign_cfg):
+    """Danger Zone — always last in Settings. Removes the campaign's
+    templates (and its settings override, if any) from the repo, so
+    outreach.py's own auto-discovery no longer recognizes it as a
+    campaign. Deliberately does NOT touch the Google Sheet — leads,
+    sends, and replies stay fully intact and readable directly there,
+    same soft-removal spirit as remove_leads never hard-deleting a lead
+    row. See campaign_builder.list_campaign_files_to_delete's docstring."""
+    campaign_name = campaign_cfg["_campaign_name"]
+    st.divider()
+    with st.expander("🗑️ Danger Zone: Delete this campaign"):
+        st.warning(
+            "This removes the campaign's templates — it will no longer appear in the Campaigns list. "
+            "Your Sheet data (leads, sends, replies) is NOT deleted and stays fully accessible directly "
+            "in the Sheet."
+        )
+        typed_name = st.text_input(f'Type the campaign name ("{campaign_name}") to confirm',
+                                    key="delete_campaign_confirm_text")
+        confirmed = confirmation_matches_campaign_name(typed_name, campaign_name)
+        if st.button("Delete Campaign", type="primary", disabled=not confirmed, key="delete_campaign_button"):
+            try:
+                paths = list_campaign_files_to_delete(campaign_name, TEMPLATES_ROOT, CAMPAIGNS_DIR)
+                client = _get_github_client()
+                for path in paths:
+                    client.delete_file(path, message=f"Delete campaign {campaign_name} "
+                                                       f"(via Streamlit, by {current_user()})")
+                st.success(f"'{campaign_name}' deleted ({len(paths)} file(s)). It'll disappear from the "
+                           "Campaigns list within a minute or two. Its Sheet data is untouched.")
+                st.session_state["selected_campaign"] = None
+                st.rerun()
+            except GitHubActionsError as exc:
+                st.error(f"Failed to delete campaign: {exc}")
 
 
 def _render_schedule_tab(campaign_cfg):
