@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -6,7 +7,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from email_account_slots_logic import (
     parse_slot_mapping, serialize_slot_mapping, find_next_free_slot,
     add_account_to_mapping, remove_account_from_mapping, update_account_address_in_mapping,
-    get_account_names, read_local_slot_mapping,
+    get_account_names, read_local_slot_mapping, build_account_secret_payload,
+    parse_bulk_accounts_csv, BULK_ACCOUNT_CSV_COLUMNS,
 )
 
 
@@ -182,3 +184,111 @@ def test_read_local_slot_mapping_reads_real_file(tmp_path):
     path.write_text("sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
     mapping = read_local_slot_mapping(str(path))
     assert mapping == {"sales1": {"slot": 1, "address": "sales1@gmail.com"}}
+
+
+# ---------- build_account_secret_payload ----------
+
+def test_build_account_secret_payload_minimal_gmail_style():
+    payload = json.loads(build_account_secret_payload("sales1", "sales1@gmail.com", "app-pass"))
+    assert payload == {"name": "sales1", "address": "sales1@gmail.com", "app_password": "app-pass"}
+
+
+def test_build_account_secret_payload_includes_custom_provider_fields():
+    payload = json.loads(build_account_secret_payload(
+        "hostinger1", "sales@example.com", "smtp-pass",
+        imap_password="imap-pass", smtp_host="smtp.hostinger.com", smtp_port="587",
+        smtp_username="login@example.com", imap_host="imap.hostinger.com", imap_port="993",
+        imap_username="login@example.com",
+    ))
+    assert payload["smtp_host"] == "smtp.hostinger.com"
+    assert payload["smtp_port"] == 587
+    assert isinstance(payload["smtp_port"], int)
+    assert payload["imap_password"] == "imap-pass"
+
+
+def test_build_account_secret_payload_omits_unset_optional_fields():
+    payload = json.loads(build_account_secret_payload("sales1", "sales1@gmail.com", "app-pass"))
+    for field in ("imap_password", "smtp_host", "smtp_port", "smtp_username",
+                  "imap_host", "imap_port", "imap_username"):
+        assert field not in payload
+
+
+# ---------- parse_bulk_accounts_csv ----------
+
+def test_parse_bulk_accounts_csv_simple_gmail_rows():
+    columns = ["Name", "Email", "Password"]
+    rows = [
+        {"Name": "sales1", "Email": "sales1@gmail.com", "Password": "pass1"},
+        {"Name": "sales2", "Email": "sales2@gmail.com", "Password": "pass2"},
+    ]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert errors == []
+    assert len(parsed) == 2
+    assert parsed[0]["name"] == "sales1"
+    assert parsed[0]["address"] == "sales1@gmail.com"
+    assert parsed[0]["password"] == "pass1"
+    assert parsed[0]["smtp_host"] is None
+
+
+def test_parse_bulk_accounts_csv_custom_provider_rows():
+    columns = BULK_ACCOUNT_CSV_COLUMNS
+    rows = [{
+        "Name": "hostinger1", "Email": "sales@example.com", "Password": "smtp-pass",
+        "IMAP Password": "imap-pass", "SMTP Host": "smtp.hostinger.com", "SMTP Port": "587",
+        "SMTP Username": "login@example.com", "IMAP Host": "imap.hostinger.com", "IMAP Port": "993",
+        "IMAP Username": "login@example.com",
+    }]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert errors == []
+    assert parsed[0]["smtp_host"] == "smtp.hostinger.com"
+    assert parsed[0]["imap_password"] == "imap-pass"
+
+
+def test_parse_bulk_accounts_csv_requires_email_and_password_columns():
+    parsed, errors = parse_bulk_accounts_csv(["Name"], [{"Name": "x"}])
+    assert parsed == []
+    assert any("Email" in e or "Password" in e for e in errors)
+
+
+def test_parse_bulk_accounts_csv_skips_row_missing_email():
+    columns = ["Name", "Email", "Password"]
+    rows = [{"Name": "sales1", "Email": "", "Password": "pass1"}]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert parsed == []
+    assert "Row 1" in errors[0]
+    assert "Email is required" in errors[0]
+
+
+def test_parse_bulk_accounts_csv_skips_row_missing_password():
+    columns = ["Name", "Email", "Password"]
+    rows = [{"Name": "sales1", "Email": "a@b.com", "Password": ""}]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert parsed == []
+    assert "Password is required" in errors[0]
+
+
+def test_parse_bulk_accounts_csv_defaults_name_to_email_local_part():
+    columns = ["Email", "Password"]
+    rows = [{"Email": "sales1@gmail.com", "Password": "pass1"}]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert errors == []
+    assert parsed[0]["name"] == "sales1"
+
+
+def test_parse_bulk_accounts_csv_one_bad_row_does_not_block_valid_rows():
+    columns = ["Name", "Email", "Password"]
+    rows = [
+        {"Name": "sales1", "Email": "sales1@gmail.com", "Password": "pass1"},
+        {"Name": "bad", "Email": "", "Password": "pass2"},
+        {"Name": "sales3", "Email": "sales3@gmail.com", "Password": "pass3"},
+    ]
+    parsed, errors = parse_bulk_accounts_csv(columns, rows)
+    assert len(parsed) == 2
+    assert len(errors) == 1
+    assert {p["name"] for p in parsed} == {"sales1", "sales3"}
+
+
+def test_parse_bulk_accounts_csv_empty_rows_list():
+    parsed, errors = parse_bulk_accounts_csv(["Name", "Email", "Password"], [])
+    assert parsed == []
+    assert errors == []
