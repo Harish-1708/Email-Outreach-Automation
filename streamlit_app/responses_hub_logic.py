@@ -48,24 +48,54 @@ def response_key(response: Dict) -> str:
     return f"{response.get('_campaign', '')}:{response.get('ResponseID', '')}"
 
 
+def is_response_read(response: Dict, session_read_keys: Set[str]) -> bool:
+    """True if the Sheet's own IsRead column already says so (the
+    durable, persists-across-sessions source of truth), OR if it was
+    marked read this session but hasn't synced to the Sheet yet — an
+    optimistic local overlay, so the UI doesn't look "stuck" showing
+    something as unread for the seconds it takes the sync workflow to
+    land."""
+    if (response.get("IsRead") or "").strip().lower() in ("yes", "true", "1"):
+        return True
+    return response_key(response) in session_read_keys
+
+
+def split_keys_by_campaign(keys: Set[str]) -> Dict[str, List[str]]:
+    """response_key()'s own format ("campaign:response_id") reversed —
+    groups a flat set of keys back into {campaign: [response_id, ...]},
+    since marking read has to happen per-campaign (each campaign has its
+    own Response Sheet, and the sync workflow is scoped to one)."""
+    grouped: Dict[str, List[str]] = {}
+    for key in keys:
+        campaign, _, response_id = key.partition(":")
+        if campaign and response_id:
+            grouped.setdefault(campaign, []).append(response_id)
+    return grouped
+
+
+def build_mark_read_payload(response_ids: List[str]) -> Dict:
+    return {"response_ids": response_ids}
+
+
 def filter_responses(responses: List[Dict], status_filter: str, campaign_filter: str,
                       inbox_filter: str, read_keys: Set[str]) -> List[Dict]:
     """status_filter: one of CLASSIFICATION_OPTIONS ("All" = no filter).
     campaign_filter: a campaign name, or "All". inbox_filter:
-    INBOX_FILTER_ALL or INBOX_FILTER_UNREAD. read_keys: response_key()
-    values already marked read — anything else counts as unread."""
+    INBOX_FILTER_ALL or INBOX_FILTER_UNREAD. read_keys: session-local
+    keys marked read but not yet synced to the Sheet — combined with
+    each response's own persistent IsRead field via is_response_read."""
     result = responses
     if status_filter != STATUS_FILTER_ALL:
         result = [r for r in result if r.get("Classification") == status_filter]
     if campaign_filter != STATUS_FILTER_ALL:
         result = [r for r in result if r.get("_campaign") == campaign_filter]
     if inbox_filter == INBOX_FILTER_UNREAD:
-        result = [r for r in result if response_key(r) not in read_keys]
+        result = [r for r in result if not is_response_read(r, read_keys)]
     return result
 
 
 def count_unread(responses: List[Dict], read_keys: Set[str]) -> int:
-    return sum(1 for r in responses if response_key(r) not in read_keys)
+    return sum(1 for r in responses if not is_response_read(r, read_keys))
 
 
 def sort_responses_newest_first(responses: List[Dict]) -> List[Dict]:
