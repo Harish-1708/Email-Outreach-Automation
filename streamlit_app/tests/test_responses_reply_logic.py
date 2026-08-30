@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from responses_reply_logic import (
     find_lead_for_response, build_reply_defaults, build_reply_references,
     parse_email_list, validate_reply, build_reply_payload, reply_payload_path,
-    build_attachment_entries, total_attachment_size_bytes,
+    build_attachment_entries, total_attachment_size_bytes, extract_email_address,
 )
 
 
@@ -68,6 +68,35 @@ def test_reply_defaults_blank_subject_fallback():
 def test_reply_defaults_to_from_response():
     defaults = build_reply_defaults(_response(From="someone@abc.com"), _lead())
     assert defaults["to"] == "someone@abc.com"
+
+
+def test_reply_defaults_extracts_bare_address_from_display_name_format():
+    """The actual reported bug: 'Rocky <harishdh16@gmail.com>' in the
+    From field must pre-fill 'To' with just the address, not the whole
+    display-name string, which is not a valid email address on its own
+    and would fail validation as soon as the form loads."""
+    defaults = build_reply_defaults(_response(From="Rocky <harishdh16@gmail.com>"), _lead())
+    assert defaults["to"] == "harishdh16@gmail.com"
+
+
+def test_extract_email_address_from_display_name_format():
+    assert extract_email_address("Rocky <harishdh16@gmail.com>") == "harishdh16@gmail.com"
+
+
+def test_extract_email_address_bare_address_unchanged():
+    assert extract_email_address("harishdh16@gmail.com") == "harishdh16@gmail.com"
+
+
+def test_extract_email_address_quoted_display_name():
+    assert extract_email_address('"Rocky, D." <harishdh16@gmail.com>') == "harishdh16@gmail.com"
+
+
+def test_extract_email_address_empty_string():
+    assert extract_email_address("") == ""
+
+
+def test_extract_email_address_none_input():
+    assert extract_email_address(None) == ""
 
 
 def test_reply_defaults_sender_account_from_lead():
@@ -181,7 +210,7 @@ def test_validate_reply_accepts_attachments_under_limit():
 # ---------- build_reply_payload ----------
 
 def test_build_reply_payload_shape():
-    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi there", "Thanks!",
+    payload = build_reply_payload(_response(), _lead(), "sales1", "lead@abc.com", "Re: Hi there", "Thanks!",
                                    ["cc@abc.com"], ["bcc@abc.com"])
     assert payload == {
         "sender_account": "sales1", "to": "lead@abc.com", "subject": "Re: Hi there", "body": "Thanks!",
@@ -191,25 +220,42 @@ def test_build_reply_payload_shape():
 
 
 def test_build_reply_payload_omits_attachments_key_when_none():
-    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [])
+    payload = build_reply_payload(_response(), _lead(), "sales1", "lead@abc.com", "Re: Hi", "Thanks!", [], [])
     assert "attachments" not in payload
 
 
 def test_build_reply_payload_includes_attachments_when_given():
     attachments = [{"filename": "photo.png", "content_base64": "ZmFrZQ=="}]
-    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [],
+    payload = build_reply_payload(_response(), _lead(), "sales1", "lead@abc.com", "Re: Hi", "Thanks!", [], [],
                                    attachments=attachments)
     assert payload["attachments"] == attachments
 
 
+def test_build_reply_payload_uses_provided_to_email_not_raw_from_field():
+    """The other real bug: even a corrected 'To' field value was
+    previously ignored — the payload always re-derived 'to' from the
+    raw, unedited response['From'], silently discarding any edit."""
+    payload = build_reply_payload(_response(From="Rocky <harishdh16@gmail.com>"), _lead(), "sales1",
+                                   "harishdh16@gmail.com", "Re: Hi", "Thanks!", [], [])
+    assert payload["to"] == "harishdh16@gmail.com"
+
+
+def test_build_reply_payload_respects_a_fully_different_to_address():
+    """The person can edit 'To' to reply to someone else entirely — that
+    edit has to actually take effect, not just fix formatting."""
+    payload = build_reply_payload(_response(From="original@abc.com"), _lead(), "sales1",
+                                   "someone-else@abc.com", "Re: Hi", "Thanks!", [], [])
+    assert payload["to"] == "someone-else@abc.com"
+
+
 def test_build_reply_payload_is_json_serializable():
-    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [])
+    payload = build_reply_payload(_response(), _lead(), "sales1", "lead@abc.com", "Re: Hi", "Thanks!", [], [])
     json.dumps(payload)  # raises if not serializable
 
 
 def test_build_reply_payload_with_attachments_is_json_serializable():
     attachments = [{"filename": "photo.png", "content_base64": "ZmFrZQ=="}]
-    payload = build_reply_payload(_response(), _lead(), "sales1", "Re: Hi", "Thanks!", [], [],
+    payload = build_reply_payload(_response(), _lead(), "sales1", "lead@abc.com", "Re: Hi", "Thanks!", [], [],
                                    attachments=attachments)
     json.dumps(payload)
 
