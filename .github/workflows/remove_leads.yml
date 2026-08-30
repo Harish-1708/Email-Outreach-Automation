@@ -20,6 +20,12 @@ concurrency:
 jobs:
   remove:
     runs-on: ubuntu-latest
+    # Explicit, least-privilege grant — needed for the "remove the
+    # processed payload" push below. Without this, the run inherits the
+    # repo's default GITHUB_TOKEN permission; if that's read-only, the
+    # push fails with a 403 even though the removal already succeeded.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,7 +50,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          rm -f "${{ github.event.inputs.payload_path }}"
-          git add -A
-          git commit -m "Remove processed removal payload: ${{ github.event.inputs.payload_path }}" || echo "Nothing to commit"
-          git push
+          PAYLOAD_PATH="${{ github.event.inputs.payload_path }}"
+          if [ -f "$PAYLOAD_PATH" ]; then
+            git rm -f "$PAYLOAD_PATH"
+            git commit -m "Remove processed removal payload: $PAYLOAD_PATH"
+            git push
+          else
+            echo "Payload file already gone — nothing to clean up."
+          fi
