@@ -51,6 +51,11 @@ jobs:
           EMAIL_ACCOUNT_SLOT_8: ${{ secrets.EMAIL_ACCOUNT_SLOT_8 }}
           EMAIL_ACCOUNT_SLOT_9: ${{ secrets.EMAIL_ACCOUNT_SLOT_9 }}
           EMAIL_ACCOUNT_SLOT_10: ${{ secrets.EMAIL_ACCOUNT_SLOT_10 }}
+          # Optional — sales-intent classification (Interested / Not Interested /
+          # Lead-Needs-Follow-up / Unclear) for each Genuine Reply. Leave this
+          # secret unset entirely and everything works exactly as before, with
+          # the Intent columns simply left blank.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -o pipefail
           python outreach.py check-replies \
