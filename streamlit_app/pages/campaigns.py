@@ -11,10 +11,12 @@ from page_state import mark_active_page  # noqa: E402
 from config import (  # noqa: E402
     WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, WORKFLOW_SEND_REPLY,
     WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT,
-    TEMPLATES_ROOT, CAMPAIGNS_DIR,
+    TEMPLATES_ROOT, CAMPAIGNS_DIR, EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH,
 )
+from email_account_slots_logic import read_local_slot_mapping  # noqa: E402
+from accounts_logic import merge_account_directories  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
-from preview_logic import list_campaigns, get_campaign_cfg, run_preview  # noqa: E402
+from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector  # noqa: E402
 from campaigns_hub_logic import build_campaigns_hub, filter_campaigns_by_search  # noqa: E402
 from campaign_analytics_logic import (  # noqa: E402
@@ -633,14 +635,20 @@ def _render_settings_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
     sending = campaign_cfg.get("sending", {})
 
-    account_directory = dict(st.secrets.get("email_accounts_directory", {}))
+    # Merges BOTH sources — the legacy Streamlit-secrets-based directory
+    # AND the slot-mapping file the Email Accounts page's Add Account
+    # button writes to — so an account added there shows up here too,
+    # without needing to also hand-maintain [email_accounts_directory].
+    streamlit_secret_directory = dict(st.secrets.get("email_accounts_directory", {}))
+    slot_mapping = read_local_slot_mapping(EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH)
+    account_directory = merge_account_directories(streamlit_secret_directory, slot_mapping)
     available_accounts = list(account_directory.keys())
 
     st.subheader("Sender accounts")
     if not available_accounts:
         st.info(
-            "No accounts configured in Streamlit Secrets yet — add [email_accounts_directory] "
-            "(see the Email Accounts page) to pick specific accounts here. Sending will still use "
+            "No accounts configured yet — add one on the Email Accounts page (➕ Add Account), or add "
+            "[email_accounts_directory] to Streamlit Secrets for the legacy path. Sending will still use "
             "whatever's configured directly in EMAIL_ACCOUNTS_JSON either way."
         )
         rotation_accounts = list(sending.get("rotation_accounts") or [])
@@ -918,47 +926,6 @@ def _render_status_controls(campaign_cfg, leads, just_arrived: bool):
                 st.rerun()
 
 
-def _render_preview_tab(campaign_cfg, leads):
-    campaign_name = campaign_cfg["_campaign_name"]
-    STAGES = ["intro", "followup1", "followup2", "followup3", "followup4"]
-    VARIANTS = ["Auto", "A", "B", "C", "D"]
-
-    st.caption("Runs instantly, in-app. Nothing is sent or written.")
-    stage = st.selectbox("Stage", STAGES, key="campaigns_preview_stage")
-    batch_size = st.number_input("Batch size", min_value=1, max_value=500, value=10,
-                                  key="campaigns_preview_batch_size")
-    variant = st.selectbox("Variant", VARIANTS, key="campaigns_preview_variant")
-    ignore_wait_days_preview = st.checkbox(
-        "Ignore the scheduled wait for this stage", key="campaigns_preview_ignore_wait_days",
-        help="Every other rule still applies — Approval must be Yes, the previous stage must "
-             "actually have been sent, this stage can't already be sent, no reply received.",
-    )
-
-    if st.button("Run Preview", key="campaigns_run_preview"):
-        try:
-            plan = run_preview(campaign_name, stage, int(batch_size), leads, forced_variant=variant,
-                                ignore_wait_days=ignore_wait_days_preview)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Preview failed: {exc}")
-            plan = None
-
-        if plan is not None:
-            if not plan:
-                st.info(f"No eligible leads for stage '{stage}'.")
-            else:
-                st.success(f"{len(plan)} eligible lead(s).")
-                for item in plan:
-                    lead = item["lead"]
-                    with st.expander(f"{lead.get('FirstName', '')} {lead.get('LastName', '')} "
-                                      f"<{lead.get('Email')}> — variant {item['variant']}"):
-                        st.write(f"**Subject:** {item['subject']}"
-                                 + (" _(continuing existing thread)_" if item["is_continuation"] else ""))
-                        st.text(item["body"])
-                        if item["missing_variables"]:
-                            st.warning(f"Unrecognized template variable(s): "
-                                       f"{', '.join(item['missing_variables'])}")
-
-
 def _render_send_section_in_settings(campaign_cfg, leads):
     """Called from the END of _render_settings_tab — sending config
     (limits, rotation) already lives there, so the actual Send action
@@ -1166,20 +1133,18 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     _render_status_controls(campaign_cfg, leads, just_arrived)
     st.divider()
 
-    tabs = st.tabs(["📊 Analytics", "👀 Preview", "📋 Data", "✉️ Sequences", "📅 Schedule", "⚙️ Settings", "💬 Responses"])
+    tabs = st.tabs(["📊 Analytics", "📋 Data", "✉️ Sequences", "📅 Schedule", "⚙️ Settings", "💬 Responses"])
     with tabs[0]:
         _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log)
     with tabs[1]:
-        _render_preview_tab(campaign_cfg, leads)
-    with tabs[2]:
         _render_data_tab(campaign_cfg, leads)
-    with tabs[3]:
+    with tabs[2]:
         _render_sequences_tab(campaign_cfg, leads)
-    with tabs[4]:
+    with tabs[3]:
         _render_schedule_tab(campaign_cfg)
-    with tabs[5]:
+    with tabs[4]:
         _render_settings_tab(campaign_cfg, leads)
-    with tabs[6]:
+    with tabs[5]:
         _render_responses_tab(campaign_cfg, leads, responses)
 
 
