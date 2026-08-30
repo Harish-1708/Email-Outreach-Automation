@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from email_account_slots_logic import (
     parse_slot_mapping, serialize_slot_mapping, find_next_free_slot,
     add_account_to_mapping, remove_account_from_mapping, update_account_address_in_mapping,
-    get_account_names,
+    get_account_names, read_local_slot_mapping,
 )
 
 
@@ -166,3 +166,19 @@ def test_get_account_names_sorted():
 
 def test_get_account_names_empty_mapping():
     assert get_account_names({}) == []
+
+
+# ---------- read_local_slot_mapping ----------
+
+def test_read_local_slot_mapping_returns_empty_when_file_missing(tmp_path):
+    missing_path = str(tmp_path / "config" / "email_account_slots.yaml")
+    assert read_local_slot_mapping(missing_path) == {}
+
+
+def test_read_local_slot_mapping_reads_real_file(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    path = config_dir / "email_account_slots.yaml"
+    path.write_text("sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
+    mapping = read_local_slot_mapping(str(path))
+    assert mapping == {"sales1": {"slot": 1, "address": "sales1@gmail.com"}}
