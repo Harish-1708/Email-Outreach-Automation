@@ -2794,6 +2794,31 @@ def test_responses_hub_page_renders_without_exceptions():
     assert "old@abc.com" in markdown_text
 
 
+def test_responses_hub_merely_loading_the_page_never_marks_anything_read():
+    """The actual bug found and fixed: st.expander's body runs on every
+    script rerun regardless of whether it's open or closed — a naive
+    "mark read inside the expander" would mark EVERY response read the
+    very first time the page loads, before anyone opened anything."""
+    fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+        at.run(timeout=15)  # a second rerun, in case a bug only manifests after the first pass
+
+    assert list(at.exception) == []
+    assert at.session_state["read_response_keys"] == set()
+    assert at.session_state["pending_sync_keys"] == set()
+    # Both responses should still show the unread marker — neither was
+    # silently marked read just by the page rendering.
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert markdown_text.count("🔵") == 2
+
+
 def test_responses_hub_status_filter_narrows_to_selected_classification():
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
@@ -2919,9 +2944,11 @@ def test_responses_hub_unread_filter_hides_opened_response():
             at.session_state[k] = v
         at.run(timeout=15)
 
-        # Opening the "Reply" expander for r1 marks it read.
-        expander = next(e for e in at.expander if "Reply" in e.label)
-        expander.expanded = True
+        # Explicitly marking r1 as read — merely opening an expander must
+        # NOT do this on its own (st.expander's body runs every rerun
+        # regardless of open/closed state).
+        mark_read_button = next(b for b in at.button if "Mark as read" in b.label)
+        mark_read_button.click()
         at.run(timeout=15)
 
         inbox_select = next(sb for sb in at.selectbox if sb.key == "responses_inbox_filter")
@@ -2929,6 +2956,49 @@ def test_responses_hub_unread_filter_hides_opened_response():
         at.run(timeout=15)
 
     assert list(at.exception) == []
+
+
+    assert list(at.exception) == []
+
+
+def test_responses_hub_sync_read_status_marks_pending_and_dispatches_workflow():
+    fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+    dispatched = []
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        dispatched.append((workflow_file, inputs.get("campaign")))
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        # Explicitly marking r1 as read queues it for sync — merely
+        # opening the Reply expander must NOT do this on its own.
+        mark_read_button = next(b for b in at.button if "Mark as read" in b.label)
+        mark_read_button.click()
+        at.run(timeout=15)
+
+        assert at.session_state["pending_sync_keys"] == {"Kelson_Creators_Licensing:r1"}
+
+        sync_button = next(b for b in at.button if "Sync read status" in b.label)
+        sync_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Sync raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert dispatched == [("mark_responses_read.yml", "Kelson_Creators_Licensing")]
+    import json as _json
+    payload = _json.loads(commits_captured["commits"][0]["content"].decode("utf-8"))
+    assert payload == {"response_ids": ["r1"]}
+    assert at.session_state["pending_sync_keys"] == set()  # cleared after a successful sync
 
 
 def test_responses_hub_check_replies_button_triggers_every_campaign():
