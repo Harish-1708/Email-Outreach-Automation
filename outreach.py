@@ -1062,14 +1062,55 @@ def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
 EMAIL_ACCOUNT_SLOT_COUNT = 10  # start small — see check_single_account_health's docstring in the
                                 # Campaigns Hub plan for why this isn't jumped straight to 20
 
+DEFAULT_SMTP_HOST = "smtp.gmail.com"
+DEFAULT_SMTP_PORT = 465
+DEFAULT_IMAP_HOST = "imap.gmail.com"
+DEFAULT_IMAP_PORT = 993
+
+
+def smtp_connection_settings(account: Dict) -> Tuple[str, int, str]:
+    """(host, port, username) for SMTP — defaults to Gmail's own values
+    and the account's login address when a custom provider's fields
+    aren't set, so an existing Gmail-only account dict keeps working
+    completely unchanged. A third-party provider (Hostinger, etc.) sets
+    smtp_host/smtp_port/smtp_username explicitly instead."""
+    host = account.get("smtp_host") or DEFAULT_SMTP_HOST
+    port = int(account.get("smtp_port") or DEFAULT_SMTP_PORT)
+    username = account.get("smtp_username") or account["address"]
+    return host, port, username
+
+
+def imap_connection_settings(account: Dict) -> Tuple[str, int, str]:
+    """Same defaulting principle as smtp_connection_settings, for IMAP."""
+    host = account.get("imap_host") or DEFAULT_IMAP_HOST
+    port = int(account.get("imap_port") or DEFAULT_IMAP_PORT)
+    username = account.get("imap_username") or account["address"]
+    return host, port, username
+
+
+def get_imap_password(account: Dict) -> str:
+    """Most providers (Gmail included) use one password for both SMTP and
+    IMAP — app_password already covers that case. A few (some Hostinger
+    setups) issue a separate IMAP-specific password; when an account has
+    imap_password set, IMAP calls use that instead of app_password.
+    smtp_send never calls this — SMTP always uses app_password."""
+    return account.get("imap_password") or account["app_password"]
+
 
 def _load_email_accounts_from_slots() -> Dict[str, Dict[str, str]]:
     """Reads EMAIL_ACCOUNT_SLOT_1..N env vars, each holding ONE account's
-    JSON ({"name": ..., "address": ..., "app_password": ...}), empty/unset
-    if that slot isn't in use. Returns {} — NOT an error — if none of the
-    slots are populated at all, since a repo mid-migration (or one that
-    hasn't started migrating) legitimately has zero slots set and relies
-    entirely on the legacy EMAIL_ACCOUNTS_JSON blob instead."""
+    JSON ({"name": ..., "address": ..., "app_password": ..., and
+    optionally smtp_host/smtp_port/smtp_username/imap_host/imap_port/
+    imap_username for a non-Gmail provider}), empty/unset if that slot
+    isn't in use. Returns {} — NOT an error — if none of the slots are
+    populated at all, since a repo mid-migration (or one that hasn't
+    started migrating) legitimately has zero slots set and relies
+    entirely on the legacy EMAIL_ACCOUNTS_JSON blob instead.
+
+    Keeps every field from the slot's JSON except "name" (which becomes
+    the dict key) — not just address/app_password — so a custom
+    provider's smtp_host etc. actually survives instead of silently
+    being dropped."""
     accounts: Dict[str, Dict[str, str]] = {}
     for i in range(1, EMAIL_ACCOUNT_SLOT_COUNT + 1):
         raw = os.environ.get(f"EMAIL_ACCOUNT_SLOT_{i}")
@@ -1082,7 +1123,7 @@ def _load_email_accounts_from_slots() -> Dict[str, Dict[str, str]]:
         for field in ("name", "address", "app_password"):
             if field not in info:
                 raise RuntimeError(f"EMAIL_ACCOUNT_SLOT_{i} is missing '{field}'.")
-        accounts[info["name"]] = {"address": info["address"], "app_password": info["app_password"]}
+        accounts[info["name"]] = {k: v for k, v in info.items() if k != "name"}
     return accounts
 
 
@@ -1274,13 +1315,24 @@ def _build_outbound_message(sender_address: str, to: str, subject: str, body_tex
 def smtp_send(address: str, app_password: str, to: str, subject: str, body_text: str,
               in_reply_to: Optional[str] = None, references: Optional[str] = None,
               cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None,
-              attachments: Optional[List[Dict]] = None) -> Dict[str, str]:
+              attachments: Optional[List[Dict]] = None,
+              smtp_host: str = DEFAULT_SMTP_HOST, smtp_port: int = DEFAULT_SMTP_PORT,
+              smtp_username: Optional[str] = None) -> Dict[str, str]:
+    """smtp_host/smtp_port/smtp_username default to Gmail's own values
+    and `address` itself — every existing call site (which never passes
+    them) keeps sending through Gmail exactly as before. A third-party
+    provider (Hostinger, etc.) passes its own host/port, and a login
+    username that can differ from the visible From address — see
+    smtp_connection_settings, which every real call site should build
+    these three arguments from rather than reading account fields here
+    directly."""
     msg, message_id = _build_outbound_message(address, to, subject, body_text, in_reply_to, references,
                                                cc=cc, attachments=attachments)
     envelope_recipients = [to] + list(cc or []) + list(bcc or [])
+    login_username = smtp_username or address
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
-        server.login(address, app_password)
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as server:
+        server.login(login_username, app_password)
         server.sendmail(address, envelope_recipients, msg.as_string())
     return {"message_id": message_id}
 
@@ -1326,9 +1378,11 @@ def send_manual_reply(accounts: Dict[str, Dict[str, str]], sender_account: str, 
             )
 
     account = accounts[sender_account]
+    smtp_host, smtp_port, smtp_username = smtp_connection_settings(account)
     return smtp_send(account["address"], account["app_password"], to=to_email, subject=subject,
                       body_text=body, in_reply_to=in_reply_to, references=references, cc=cc, bcc=bcc,
-                      attachments=attachments)
+                      attachments=attachments, smtp_host=smtp_host, smtp_port=smtp_port,
+                      smtp_username=smtp_username)
 
 
 def classify_send_exception(exc: Exception) -> str:
@@ -1423,10 +1477,17 @@ def _parse_email_message(raw_bytes: bytes) -> Dict:
     return _message_to_dict(msg)
 
 
-def imap_fetch_recent(address: str, app_password: str, since_dt: datetime) -> List[Dict]:
-    imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+def imap_fetch_recent(address: str, app_password: str, since_dt: datetime,
+                       imap_host: str = DEFAULT_IMAP_HOST, imap_port: int = DEFAULT_IMAP_PORT,
+                       imap_username: Optional[str] = None) -> List[Dict]:
+    """imap_host/imap_port/imap_username default to Gmail's own values
+    and `address` itself — every existing call site keeps working
+    unchanged. See imap_connection_settings, which every real call site
+    should build these three arguments from."""
+    login_username = imap_username or address
+    imap = imaplib.IMAP4_SSL(imap_host, imap_port)
     try:
-        imap.login(address, app_password)
+        imap.login(login_username, app_password)
         imap.select("INBOX", readonly=True)
         date_str = since_dt.strftime("%d-%b-%Y")
         status, data = imap.search(None, f'(SINCE "{date_str}")')
@@ -1462,16 +1523,22 @@ def classify_imap_exception(exc: Exception) -> str:
     return ERR_REPLY_CHECK
 
 
-def check_single_account_health(address: str, app_password: str) -> Tuple[str, str]:
+def check_single_account_health(address: str, app_password: str, imap_host: str = DEFAULT_IMAP_HOST,
+                                 imap_port: int = DEFAULT_IMAP_PORT,
+                                 imap_username: Optional[str] = None) -> Tuple[str, str]:
     """Cheap connectivity check — logs in via IMAP and immediately logs
     out, never fetches or sends anything. Returns (status, detail):
     status is 'Connected' or 'Disconnected'; detail is a short,
     password-free reason on failure, empty on success. The password
     itself never appears in the return value — only ever used locally,
-    in-process, for this one login attempt."""
-    imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+    in-process, for this one login attempt. imap_host/imap_port/
+    imap_username default to Gmail's own values — see
+    imap_connection_settings, which check_account_health builds these
+    from per-account."""
+    login_username = imap_username or address
+    imap = imaplib.IMAP4_SSL(imap_host, imap_port)
     try:
-        imap.login(address, app_password)
+        imap.login(login_username, app_password)
         return "Connected", ""
     except Exception as exc:  # noqa: BLE001 - any failure here means "can't currently connect", full stop
         return "Disconnected", str(exc)[:200]
@@ -1492,7 +1559,10 @@ def check_account_health(accounts: Dict[str, Dict[str, str]]) -> List[Dict]:
     now_str = datetime.now().strftime(DATETIME_FMT)
     results = []
     for name, account in accounts.items():
-        status, detail = check_single_account_health(account["address"], account["app_password"])
+        imap_host, imap_port, imap_username = imap_connection_settings(account)
+        status, detail = check_single_account_health(account["address"], get_imap_password(account),
+                                                       imap_host=imap_host, imap_port=imap_port,
+                                                       imap_username=imap_username)
         results.append({
             "AccountName": name, "Address": account["address"], "Status": status,
             "Detail": detail, "CheckedAt": now_str,
@@ -2024,13 +2094,17 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
             # the network send itself is parallelized.
             sent_outcomes: Dict[int, Tuple[str, object]] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(round_jobs)) as executor:
-                future_to_job = {
-                    executor.submit(smtp_send, accounts[acct]["address"], accounts[acct]["app_password"],
-                                     to=job_item["lead"].get("Email", ""), subject=job_item["subject"],
-                                     body_text=job_item["body"], in_reply_to=job_item["in_reply_to"],
-                                     references=job_item["references"]): orig_idx
-                    for orig_idx, job_item, acct in round_jobs
-                }
+                future_to_job = {}
+                for orig_idx, job_item, acct in round_jobs:
+                    smtp_host, smtp_port, smtp_username = smtp_connection_settings(accounts[acct])
+                    future = executor.submit(
+                        smtp_send, accounts[acct]["address"], accounts[acct]["app_password"],
+                        to=job_item["lead"].get("Email", ""), subject=job_item["subject"],
+                        body_text=job_item["body"], in_reply_to=job_item["in_reply_to"],
+                        references=job_item["references"],
+                        smtp_host=smtp_host, smtp_port=smtp_port, smtp_username=smtp_username,
+                    )
+                    future_to_job[future] = orig_idx
                 for future in concurrent.futures.as_completed(future_to_job):
                     orig_idx = future_to_job[future]
                     try:
@@ -2182,7 +2256,9 @@ def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], 
     actions = []
     for account_name, account in accounts.items():
         try:
-            messages = imap_fetch_recent(account["address"], account["app_password"], since_dt)
+            imap_host, imap_port, imap_username = imap_connection_settings(account)
+            messages = imap_fetch_recent(account["address"], get_imap_password(account), since_dt,
+                                          imap_host=imap_host, imap_port=imap_port, imap_username=imap_username)
         except Exception as exc:  # noqa: BLE001 - one account's IMAP outage shouldn't block the rest
             error_type = classify_imap_exception(exc)
             print(f"WARNING: IMAP check failed for account '{account_name}': {exc}", file=sys.stderr)
