@@ -184,8 +184,11 @@ else:
             with col_a:
                 prefix = "🔵 " if is_unread else ""
                 st.markdown(f"{prefix}**{label}**")
+                intent = response.get("Intent", "")
+                intent_confidence = response.get("IntentConfidence", "")
+                intent_badge = f" · 🎯 {intent} ({intent_confidence} confidence)" if intent else ""
                 st.caption(f"{campaign_name} · {response.get('ReceivedAt', '')} · "
-                           f"{response.get('Classification', '')}")
+                           f"{response.get('Classification', '')}{intent_badge}")
             with col_b:
                 st.caption(response.get("ActionTaken", ""))
                 if is_unread:
