@@ -2755,15 +2755,16 @@ def test_pages_require_login_when_not_authenticated():
 
 def _responses_hub_fake_ws():
     return {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
-            [{"LeadID": "1", "Email": "lead1@abc.com", "Approval": "Yes", "SenderAccount": "sales1"}]
-        ),
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet([
+            {"LeadID": "1", "Email": "lead1@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
+            {"LeadID": "2", "Email": "old@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
+        ]),
         "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([
             {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
              "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
              "MessageID": "<m1@mail.gmail.com>", "ReceivedAt": "2026-08-29 10:00:00",
              "ActionTaken": "Stopped Sequence"},
-            {"ResponseID": "r2", "LeadID": "1", "From": "old@abc.com", "Subject": "Auto-reply",
+            {"ResponseID": "r2", "LeadID": "2", "From": "old@abc.com", "Subject": "Auto-reply",
              "Snippet": "Out of office", "Classification": "Auto-Reply",
              "MessageID": "<m2@mail.gmail.com>", "ReceivedAt": "2026-08-28 10:00:00",
              "ActionTaken": "Logged Only"},
@@ -2812,6 +2813,57 @@ def test_responses_hub_status_filter_narrows_to_selected_classification():
     markdown_text = " ".join(m.value for m in at.markdown)
     assert "old@abc.com" in markdown_text
     assert "lead1@abc.com" not in markdown_text
+
+
+def test_responses_hub_search_narrows_by_query():
+    fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        search_input = next(ti for ti in at.text_input if ti.key == "responses_search_query")
+        search_input.set_value("interested")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "lead1@abc.com" in markdown_text  # snippet is "Interested, tell me more"
+    assert "old@abc.com" not in markdown_text  # snippet is "Out of office"
+
+
+def test_responses_hub_conversation_view_shows_full_thread():
+    fake_ws = _responses_hub_fake_ws()
+    # Give lead1 an outgoing Intro too, so the thread has both directions.
+    fake_ws["Kelson_Creators_Licensing Master Sheet"] = FakeWorksheet([
+        {"LeadID": "1", "Email": "lead1@abc.com", "FirstName": "Sam", "Approval": "Yes",
+         "SenderAccount": "sales1", "IntroSentAt": "2026-08-20 09:00:00", "IntroVariant": "A"},
+        {"LeadID": "2", "Email": "old@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
+    ])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        conversation_expander = next(e for e in at.expander if "conversation" in e.label)
+        conversation_expander.expanded = True
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Conversation view raised: {list(at.exception)}"
+    assert list(at.error) == []
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "**You**" in markdown_text  # the re-rendered outgoing Intro
+    body_text = " ".join(t.value for t in at.text)
+    assert "Sam" in body_text  # template variable actually rendered for this lead
 
 
 def test_responses_hub_campaign_filter_narrows_to_selected_campaign():
