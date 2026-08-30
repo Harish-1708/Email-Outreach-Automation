@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from campaigns_hub_logic import (
     compute_last_activity_timestamp, build_draft_campaign_row, build_campaign_hub_row,
-    build_campaigns_hub, filter_campaigns_by_search,
+    build_campaigns_hub, filter_campaigns_by_search, build_deleted_campaign_row,
 )
 
 STAGES = [{"name": "intro", "template_prefix": "intro", "wait_days_after_previous": 0}]
@@ -86,7 +86,7 @@ def test_build_campaigns_hub_skips_sheet_fetch_for_draft_campaigns():
         fetch_calls.append(campaign_cfg["_campaign_name"])
         return [_lead()], [], [{"Status": "sent", "Timestamp": "2026-08-01 09:00:00"}]
 
-    rows, errors = build_campaigns_hub(["NewOne", "Established"], get_cfg, fetch)
+    rows, deleted_rows, errors = build_campaigns_hub(["NewOne", "Established"], get_cfg, fetch)
 
     assert len(rows) == 2
     assert fetch_calls == ["Established"]  # never fetched Sheet data for the draft one
@@ -104,7 +104,7 @@ def test_build_campaigns_hub_isolates_per_campaign_config_errors():
     def fetch(campaign_cfg):
         return [_lead()], [], []
 
-    rows, errors = build_campaigns_hub(["Broken", "Fine"], get_cfg, fetch)
+    rows, deleted_rows, errors = build_campaigns_hub(["Broken", "Fine"], get_cfg, fetch)
     assert len(rows) == 1
     assert rows[0]["name"] == "Fine"
     assert errors == [("Broken", "No templates found")]
@@ -119,16 +119,51 @@ def test_build_campaigns_hub_isolates_per_campaign_sheet_errors():
             raise Exception("Tab doesn't exist yet")
         return [_lead()], [], []
 
-    rows, errors = build_campaigns_hub(["NoTabsYet", "Fine"], get_cfg, fetch)
+    rows, deleted_rows, errors = build_campaigns_hub(["NoTabsYet", "Fine"], get_cfg, fetch)
     assert len(rows) == 1
     assert rows[0]["name"] == "Fine"
     assert errors == [("NoTabsYet", "Tab doesn't exist yet")]
 
 
 def test_build_campaigns_hub_empty_list():
-    rows, errors = build_campaigns_hub([], lambda n: _cfg(n), lambda c: ([], [], []))
+    rows, deleted_rows, errors = build_campaigns_hub([], lambda n: _cfg(n), lambda c: ([], [], []))
     assert rows == []
     assert errors == []
+
+
+def test_build_campaigns_hub_excludes_deleted_campaigns_from_normal_rows():
+    def get_cfg(name):
+        status = "deleted" if name == "Removed" else "active"
+        return _cfg(name, status=status)
+
+    def fetch(campaign_cfg):
+        return [_lead()], [], []
+
+    rows, deleted_rows, errors = build_campaigns_hub(["Removed", "Fine"], get_cfg, fetch)
+    assert [r["name"] for r in rows] == ["Fine"]  # deleted one never appears here
+    assert [r["name"] for r in deleted_rows] == ["Removed"]
+    assert errors == []
+
+
+def test_build_campaigns_hub_deleted_campaign_never_needs_a_sheet_fetch():
+    fetch_calls = []
+
+    def get_cfg(name):
+        return _cfg(name, status="deleted")
+
+    def fetch(campaign_cfg):
+        fetch_calls.append(campaign_cfg["_campaign_name"])
+        return [], [], []
+
+    build_campaigns_hub(["Removed"], get_cfg, fetch)
+    assert fetch_calls == []  # same principle as Draft — status is knowable from config alone
+
+
+def test_build_deleted_campaign_row_shape():
+    row = build_deleted_campaign_row(_cfg("Removed", status="deleted"))
+    assert row["name"] == "Removed"
+    assert row["status"] == "deleted"
+    assert "Deleted" in row["status_label"]
 
 
 # ---------- filter_campaigns_by_search ----------
