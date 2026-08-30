@@ -2010,6 +2010,11 @@ def send_batch(campaign_cfg: Dict, sheets: SheetsConnector, accounts: Dict[str, 
     campaign can still be reviewed any time, just not sent.
     """
     status = campaign_cfg.get("status") or "active"
+    if status == "deleted":
+        raise CampaignPausedError(
+            f"Campaign '{campaign_cfg.get('_campaign_name', '')}' has been (temporarily) deleted — "
+            "no batch will be sent. Restore it first if this was unintentional."
+        )
     if status == "paused":
         raise CampaignPausedError(
             f"Campaign '{campaign_cfg.get('_campaign_name', '')}' is paused — no batch will be sent. "
