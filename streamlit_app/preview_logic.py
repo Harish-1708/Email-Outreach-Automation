@@ -9,25 +9,30 @@ that credential lives.
 import sys
 from typing import Dict, List, Optional
 
-from config import REPO_ROOT, SETTINGS_PATH, CAMPAIGNS_DIR, TEMPLATES_ROOT
+import config
 
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+if config.REPO_ROOT not in sys.path:
+    sys.path.insert(0, config.REPO_ROOT)
 
 import outreach  # noqa: E402
 
 
 def get_campaign_cfg(campaign_name: str) -> Dict:
+    # Reads config.SETTINGS_PATH/CAMPAIGNS_DIR/TEMPLATES_ROOT at CALL time via
+    # the module (not `from config import X` at import time) — this module
+    # is imported once and cached by Python for the whole process, so a
+    # test's patch("config.CAMPAIGNS_DIR", ...) must still be visible on
+    # every call, not just the first one before the patch took effect.
     return outreach.get_campaign(
         campaign_name,
-        settings_path=SETTINGS_PATH,
-        campaigns_dir=CAMPAIGNS_DIR,
-        templates_root=TEMPLATES_ROOT,
+        settings_path=config.SETTINGS_PATH,
+        campaigns_dir=config.CAMPAIGNS_DIR,
+        templates_root=config.TEMPLATES_ROOT,
     )
 
 
 def list_campaigns() -> List[str]:
-    return outreach.discover_campaign_names(TEMPLATES_ROOT)
+    return outreach.discover_campaign_names(config.TEMPLATES_ROOT)
 
 
 def run_preview(campaign_name: str, stage_name: str, batch_size: int,
