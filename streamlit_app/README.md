@@ -11,20 +11,22 @@ directly — no GitHub trip, no pull request to approve.
 
 - **🗂️ Campaigns** — the everyday view, and the only page you need for
   day-to-day work. Every phase (A–H) is now real: search, create a
-  campaign inline, see status at a glance, Launch/Pause/Resume, and
-  inside a campaign: Analytics, Data, Sequences (+ Delete Variant,
+  campaign inline, see status at a glance, Launch/Pause/Resume, a
+  "🗑️ Deleted Campaigns" section to Restore anything temporarily removed,
+  and inside a campaign: Analytics, Data, Sequences (+ Delete Variant,
   Delete Stage, and ThreadSubject Maintenance — all near the bottom),
   Schedule, Settings (+ Send, only available while the campaign is
-  actually Running, and a Danger Zone to delete the whole campaign — its
-  Sheet data is never touched, only its templates), and Responses
-  (+ Check Replies at the top, reply directly from the app — Cc/Bcc, file
-  attachments, correctly threaded into the same conversation). Each
-  action lives with the thing it's most related to, rather than grouped
-  into its own separate tab — Send sits with sending config, Check
-  Replies sits with the replies themselves. A single-lead template
-  preview already lives inline in Sequences, so there's no separate
-  Preview tab. A fuller quoted-thread view and scheduling a reply for
-  later are deliberately not built yet — see below.
+  actually Running, and a Danger Zone with two tiers — Temporarily
+  Remove, which just hides it and can be undone, and Permanently Delete,
+  which can't be — neither ever touches the Sheet, only templates), and
+  Responses (+ Check Replies at the top, reply directly from the app —
+  Cc/Bcc, file attachments, correctly threaded into the same
+  conversation). Each action lives with the thing it's most related to,
+  rather than grouped into its own separate tab — Send sits with sending
+  config, Check Replies sits with the replies themselves. A single-lead
+  template preview already lives inline in Sequences, so there's no
+  separate Preview tab. A fuller quoted-thread view and scheduling a
+  reply for later are deliberately not built yet — see below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -134,12 +136,15 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
-- **Deleting a campaign, a stage, or a variant never touches the Google
-  Sheet.** Only the template files (and the campaign's settings override,
-  for a full campaign delete) are removed — leads, sends, and replies
-  stay exactly where they are, fully readable directly in the Sheet.
-  "Delete" here means "stop treating this as an active campaign," not
-  "erase its history."
+- **Deleting a campaign has two tiers.** "Temporarily Remove" (Settings →
+  Danger Zone) just changes its status — the campaign disappears from
+  the everyday Campaigns list but shows up in "🗑️ Deleted Campaigns"
+  (Campaigns Hub page) with a Restore button, nothing about it is
+  touched. "Permanently Delete" removes its template files (and its
+  settings override, if any) outright and isn't reversible from this
+  app. Neither ever touches the Google Sheet — leads, sends, and replies
+  stay exactly where they are, fully readable directly in the Sheet,
+  either way.
 - **You can only delete the *last* stage**, never a middle one — stages
   must stay contiguous from Intro (the same rule
   `outreach.discover_stages_and_variants` already enforces), so deleting
@@ -163,10 +168,6 @@ Remove buttons on the Email Accounts page instead:
   "set several secrets at once" endpoint. A very large upload (100+ rows)
   will take a little while; the mapping file itself is still committed
   once for the whole batch, not once per account.
-- **Note on Delete Campaign/Stage/Variant, above: these currently remove
-  files outright** — a temporary/recoverable "soft delete" for whole
-  campaigns (move to a "Deleted Campaigns" view, restorable later) is
-  planned but not built yet.
 
 - **Replying supports file/image attachments, up to 10 MB total.** Sent
   as regular email attachments, not inline/embedded HTML images — this
