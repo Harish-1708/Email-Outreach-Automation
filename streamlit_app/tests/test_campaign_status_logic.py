@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from campaign_status_logic import (
     compute_campaign_readiness, is_lead_finished, compute_campaign_is_complete,
     compute_campaign_status, status_label,
-    STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_COMPLETED, STATUS_ATTENTION,
+    STATUS_DRAFT, STATUS_RUNNING, STATUS_PAUSED, STATUS_COMPLETED, STATUS_ATTENTION, STATUS_DELETED,
 )
 
 STAGES = [
@@ -182,3 +182,25 @@ def test_status_label_known_values():
 
 def test_status_label_unknown_value_passthrough():
     assert status_label("something_else") == "something_else"
+
+
+# ---------- deleted (temporary removal) ----------
+
+def test_compute_campaign_status_deleted():
+    campaign_cfg = {"status": "deleted", "stages": [{"name": "Intro"}], "_global_default_account": "sales1"}
+    status, problems = compute_campaign_status(campaign_cfg, [])
+    assert status == STATUS_DELETED
+    assert problems == []
+
+
+def test_compute_campaign_status_deleted_takes_precedence_over_readiness_issues():
+    """A deleted campaign shouldn't show as 'Attention needed' just
+    because it also happens to be missing a sender — deleted is checked
+    first, unconditionally."""
+    campaign_cfg = {"status": "deleted"}  # no sender, no stages — would be Attention if not deleted
+    status, problems = compute_campaign_status(campaign_cfg, [])
+    assert status == STATUS_DELETED
+
+
+def test_status_label_deleted():
+    assert "Deleted" in status_label(STATUS_DELETED)
