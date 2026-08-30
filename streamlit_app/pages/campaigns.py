@@ -366,6 +366,18 @@ def _render_data_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
 
     with st.expander("➕ Add Leads (upload CSV)", expanded=not leads):
+        st.caption(
+            "Your CSV's column headers can be named anything — you'll map them to the right fields "
+            "after upload. A minimal example:"
+        )
+        st.code(
+            "FirstName,LastName,Email,Company\n"
+            "Rocky,D,rocky@example.com,Example Corp\n"
+            "Jane,Smith,jane@example.com,Acme Inc",
+            language="csv",
+        )
+        st.caption(f"Recognized fields: {', '.join(KNOWN_FIELDS)}. Only Email is required — any other "
+                   "column becomes a custom field on the lead (visible in the Master Sheet as extra columns).")
         uploaded = st.file_uploader("Upload CSV", type=["csv"], key="data_csv_upload")
         if uploaded is not None:
             columns, rows = parse_csv_bytes(uploaded.getvalue())
@@ -679,8 +691,6 @@ def _render_sequences_tab(campaign_cfg, leads):
         else:
             st.info(block_reason_s)
 
-    _render_maintenance_section_in_sequences(campaign_cfg)
-
 
 def _render_settings_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
@@ -762,6 +772,7 @@ def _render_settings_tab(campaign_cfg, leads):
             except GitHubActionsError as exc:
                 st.error(f"Save failed: {exc}")
 
+    _render_maintenance_section_in_settings(campaign_cfg)
     _render_send_section_in_settings(campaign_cfg, leads)
     _render_delete_campaign_section(campaign_cfg)
 
@@ -921,8 +932,8 @@ def _render_responses_tab(campaign_cfg, leads, responses):
                     else:
                         try:
                             attachments = build_attachment_entries(uploaded_files) if uploaded_files else None
-                            payload = build_reply_payload(response, lead, defaults["sender_account"], subject,
-                                                           body, cc, bcc, attachments=attachments)
+                            payload = build_reply_payload(response, lead, defaults["sender_account"], to_email,
+                                                           subject, body, cc, bcc, attachments=attachments)
                             path = reply_payload_path(campaign_name, response.get("ResponseID", "unknown"))
                             client = _get_github_client()
                             client.create_file(
@@ -1139,51 +1150,51 @@ def _render_check_replies_section_in_responses(campaign_cfg):
     st.divider()
 
 
-def _render_maintenance_section_in_sequences(campaign_cfg):
-    """Called from the END of _render_sequences_tab — ThreadSubject is a
-    template-threading concern, and this is a rare, likely one-time tool
-    (new sends populate ThreadSubject automatically; this only fixes
-    leads that were already mid-sequence before that existed)."""
+def _render_maintenance_section_in_settings(campaign_cfg):
+    """Called from _render_settings_tab — moved out of Sequences since it
+    was a template-editing tab and this isn't a template edit, it's a
+    rare, likely one-time repair tool (new sends populate ThreadSubject
+    automatically; this only fixes leads that were already mid-sequence
+    before that existed). Collapsed by default so it doesn't compete for
+    attention with everyday settings."""
     campaign_name = campaign_cfg["_campaign_name"]
-    st.divider()
-    st.subheader("🔧 Maintenance: Backfill ThreadSubject")
-    st.caption(
-        "For leads already mid-sequence before ThreadSubject existed. Never overwrites an "
-        "already-set ThreadSubject — safe to run more than once, it only fills gaps. New sends "
-        "populate this automatically — you likely only ever need this once, if at all."
-    )
-    dry_run = st.checkbox("Dry run (preview only, don't write anything)", value=True,
-                           key="campaigns_backfill_dry_run")
+    with st.expander("🔧 Maintenance: Backfill ThreadSubject"):
+        st.caption(
+            "For leads already mid-sequence before ThreadSubject existed. Never overwrites an "
+            "already-set ThreadSubject — safe to run more than once, it only fills gaps. New sends "
+            "populate this automatically — you likely only ever need this once, if at all."
+        )
+        dry_run = st.checkbox("Dry run (preview only, don't write anything)", value=True,
+                               key="campaigns_backfill_dry_run")
 
-    if st.button("Run Backfill", key="campaigns_run_backfill"):
-        try:
-            client = _get_github_client()
-            inputs = build_backfill_thread_subject_inputs(campaign_name, dry_run=dry_run)
-            run_details = client.dispatch_workflow(WORKFLOW_BACKFILL_THREAD_SUBJECT, inputs)
-            if run_details is None:
-                time.sleep(2)
-                run_details = client.find_recent_run(WORKFLOW_BACKFILL_THREAD_SUBJECT)
-            if run_details:
-                st.session_state["last_backfill_run_id"] = run_details.get("id") or run_details.get("run_id")
-                st.session_state["last_backfill_run_url"] = run_details.get("html_url", "")
-            st.success(f"Triggered backfill for '{campaign_name}'" + (" (dry run)" if dry_run else "") + ".")
-        except GitHubActionsError as exc:
-            st.error(f"Failed to trigger backfill: {exc}")
-
-    backfill_run_id = st.session_state.get("last_backfill_run_id")
-    if backfill_run_id:
-        st.write(f"**Last triggered run:** "
-                 f"[{backfill_run_id}]({st.session_state.get('last_backfill_run_url', '')})")
-        if st.button("🔄 Refresh run status", key="campaigns_backfill_refresh_status"):
+        if st.button("Run Backfill", key="campaigns_run_backfill"):
             try:
-                run = _get_github_client().get_run(backfill_run_id)
-                status = run.get("status", "unknown")
-                conclusion = run.get("conclusion")
-                st.success(f"Completed — conclusion: {conclusion}.") if status == "completed" \
-                    else st.info(f"Status: {status}")
+                client = _get_github_client()
+                inputs = build_backfill_thread_subject_inputs(campaign_name, dry_run=dry_run)
+                run_details = client.dispatch_workflow(WORKFLOW_BACKFILL_THREAD_SUBJECT, inputs)
+                if run_details is None:
+                    time.sleep(2)
+                    run_details = client.find_recent_run(WORKFLOW_BACKFILL_THREAD_SUBJECT)
+                if run_details:
+                    st.session_state["last_backfill_run_id"] = run_details.get("id") or run_details.get("run_id")
+                    st.session_state["last_backfill_run_url"] = run_details.get("html_url", "")
+                st.success(f"Triggered backfill for '{campaign_name}'" + (" (dry run)" if dry_run else "") + ".")
             except GitHubActionsError as exc:
-                st.error(f"Failed to fetch run status: {exc}")
+                st.error(f"Failed to trigger backfill: {exc}")
 
+        backfill_run_id = st.session_state.get("last_backfill_run_id")
+        if backfill_run_id:
+            st.write(f"**Last triggered run:** "
+                     f"[{backfill_run_id}]({st.session_state.get('last_backfill_run_url', '')})")
+            if st.button("🔄 Refresh run status", key="campaigns_backfill_refresh_status"):
+                try:
+                    run = _get_github_client().get_run(backfill_run_id)
+                    status = run.get("status", "unknown")
+                    conclusion = run.get("conclusion")
+                    st.success(f"Completed — conclusion: {conclusion}.") if status == "completed" \
+                        else st.info(f"Status: {status}")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to fetch run status: {exc}")
 
 
 def _render_campaign_detail(campaign_name: str, just_arrived: bool):
