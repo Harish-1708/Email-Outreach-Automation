@@ -2840,6 +2840,62 @@ def test_responses_hub_status_filter_narrows_to_selected_classification():
     assert "lead1@abc.com" not in markdown_text
 
 
+def test_responses_hub_shows_intent_badge_when_classified():
+    fake_ws = _responses_hub_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
+        {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
+         "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
+         "MessageID": "<m1@mail.gmail.com>", "ReceivedAt": "2026-08-29 10:00:00",
+         "ActionTaken": "Stopped Sequence", "Intent": "Interested", "IntentConfidence": "High"},
+    ])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    caption_texts = " ".join(c.value for c in at.caption)
+    assert "🎯 Interested" in caption_texts
+    assert "High confidence" in caption_texts
+
+
+def test_responses_hub_status_filter_narrows_by_intent():
+    fake_ws = _responses_hub_fake_ws()
+    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
+        {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
+         "Snippet": "Interested", "Classification": "Genuine Reply", "MessageID": "<m1@mail.gmail.com>",
+         "ReceivedAt": "2026-08-29 10:00:00", "ActionTaken": "Stopped Sequence",
+         "Intent": "Interested", "IntentConfidence": "High"},
+        {"ResponseID": "r2", "LeadID": "2", "From": "old@abc.com", "Subject": "Re: Hey",
+         "Snippet": "No thanks", "Classification": "Genuine Reply", "MessageID": "<m2@mail.gmail.com>",
+         "ReceivedAt": "2026-08-28 10:00:00", "ActionTaken": "Stopped Sequence",
+         "Intent": "Not Interested", "IntentConfidence": "High"},
+    ])
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        status_select = next(sb for sb in at.selectbox if sb.key == "responses_status_filter")
+        status_select.set_value("Interested")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "lead1@abc.com" in markdown_text
+    assert "old@abc.com" not in markdown_text
+
+
 def test_responses_hub_search_narrows_by_query():
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
