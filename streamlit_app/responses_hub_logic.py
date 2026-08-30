@@ -16,14 +16,38 @@ STATUS_FILTER_ALL = "All"
 INBOX_FILTER_ALL = "All"
 INBOX_FILTER_UNREAD = "Unread only"
 
+# Intent values (see outreach.INTENT_OPTIONS) come first — they're the
+# ones you'd actually filter by most often. The mechanical Classification
+# values stay available too, including "Genuine Reply" on its own, which
+# is genuinely useful as "replies not yet intent-classified" (blank
+# Intent) — e.g. ones logged before this feature was configured.
+INTENT_FILTER_VALUES = {"Interested", "Not Interested", "Lead / Needs Follow-up", "Unclear"}
+
 CLASSIFICATION_OPTIONS = [
     STATUS_FILTER_ALL,
+    "Interested",
+    "Not Interested",
+    "Lead / Needs Follow-up",
+    "Unclear",
     "Genuine Reply",
     "Auto-Reply",
     "Out of Office",
     "Bounce (Hard)",
     "Bounce (Soft)",
 ]
+
+
+def matches_status_filter(response: Dict, status_filter: str) -> bool:
+    """A single Status dropdown spans two SEPARATE underlying fields —
+    Intent (sales-intent, only ever set for a Genuine Reply) and
+    Classification (the mechanical category everything gets). Which
+    field a given filter value checks depends on which list it's from,
+    not on any naming coincidence between them."""
+    if status_filter == STATUS_FILTER_ALL:
+        return True
+    if status_filter in INTENT_FILTER_VALUES:
+        return response.get("Intent") == status_filter
+    return response.get("Classification") == status_filter
 
 
 def tag_responses_with_campaign(responses: List[Dict], campaign_name: str) -> List[Dict]:
@@ -79,14 +103,16 @@ def build_mark_read_payload(response_ids: List[str]) -> Dict:
 
 def filter_responses(responses: List[Dict], status_filter: str, campaign_filter: str,
                       inbox_filter: str, read_keys: Set[str]) -> List[Dict]:
-    """status_filter: one of CLASSIFICATION_OPTIONS ("All" = no filter).
+    """status_filter: one of CLASSIFICATION_OPTIONS ("All" = no filter) —
+    see matches_status_filter for how an Intent value vs. a Classification
+    value each get checked against the right underlying field.
     campaign_filter: a campaign name, or "All". inbox_filter:
     INBOX_FILTER_ALL or INBOX_FILTER_UNREAD. read_keys: session-local
     keys marked read but not yet synced to the Sheet — combined with
     each response's own persistent IsRead field via is_response_read."""
     result = responses
     if status_filter != STATUS_FILTER_ALL:
-        result = [r for r in result if r.get("Classification") == status_filter]
+        result = [r for r in result if matches_status_filter(r, status_filter)]
     if campaign_filter != STATUS_FILTER_ALL:
         result = [r for r in result if r.get("_campaign") == campaign_filter]
     if inbox_filter == INBOX_FILTER_UNREAD:
