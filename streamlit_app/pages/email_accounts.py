@@ -16,8 +16,8 @@ from accounts_logic import (  # noqa: E402
     aggregate_sent_today_by_account, build_account_rows, build_health_lookup, merge_account_directories,
 )
 from email_account_slots_logic import (  # noqa: E402
-    SLOT_MAPPING_PATH, parse_slot_mapping, serialize_slot_mapping, add_account_to_mapping,
-    remove_account_from_mapping, update_account_address_in_mapping,
+    SLOT_MAPPING_PATH, serialize_slot_mapping, add_account_to_mapping,
+    remove_account_from_mapping, update_account_address_in_mapping, read_local_slot_mapping,
 )
 
 if REPO_ROOT not in sys.path:
@@ -56,18 +56,7 @@ def _get_github_client() -> GitHubClient:
     return GitHubClient(token=gh["token"], owner=gh["owner"], repo=gh["repo"])
 
 
-def _read_local_slot_mapping():
-    """Local file read (the repo's own checkout), NOT a GitHub API call —
-    same pattern as reading templates/settings.yaml elsewhere in this app.
-    Safe to read directly since this file only ever contains names, slot
-    numbers, and addresses — never a password."""
-    if not os.path.exists(EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH):
-        return {}
-    with open(EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH, "r", encoding="utf-8") as f:
-        return parse_slot_mapping(f.read())
-
-
-slot_mapping = _read_local_slot_mapping()
+slot_mapping = read_local_slot_mapping(EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH)
 streamlit_secret_directory = dict(st.secrets.get("email_accounts_directory", {}))
 account_directory = merge_account_directories(streamlit_secret_directory, slot_mapping)
 
@@ -198,21 +187,12 @@ rows = build_account_rows(account_directory, sent_today_by_account, default_acco
 
 _STATUS_ICONS = {"Connected": "🟢", "Disconnected": "🔴", "Unknown": "⚪"}
 
-cols = st.columns(len(rows)) if rows else []
-for col, row in zip(cols, rows):
-    label = row["name"] + (" ⭐ default" if row["is_default"] else "")
-    icon = _STATUS_ICONS.get(row["status"], "⚪")
-    col.metric(label, f"{row['sent_today']} sent today")
-    col.caption(f"{row['address']}  ·  {icon} {row['status']}")
-    if row["status"] == "Disconnected" and row["status_detail"]:
-        col.caption(f"⚠️ {row['status_detail']}")
-
-st.divider()
 st.dataframe(
     {
-        "Account": [r["name"] for r in rows],
+        "Account": [r["name"] + (" ⭐" if r["is_default"] else "") for r in rows],
         "Address": [r["address"] for r in rows],
         "Status": [f"{_STATUS_ICONS.get(r['status'], '⚪')} {r['status']}" for r in rows],
+        "Detail": [r["status_detail"] if r["status"] == "Disconnected" else "" for r in rows],
         "Last Checked": [r["checked_at"] or "—" for r in rows],
         "Sent Today (all campaigns)": [r["sent_today"] for r in rows],
         "Default": ["Yes" if r["is_default"] else "" for r in rows],
