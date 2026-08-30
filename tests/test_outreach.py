@@ -2493,6 +2493,51 @@ def test_check_replies_genuine_reply_stops_sequence(monkeypatch):
     assert updated["LastActionAt"]
 
 
+def test_check_replies_logs_full_untruncated_body_alongside_snippet(monkeypatch):
+    """The real point of storing FullBody: a conversation view needs the
+    complete message, not the 500-char preview Snippet has always been."""
+    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+    long_body = "This is a much longer reply. " * 50  # well over 500 chars
+
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
+        return [{
+            "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
+            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
+            "headers": {}, "body": long_body, "snippet": long_body[:500],
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
+
+    assert len(fake_sheets.responses) == 1
+    logged = fake_sheets.responses[0]
+    assert logged["FullBody"] == long_body  # complete, not truncated
+    assert logged["Snippet"] == long_body[:500]  # unchanged, still a short preview
+    assert len(logged["FullBody"]) > len(logged["Snippet"])
+
+
+def test_check_replies_full_body_capped_at_sheets_cell_limit(monkeypatch):
+    """A single Google Sheets cell caps at 50,000 characters — an
+    unusually long email must be capped, not sent as a request Google
+    would reject outright."""
+    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+    huge_body = "x" * 100_000
+
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
+        return [{
+            "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
+            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
+            "headers": {}, "body": huge_body, "snippet": huge_body[:500],
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
+
+    assert len(fake_sheets.responses[0]["FullBody"]) <= 49000
+
+
 def test_check_replies_one_account_imap_failure_does_not_block_others(monkeypatch):
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
     fake_sheets = FakeSheets(leads)
@@ -2769,6 +2814,7 @@ class FakeWs:
     def __init__(self, header=None):
         self._header = header if header is not None else []
         self.appended_rows = []
+        self.updated_cells = []  # [(row, col, value), ...]
 
     def row_values(self, n):
         return self._header
@@ -2777,6 +2823,13 @@ class FakeWs:
         self.appended_rows.append(row)
         if not self._header:
             self._header = row
+
+    def update_cell(self, row, col, value):
+        self.updated_cells.append((row, col, value))
+        if row == 1:
+            while len(self._header) < col:
+                self._header.append("")
+            self._header[col - 1] = value
 
 
 class FakeSpreadsheet:
@@ -2801,6 +2854,45 @@ def test_get_or_create_ws_creates_new_tab_with_header():
     ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
     assert ws.appended_rows == [["A", "B"]]
     assert "MyTab" in spreadsheet.added
+
+
+def test_get_or_create_ws_auto_widens_header_when_new_required_column_added():
+    """The actual migration case: a tab created before some new required
+    column existed must get that column appended to its header, not
+    raise an error — existing rows keep their values in their existing
+    positions untouched, and only the header row changes."""
+    existing_ws = FakeWs(header=["A", "B"])
+    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
+    ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B", "C"])
+    assert ws.row_values(1) == ["A", "B", "C"]
+    assert existing_ws.updated_cells == [(1, 3, "C")]
+
+
+def test_get_or_create_ws_auto_widens_multiple_missing_columns():
+    existing_ws = FakeWs(header=["A"])
+    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
+    outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B", "C"])
+    assert existing_ws.row_values(1) == ["A", "B", "C"]
+    assert existing_ws.updated_cells == [(1, 2, "B"), (1, 3, "C")]
+
+
+def test_get_or_create_ws_auto_widen_never_touches_existing_column_names():
+    """The existing columns' actual names must be preserved exactly —
+    only cells STRICTLY AFTER the existing header length are written."""
+    existing_ws = FakeWs(header=["A", "B"])
+    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
+    outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B", "C"])
+    assert all(row != 1 or col > 2 for row, col, _ in existing_ws.updated_cells)
+
+
+def test_get_or_create_ws_still_raises_when_existing_header_is_not_a_valid_prefix():
+    """A genuinely WRONG header (existing columns don't match what's
+    required, not just shorter) must still raise — auto-widening only
+    ever applies when the existing header is an exact prefix."""
+    existing_ws = FakeWs(header=["A", "WRONG"])
+    spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
+    with pytest.raises(RuntimeError, match="does not start with the expected columns"):
+        outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B", "C"])
 
 
 def test_get_or_create_ws_accepts_extra_trailing_custom_columns():
