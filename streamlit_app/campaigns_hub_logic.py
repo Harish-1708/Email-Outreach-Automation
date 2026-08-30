@@ -35,6 +35,19 @@ def build_draft_campaign_row(campaign_cfg: Dict) -> Dict:
     }
 
 
+def build_deleted_campaign_row(campaign_cfg: Dict) -> Dict:
+    """Same lightweight shape as a Draft row (no Sheet fetch needed) — a
+    temporarily-removed campaign's history stays in the Sheet untouched,
+    but the Deleted Campaigns list itself only needs to show what it is
+    and let you Restore it, not a full analytics recompute."""
+    return {
+        "name": campaign_cfg["_campaign_name"], "status": "deleted",
+        "status_label": status_label("deleted"), "problems": [],
+        "total_leads": 0, "sent": 0, "replies": 0, "reply_rate": "—",
+        "last_activity": "",
+    }
+
+
 def build_campaign_hub_row(campaign_cfg: Dict, leads: List[Dict], responses: List[Dict],
                             send_log: List[Dict]) -> Dict:
     stages = campaign_cfg["stages"]
@@ -54,17 +67,22 @@ def build_campaigns_hub(
     campaign_names: List[str],
     get_campaign_cfg: Callable[[str], Dict],
     fetch_sheet_data: Callable[[Dict], Tuple[List[Dict], List[Dict], List[Dict]]],
-) -> Tuple[List[Dict], List[Tuple[str, str]]]:
+) -> Tuple[List[Dict], List[Dict], List[Tuple[str, str]]]:
     """get_campaign_cfg(name) -> campaign_cfg (local, no network — never
     fails for a missing Sheet tab, only a missing templates folder).
     fetch_sheet_data(campaign_cfg) -> (leads, responses, send_log),
-    called ONLY for non-draft campaigns, since a Draft's status never
-    needs Sheet data. Returns (rows, errors) — errors is
-    [(campaign_name, message)] for a non-draft campaign whose Sheet data
-    couldn't be read (e.g. a race right after creation, before its tabs
-    exist yet); those are skipped from rows rather than failing the page.
+    called ONLY for non-draft, non-deleted campaigns, since neither needs
+    Sheet data to show its status. Returns (rows, deleted_rows, errors):
+    rows is the normal, everyday campaign list (deleted campaigns are
+    deliberately never in here — that's the whole point of a temporary
+    removal actually hiding them); deleted_rows is separate, for the
+    Deleted Campaigns view; errors is [(campaign_name, message)] for a
+    non-draft, non-deleted campaign whose Sheet data couldn't be read
+    (e.g. a race right after creation, before its tabs exist yet) — those
+    are skipped from rows rather than failing the page.
     """
     rows: List[Dict] = []
+    deleted_rows: List[Dict] = []
     errors: List[Tuple[str, str]] = []
     for name in campaign_names:
         try:
@@ -73,7 +91,11 @@ def build_campaigns_hub(
             errors.append((name, str(exc)))
             continue
 
-        if (campaign_cfg.get("status") or "active") == "draft":
+        raw_status = campaign_cfg.get("status") or "active"
+        if raw_status == "deleted":
+            deleted_rows.append(build_deleted_campaign_row(campaign_cfg))
+            continue
+        if raw_status == "draft":
             rows.append(build_draft_campaign_row(campaign_cfg))
             continue
 
@@ -83,7 +105,7 @@ def build_campaigns_hub(
             errors.append((name, str(exc)))
             continue
         rows.append(build_campaign_hub_row(campaign_cfg, leads, responses, send_log))
-    return rows, errors
+    return rows, deleted_rows, errors
 
 
 def filter_campaigns_by_search(rows: List[Dict], query: str) -> List[Dict]:
