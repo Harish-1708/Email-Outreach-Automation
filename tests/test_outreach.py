@@ -2224,6 +2224,21 @@ def test_send_batch_raises_for_draft_status_before_touching_anything(monkeypatch
     assert smtp_called == []
 
 
+def test_send_batch_raises_for_deleted_status_before_touching_anything(monkeypatch):
+    smtp_called = []
+    monkeypatch.setattr(outreach, "smtp_send", lambda *a, **kw: smtp_called.append(1) or {"message_id": "<m>"})
+
+    campaign_cfg = _base_campaign_cfg()
+    campaign_cfg["status"] = "deleted"
+    lead = make_lead(_row=2, LeadID="L1", Email="a@abc.com")
+    fake_sheets = FakeSheets([lead])
+
+    with pytest.raises(outreach.CampaignPausedError, match="deleted"):
+        outreach.send_batch(campaign_cfg, fake_sheets, ACCOUNTS, "intro", 10)
+
+    assert smtp_called == []
+
+
 def test_build_batch_ignores_draft_status_preview_still_works(monkeypatch):
     # Preview/build_batch must stay usable for a Draft campaign too —
     # only send_batch is gated, same principle as Paused.
