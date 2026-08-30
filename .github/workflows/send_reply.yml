@@ -30,6 +30,14 @@ on:
 jobs:
   send-reply:
     runs-on: ubuntu-latest
+    # Explicit, least-privilege grant for this one workflow — needed to
+    # push the "remove the processed payload" commit below. Without this,
+    # the run inherits whatever the repo's default GITHUB_TOKEN
+    # permission is; if that's read-only (a common, safer org default),
+    # the push fails with a 403 even though the actual send already
+    # succeeded — exactly the confusing failure this fixes.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -65,7 +73,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          rm -f "${{ github.event.inputs.payload_path }}"
-          git add -A
-          git commit -m "Remove processed reply payload: ${{ github.event.inputs.payload_path }}" || echo "Nothing to commit"
-          git push
+          PAYLOAD_PATH="${{ github.event.inputs.payload_path }}"
+          if [ -f "$PAYLOAD_PATH" ]; then
+            git rm -f "$PAYLOAD_PATH"
+            git commit -m "Remove processed reply payload: $PAYLOAD_PATH"
+            git push
+          else
+            echo "Payload file already gone — nothing to clean up."
+          fi
