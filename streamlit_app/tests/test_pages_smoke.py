@@ -576,6 +576,135 @@ def test_add_account_happy_path_writes_secret_and_mapping_and_triggers_health_ch
     assert written_mapping == {"sales1": {"slot": 1, "address": "sales1@gmail.com"}}
 
 
+def test_add_account_custom_provider_fields_reach_the_secret(tmp_path):
+    (tmp_path / "config").mkdir()
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", lambda self, w, i: None):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        add_button = next(b for b in at.button if b.label == "➕ Add Account")
+        add_button.click()
+        at.run()
+
+        provider_radio = next(r for r in at.radio if r.key == "add_account_provider")
+        provider_radio.set_value("Custom (Hostinger, etc.)")
+        at.run()
+
+        next(ti for ti in at.text_input if ti.key == "add_account_name").set_value("hostinger1")
+        next(ti for ti in at.text_input if ti.key == "add_account_address").set_value("sales@example.com")
+        next(ti for ti in at.text_input if ti.key == "add_account_password").set_value("smtp-pass-here")
+        next(ti for ti in at.text_input if ti.key == "add_account_smtp_host").set_value("smtp.hostinger.com")
+        next(ti for ti in at.text_input if ti.key == "add_account_smtp_port").set_value("465")
+        next(ti for ti in at.text_input if ti.key == "add_account_imap_host").set_value("imap.hostinger.com")
+        next(ti for ti in at.text_input if ti.key == "add_account_imap_port").set_value("993")
+        next(cb for cb in at.checkbox if cb.key == "add_account_confirm").set_value(True)
+        at.run()
+
+        submit_button = next(b for b in at.button if b.label == "Add Account")
+        submit_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Add Account (custom provider) raised: {list(at.exception)}"
+    assert list(at.error) == []
+    payload = json.loads(captured["set_secret_calls"][0]["value"])
+    assert payload["smtp_host"] == "smtp.hostinger.com"
+    assert payload["smtp_port"] == 465
+    assert payload["imap_host"] == "imap.hostinger.com"
+    assert payload["imap_port"] == 993
+
+
+def test_bulk_add_accounts_csv_adds_every_valid_row(tmp_path):
+    (tmp_path / "config").mkdir()
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    csv_content = (
+        "Name,Email,Password\n"
+        "sales1,sales1@gmail.com,pass1\n"
+        "sales2,sales2@gmail.com,pass2\n"
+        "sales3,sales3@gmail.com,pass3\n"
+    ).encode("utf-8")
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", lambda self, w, i: None):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        uploader = next(fu for fu in at.file_uploader if fu.key == "bulk_accounts_csv_upload")
+        uploader.upload("accounts.csv", csv_content, "text/csv")
+        at.run()
+
+        assert list(at.exception) == []
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_bulk_add_accounts")
+        confirm_checkbox.set_value(True)
+        at.run()
+
+        add_all_button = next(b for b in at.button if b.key == "bulk_add_accounts_button")
+        add_all_button.click()
+        at.run()
+
+    assert list(at.exception) == [], f"Bulk add raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert len(captured["set_secret_calls"]) == 3
+    assert {c["name"] for c in captured["set_secret_calls"]} == {
+        "EMAIL_ACCOUNT_SLOT_1", "EMAIL_ACCOUNT_SLOT_2", "EMAIL_ACCOUNT_SLOT_3",
+    }
+    # exactly ONE mapping-file commit for the whole batch, not one per account
+    mapping_commits = [c for c in commits_captured["commits"] if c["path"] == "config/email_account_slots.yaml"]
+    assert len(mapping_commits) == 1
+
+    import yaml as _yaml
+    written_mapping = _yaml.safe_load(mapping_commits[0]["content"].decode("utf-8"))
+    assert set(written_mapping.keys()) == {"sales1", "sales2", "sales3"}
+
+
+def test_bulk_add_accounts_csv_reports_invalid_rows_without_blocking_valid_ones(tmp_path):
+    (tmp_path / "config").mkdir()
+    captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    csv_content = (
+        "Name,Email,Password\n"
+        "sales1,sales1@gmail.com,pass1\n"
+        "bad_row,,pass2\n"
+    ).encode("utf-8")
+
+    with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
+         patch("github_client.GitHubClient.set_secret", fake_set_secret), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", lambda self, w, i: None):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run()
+
+        uploader = next(fu for fu in at.file_uploader if fu.key == "bulk_accounts_csv_upload")
+        uploader.upload("accounts.csv", csv_content, "text/csv")
+        at.run()
+
+    assert list(at.exception) == []
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "Row 2" in warning_texts
+    assert "Email is required" in warning_texts
+    success_texts = " ".join(s.value for s in at.success)
+    assert "1 account(s) ready" in success_texts
+
+
 def test_add_account_rejects_blank_fields_without_writing_anything(tmp_path):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
@@ -648,9 +777,9 @@ def test_manage_section_shows_only_accounts_tracked_in_slot_mapping(tmp_path):
         at.run()
 
     assert list(at.exception) == []
-    expander_labels = [e.label for e in at.expander]
-    assert any("sales1" in label for label in expander_labels)
-    assert not any("legacy_only" in label for label in expander_labels)  # not manageable via this app
+    manage_selector = next(sb for sb in at.selectbox if sb.key == "manage_account_select")
+    assert "sales1" in manage_selector.options
+    assert "legacy_only" not in manage_selector.options  # not manageable via this app
 
 
 def test_manage_section_edit_address_commits_updated_mapping_no_secret_write(tmp_path):
