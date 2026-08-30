@@ -267,7 +267,7 @@ def _render_hub(just_arrived: bool):
             _new_campaign_dialog(existing_campaigns)
 
     try:
-        rows, errors = _load_hub_rows()
+        rows, deleted_rows, errors = _load_hub_rows()
     except Exception as exc:  # noqa: BLE001
         st.error(f"Couldn't load campaigns: {exc}")
         st.stop()
@@ -296,6 +296,20 @@ def _render_hub(just_arrived: bool):
         with st.expander(f"{len(errors)} campaign(s) couldn't be loaded"):
             for name, message in errors:
                 st.write(f"**{name}** — {message}")
+
+    if deleted_rows:
+        with st.expander(f"🗑️ Deleted Campaigns ({len(deleted_rows)})"):
+            st.caption(
+                "Temporarily removed — hidden from the list above, but nothing about them was deleted. "
+                "Restore brings a campaign back as a Draft."
+            )
+            for row in deleted_rows:
+                col1, col2 = st.columns([4, 1])
+                col1.write(f"**{row['name']}**")
+                if col2.button("↩️ Restore", key=f"restore_{row['name']}"):
+                    if _update_campaign_status(row["name"], "draft"):
+                        st.success(f"'{row['name']}' restored as a Draft.")
+                        st.rerun()
 
 
 # =============================================================================
@@ -778,25 +792,48 @@ def _render_settings_tab(campaign_cfg, leads):
 
 
 def _render_delete_campaign_section(campaign_cfg):
-    """Danger Zone — always last in Settings. Removes the campaign's
-    templates (and its settings override, if any) from the repo, so
-    outreach.py's own auto-discovery no longer recognizes it as a
-    campaign. Deliberately does NOT touch the Google Sheet — leads,
-    sends, and replies stay fully intact and readable directly there,
-    same soft-removal spirit as remove_leads never hard-deleting a lead
-    row. See campaign_builder.list_campaign_files_to_delete's docstring."""
+    """Danger Zone — always last in Settings. Two distinct actions:
+
+    Temporarily Remove: just flips campaign_cfg["status"] to "deleted" —
+    a one-line config change, nothing about the campaign is touched.
+    It disappears from the everyday Campaigns list and shows up instead
+    in the Deleted Campaigns view (Hub page), with a Restore button.
+
+    Permanently Delete: removes the campaign's templates (and its
+    settings override, if any) from the repo, so outreach.py's own
+    auto-discovery no longer recognizes it as a campaign at all — not
+    reversible from this app. Neither option ever touches the Google
+    Sheet — leads, sends, and replies stay fully intact and readable
+    directly there either way, same soft-removal spirit as remove_leads
+    never hard-deleting a lead row. See
+    campaign_builder.list_campaign_files_to_delete's docstring."""
     campaign_name = campaign_cfg["_campaign_name"]
     st.divider()
-    with st.expander("🗑️ Danger Zone: Delete this campaign"):
+    with st.expander("🗑️ Danger Zone"):
+        st.subheader("Temporarily Remove")
+        st.caption(
+            "Hides this campaign from the everyday Campaigns list — nothing is deleted. Find it again "
+            "any time in Deleted Campaigns (on the Campaigns Hub page) and Restore it as a Draft."
+        )
+        if st.button("Temporarily Remove Campaign", key="temp_remove_campaign_button"):
+            if _update_campaign_status(campaign_name, "deleted"):
+                st.success(f"'{campaign_name}' temporarily removed. Find it in Deleted Campaigns on the "
+                           "Campaigns Hub page to restore it later.")
+                st.session_state["selected_campaign"] = None
+                st.rerun()
+
+        st.divider()
+        st.subheader("Permanently Delete")
         st.warning(
-            "This removes the campaign's templates — it will no longer appear in the Campaigns list. "
-            "Your Sheet data (leads, sends, replies) is NOT deleted and stays fully accessible directly "
-            "in the Sheet."
+            "This removes the campaign's templates — it will no longer appear anywhere, including "
+            "Deleted Campaigns, and this can't be undone from this app. Your Sheet data (leads, sends, "
+            "replies) is NOT deleted and stays fully accessible directly in the Sheet."
         )
         typed_name = st.text_input(f'Type the campaign name ("{campaign_name}") to confirm',
                                     key="delete_campaign_confirm_text")
         confirmed = confirmation_matches_campaign_name(typed_name, campaign_name)
-        if st.button("Delete Campaign", type="primary", disabled=not confirmed, key="delete_campaign_button"):
+        if st.button("Permanently Delete Campaign", type="primary", disabled=not confirmed,
+                     key="delete_campaign_button"):
             try:
                 paths = list_campaign_files_to_delete(campaign_name, TEMPLATES_ROOT, CAMPAIGNS_DIR)
                 client = _get_github_client()
