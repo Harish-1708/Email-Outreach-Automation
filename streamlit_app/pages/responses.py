@@ -15,12 +15,13 @@ from send_logic import build_check_replies_inputs  # noqa: E402
 from responses_hub_logic import (  # noqa: E402
     tag_responses_with_campaign, response_key, filter_responses, count_unread,
     sort_responses_newest_first, get_campaign_names_present, CLASSIFICATION_OPTIONS,
-    STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD,
+    STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD, search_responses,
 )
 from responses_reply_logic import (  # noqa: E402
     find_lead_for_response, build_reply_defaults, parse_email_list, validate_reply,
     build_reply_payload, reply_payload_path, build_attachment_entries, total_attachment_size_bytes,
 )
+from conversation_logic import build_conversation_thread, filter_responses_for_lead  # noqa: E402
 from data_import_logic import payload_to_bytes  # noqa: E402
 
 if REPO_ROOT not in sys.path:
@@ -109,6 +110,9 @@ read_keys = st.session_state["read_response_keys"]
 # make silently here.
 unread_count = count_unread(all_responses, read_keys)
 
+search_query = st.text_input("🔍 Search responses (sender, subject, snippet, campaign)",
+                              key="responses_search_query")
+
 col1, col2, col3 = st.columns(3)
 with col1:
     status_filter = st.selectbox("Status", CLASSIFICATION_OPTIONS, key="responses_status_filter")
@@ -125,7 +129,8 @@ if unavailable_campaigns:
     st.caption(f"{len(unavailable_campaigns)} campaign(s) not counted yet (no Response Sheet tab exists — "
                f"no replies for them yet): {', '.join(unavailable_campaigns)}")
 
-filtered = filter_responses(all_responses, status_filter, campaign_filter, inbox_filter, read_keys)
+filtered = search_responses(all_responses, search_query)
+filtered = filter_responses(filtered, status_filter, campaign_filter, inbox_filter, read_keys)
 filtered = sort_responses_newest_first(filtered)
 
 if not filtered:
@@ -149,6 +154,24 @@ else:
             with col_b:
                 st.caption(response.get("ActionTaken", ""))
             st.write(response.get("Snippet", ""))
+
+            with st.expander("💬 View full conversation"):
+                if lead is None:
+                    st.caption("Can't reconstruct this conversation — no matching lead found in the "
+                               "Master Sheet (the response may predate the lead being added).")
+                else:
+                    responses_for_this_lead = filter_responses_for_lead(all_responses, lead.get("LeadID", ""))
+                    campaign_cfg_for_thread = get_campaign_cfg(campaign_name)
+                    thread = build_conversation_thread(campaign_cfg_for_thread, lead, responses_for_this_lead)
+                    if not thread:
+                        st.caption("No messages found for this lead yet.")
+                    for msg in thread:
+                        if msg["direction"] == "outgoing":
+                            st.markdown(f"**You** · {msg['timestamp']}")
+                        else:
+                            st.markdown(f"**{msg.get('from', 'Them')}** · {msg['timestamp']}")
+                        st.text(msg["body"])
+                        st.divider()
 
             with st.expander("↩️ Reply"):
                 read_keys.add(key)  # opening the reply form counts as having read it
