@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from responses_hub_logic import (
     tag_responses_with_campaign, response_key, filter_responses, count_unread,
     sort_responses_newest_first, get_campaign_names_present, build_reply_summary_label,
-    find_response_by_key, STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD,
+    find_response_by_key, STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD, search_responses,
 )
 
 
@@ -195,3 +195,58 @@ def test_find_response_by_key_not_found_returns_none():
 
 def test_find_response_by_key_empty_list():
     assert find_response_by_key([], "Foo:r1") is None
+
+
+# ---------- search_responses ----------
+
+def test_search_responses_matches_sender():
+    responses = [_response(From="rocky@abc.com"), _response(From="jane@xyz.com")]
+    result = search_responses(responses, "rocky")
+    assert len(result) == 1
+    assert result[0]["From"] == "rocky@abc.com"
+
+
+def test_search_responses_matches_subject():
+    responses = [_response(Subject="Re: pricing question"), _response(Subject="Re: unrelated")]
+    result = search_responses(responses, "pricing")
+    assert len(result) == 1
+
+
+def test_search_responses_matches_snippet():
+    responses = [_response(ResponseID="r1", Snippet="Let's discuss DudeRobe partnership"),
+                 _response(ResponseID="r2", Snippet="Not interested")]
+    result = search_responses(responses, "duderobe")
+    assert len(result) == 1
+    assert result[0]["ResponseID"] == "r1"
+
+
+def test_search_responses_matches_campaign():
+    responses = [_response(ResponseID="r1", _campaign="DudeRobe_Q3"), _response(ResponseID="r2", _campaign="Other")]
+    result = search_responses(responses, "duderobe")
+    assert len(result) == 1
+    assert result[0]["ResponseID"] == "r1"
+
+
+def test_search_responses_case_insensitive():
+    responses = [_response(From="Rocky@ABC.com")]
+    assert len(search_responses(responses, "rocky")) == 1
+    assert len(search_responses(responses, "ROCKY")) == 1
+
+
+def test_search_responses_blank_query_returns_everything():
+    responses = [_response(ResponseID="r1"), _response(ResponseID="r2")]
+    assert search_responses(responses, "") == responses
+    assert search_responses(responses, "   ") == responses
+
+
+def test_search_responses_no_match_returns_empty():
+    responses = [_response(From="rocky@abc.com")]
+    assert search_responses(responses, "nonexistent_term") == []
+
+
+def test_search_responses_empty_list():
+    assert search_responses([], "anything") == []
+
+
+def test_search_responses_handles_missing_fields_gracefully():
+    assert search_responses([{}], "anything") == []
