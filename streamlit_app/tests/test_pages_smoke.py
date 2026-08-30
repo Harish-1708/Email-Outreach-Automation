@@ -1709,6 +1709,40 @@ def test_delete_campaign_deletes_every_template_file(tmp_path):
     assert all(p.startswith("templates/Kelson_Creators_Licensing/") for p in deleted_paths)
 
 
+def test_temporarily_remove_campaign_sets_deleted_status_without_deleting_files():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+    deleted_paths = []
+
+    def fake_delete_file(self, path, message, branch="main"):
+        deleted_paths.append(path)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        temp_remove_button = next(b for b in at.button if b.key == "temp_remove_campaign_button")
+        temp_remove_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Temporary remove raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert deleted_paths == []  # no template files touched — this is a config-only change
+
+    import yaml as _yaml
+    override_commit = next(c for c in commits_captured["commits"] if c["path"].endswith(".yaml"))
+    written = _yaml.safe_load(override_commit["content"].decode("utf-8"))
+    assert written["status"] == "deleted"
+    assert at.session_state["selected_campaign"] is None  # navigates back to the hub
+
+
 def test_delete_variant_allowed_when_multiple_variants_exist():
     """This fixture campaign has all 4 variants (A–D) on disk — deleting
     any one of them must be allowed, since more than one remains after."""
