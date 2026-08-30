@@ -27,6 +27,14 @@ directly — no GitHub trip, no pull request to approve.
   template preview already lives inline in Sequences, so there's no
   separate Preview tab. A fuller quoted-thread view and scheduling a
   reply for later are deliberately not built yet — see below.
+- **💬 Responses** — every reply across every campaign in one place, not
+  scoped to one campaign like the tab above. Filter by status (the
+  system's own mechanical classifications — Genuine Reply, Auto-Reply,
+  Out of Office, Bounce Hard/Soft — not Instantly-style sentiment
+  "Interested/Not Interested," which this doesn't do; see Known
+  limitations), by campaign, or to unread only. Reply directly from
+  here too, exactly the same tools as the per-campaign tab. Unread
+  tracking is session-only right now — see Known limitations.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -135,6 +143,25 @@ Remove buttons on the Email Accounts page instead:
    nothing breaks either way in the meantime.
 
 ## Known limitations (by design, not bugs)
+
+- **No sentiment classification (Interested / Not Interested / Lead).**
+  The system classifies mechanically (Genuine Reply, Auto-Reply, Out of
+  Office, Bounce) — it doesn't judge what a reply actually says. Adding
+  that would need a deliberate design decision (a rules engine or an
+  LLM call), not a keyword guess that could misclassify a real prospect.
+- **Unread tracking on the Responses page resets each browser session.**
+  It lives in `st.session_state`, not the Sheet — Streamlit only ever
+  reads the Response Sheet today, and persisting read/unread state across
+  sessions would mean giving it a write path there, which is a real
+  permission decision, not something to add silently.
+- **This app never connects to SMTP/IMAP directly** — only GitHub
+  Actions does, using a credential Streamlit never holds. Real email
+  credentials living inside a public-facing web app would be a
+  meaningfully bigger risk than anything else here. "Check Replies Now"
+  (per-campaign or all-at-once on the Responses page) gives you an
+  on-demand check without waiting for the schedule; shortening
+  `check_replies.yml`'s cron interval is the safe way to reduce that
+  wait generally, if 30 minutes is too slow for your use case.
 
 - **Deleting a campaign has two tiers.** "Temporarily Remove" (Settings →
   Danger Zone) just changes its status — the campaign disappears from
