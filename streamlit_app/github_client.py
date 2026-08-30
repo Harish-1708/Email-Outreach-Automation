@@ -116,6 +116,21 @@ class GitHubClient:
         if resp.status_code not in (200, 201):
             raise GitHubActionsError(f"Failed to create/update file '{path}': {resp.status_code} {resp.text[:300]}")
 
+    def delete_file(self, path: str, message: str, branch: str = "main") -> None:
+        """Deletes a file at `path`. GitHub's contents API requires the
+        current SHA to delete, same as create_file requires for an
+        update — fetched fresh here. If the file is already gone, this is
+        a no-op, not an error — the caller's goal ('this file shouldn't
+        exist') is already satisfied, same philosophy as delete_secret."""
+        existing_sha = self.get_file_sha(path, ref=branch)
+        if existing_sha is None:
+            return
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/contents/{path}"
+        payload = {"message": message, "sha": existing_sha, "branch": branch}
+        resp = requests.delete(url, json=payload, headers=self._headers, timeout=self.timeout)
+        if resp.status_code not in (200, 204):
+            raise GitHubActionsError(f"Failed to delete file '{path}': {resp.status_code} {resp.text[:300]}")
+
     def commit_campaign_files_directly(self, files: List[Dict[str, bytes]], commit_message: str,
                                         base: str = "main") -> None:
         """files: [{'path': 'templates/Foo/intro_A.txt', 'content': b'...'}].
