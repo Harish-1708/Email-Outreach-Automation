@@ -16,7 +16,7 @@ transition (same merge pattern as outreach.load_email_accounts).
 """
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -107,3 +107,85 @@ def read_local_slot_mapping(abs_path: str) -> Dict[str, Dict]:
         return {}
     with open(abs_path, "r", encoding="utf-8") as f:
         return parse_slot_mapping(f.read())
+
+
+def build_account_secret_payload(name: str, address: str, password: str,
+                                  imap_password: Optional[str] = None,
+                                  smtp_host: Optional[str] = None, smtp_port: Optional[str] = None,
+                                  smtp_username: Optional[str] = None,
+                                  imap_host: Optional[str] = None, imap_port: Optional[str] = None,
+                                  imap_username: Optional[str] = None) -> str:
+    """Builds the JSON string for one EMAIL_ACCOUNT_SLOT_N secret. Only
+    includes an optional field when it's actually set — a plain Gmail
+    account's secret stays exactly {"name", "address", "app_password"},
+    the format that's always worked, rather than padding every account
+    with empty custom-provider fields it doesn't need. A third-party
+    provider (Hostinger, etc.) can set some or all of the rest —
+    smtp_connection_settings/imap_connection_settings fall back to
+    Gmail's own host/port and the account's address for anything left
+    unset here."""
+    import json
+    payload: Dict = {"name": name, "address": address, "app_password": password}
+    if imap_password:
+        payload["imap_password"] = imap_password
+    if smtp_host:
+        payload["smtp_host"] = smtp_host
+    if smtp_port:
+        payload["smtp_port"] = int(smtp_port)
+    if smtp_username:
+        payload["smtp_username"] = smtp_username
+    if imap_host:
+        payload["imap_host"] = imap_host
+    if imap_port:
+        payload["imap_port"] = int(imap_port)
+    if imap_username:
+        payload["imap_username"] = imap_username
+    return json.dumps(payload)
+
+
+BULK_ACCOUNT_CSV_COLUMNS = [
+    "Name", "Email", "Password", "IMAP Password", "SMTP Host", "SMTP Port", "SMTP Username",
+    "IMAP Host", "IMAP Port", "IMAP Username",
+]
+
+
+def parse_bulk_accounts_csv(columns: List[str], rows: List[Dict[str, str]]) -> Tuple[List[Dict], List[str]]:
+    """One universal CSV format covers both a plain Gmail account (only
+    Name/Email/Password filled in — every other column blank) and a
+    custom-provider account (Hostinger, etc. — the rest filled in too).
+    Returns (parsed_rows, errors); parsed_rows is a list of dicts with
+    keys matching build_account_secret_payload's parameters, one per
+    valid row, in order. errors names which row (1-indexed, matching
+    what a spreadsheet shows, header excluded) couldn't be parsed and
+    why — a bad row is skipped, not a reason to abandon every other
+    valid row in the same file."""
+    required = {"Email", "Password"}
+    missing_columns = required - set(columns)
+    if missing_columns:
+        return [], [f"CSV is missing required column(s): {', '.join(sorted(missing_columns))}"]
+
+    parsed = []
+    errors = []
+    for i, row in enumerate(rows, start=1):
+        email_addr = (row.get("Email") or "").strip()
+        password = (row.get("Password") or "").strip()
+        if not email_addr:
+            errors.append(f"Row {i}: Email is required.")
+            continue
+        if not password:
+            errors.append(f"Row {i}: Password is required.")
+            continue
+        name = (row.get("Name") or "").strip() or email_addr.split("@")[0]
+        parsed.append({
+            "name": name,
+            "address": email_addr,
+            "password": password,
+            "imap_password": (row.get("IMAP Password") or "").strip() or None,
+            "smtp_host": (row.get("SMTP Host") or "").strip() or None,
+            "smtp_port": (row.get("SMTP Port") or "").strip() or None,
+            "smtp_username": (row.get("SMTP Username") or "").strip() or None,
+            "imap_host": (row.get("IMAP Host") or "").strip() or None,
+            "imap_port": (row.get("IMAP Port") or "").strip() or None,
+            "imap_username": (row.get("IMAP Username") or "").strip() or None,
+        })
+    return parsed, errors
