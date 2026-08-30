@@ -23,6 +23,7 @@ STATUS_RUNNING = "running"
 STATUS_PAUSED = "paused"
 STATUS_COMPLETED = "completed"
 STATUS_ATTENTION = "attention"
+STATUS_DELETED = "deleted"
 
 STATUS_LABELS = {
     STATUS_DRAFT: "📝 Draft",
@@ -30,6 +31,7 @@ STATUS_LABELS = {
     STATUS_PAUSED: "⏸ Paused",
     STATUS_COMPLETED: "✅ Completed",
     STATUS_ATTENTION: "⚠️ Attention needed",
+    STATUS_DELETED: "🗑️ Deleted (temporarily removed)",
 }
 
 
@@ -93,6 +95,8 @@ def compute_campaign_status(campaign_cfg: Dict, leads: List[Dict]) -> Tuple[str,
     "attention"."""
     raw_status = campaign_cfg.get("status") or "active"
 
+    if raw_status == "deleted":
+        return STATUS_DELETED, []
     if raw_status == "draft":
         return STATUS_DRAFT, []
     if raw_status == "paused":
