@@ -26,3 +26,30 @@ def build_status_override(raw_override: Dict, new_status: str) -> Dict:
     updated = dict(raw_override)
     updated["status"] = new_status
     return updated
+
+
+def build_delete_override(raw_override: Dict, current_status: str) -> Dict:
+    """Temporarily Remove — sets status to 'deleted', but first remembers
+    the EXACT status it's replacing (draft/active/paused) as
+    previous_status, so Restore can put the campaign back exactly how it
+    was — not just default to Draft regardless of whether it was
+    actually Running or Paused beforehand. Everything else in the
+    override (sending, schedule, ...) passes through untouched, same as
+    build_status_override."""
+    updated = dict(raw_override)
+    updated["status"] = "deleted"
+    updated["previous_status"] = current_status
+    return updated
+
+
+def build_restore_override(raw_override: Dict) -> Dict:
+    """Restore — sets status back to whatever build_delete_override
+    recorded as previous_status, then removes that now-stale key so it
+    doesn't linger in the file. Falls back to 'active' if previous_status
+    is somehow missing (e.g. the override file was hand-edited) rather
+    than raising — a missing value here shouldn't block someone from
+    getting their campaign back."""
+    updated = dict(raw_override)
+    updated["status"] = raw_override.get("previous_status") or "active"
+    updated.pop("previous_status", None)
+    return updated
