@@ -22,6 +22,7 @@ WORKFLOW_BACKFILL_THREAD_SUBJECT = "backfill_thread_subject.yml"
 WORKFLOW_IMPORT_LEADS = "import_leads.yml"
 WORKFLOW_REMOVE_LEADS = "remove_leads.yml"
 WORKFLOW_SEND_REPLY = "send_reply.yml"
+WORKFLOW_MARK_RESPONSES_READ = "mark_responses_read.yml"
 WORKFLOW_CHECK_ACCOUNT_HEALTH = "check_account_health.yml"
 
 EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH = os.path.join(REPO_ROOT, "config", "email_account_slots.yaml")
