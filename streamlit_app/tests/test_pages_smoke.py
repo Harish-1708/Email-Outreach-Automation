@@ -1508,6 +1508,183 @@ def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too():
     assert set(account_selector.options) == {"sales1", "sales2"}  # both sources present
 
 
+def test_delete_campaign_requires_typed_name_confirmation():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    delete_button = next(b for b in at.button if b.key == "delete_campaign_button")
+    assert delete_button.disabled is True  # nothing typed yet
+
+
+def test_delete_campaign_enables_button_only_on_exact_name_match():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
+        confirm_input.set_value("wrong name")
+        at.run(timeout=15)
+        assert next(b for b in at.button if b.key == "delete_campaign_button").disabled is True
+
+        confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
+        confirm_input.set_value("Kelson_Creators_Licensing")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert next(b for b in at.button if b.key == "delete_campaign_button").disabled is False
+
+
+def test_delete_campaign_deletes_every_template_file(tmp_path):
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    deleted_paths = []
+
+    def fake_delete_file(self, path, message, branch="main"):
+        deleted_paths.append(path)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
+        confirm_input.set_value("Kelson_Creators_Licensing")
+        at.run(timeout=15)
+
+        delete_button = next(b for b in at.button if b.key == "delete_campaign_button")
+        delete_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert len(deleted_paths) >= 1
+    assert all(p.startswith("templates/Kelson_Creators_Licensing/") for p in deleted_paths)
+
+
+def test_delete_variant_allowed_when_multiple_variants_exist():
+    """This fixture campaign has all 4 variants (A–D) on disk — deleting
+    any one of them must be allowed, since more than one remains after."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert any(b.key == "delete_variant_button" for b in at.button)
+
+
+def test_delete_variant_actually_deletes_every_stage_file(tmp_path):
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    deleted_paths = []
+
+    def fake_delete_file(self, path, message, branch="main"):
+        deleted_paths.append(path)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        # Default selectbox value is the first variant, "A".
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_delete_variant")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        delete_button = next(b for b in at.button if b.key == "delete_variant_button")
+        delete_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    # 5 stages exist on disk for this fixture campaign — all 5 variant-A files deleted together.
+    assert len(deleted_paths) == 5
+    assert all(p.endswith("_A.txt") for p in deleted_paths)
+
+
+def test_delete_stage_only_offered_for_the_last_stage():
+    """This fixture campaign has 5 stages on disk (intro..followup4) —
+    only followup4 should be deletable; the button must not exist for
+    any earlier stage, since deleting a middle stage would orphan
+    everything after it."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    delete_stage_button = next(b for b in at.button if b.key == "delete_stage_button")
+    assert delete_stage_button.disabled is True  # confirm checkbox not checked yet
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "followup4" in markdown_text  # offered stage is genuinely the last one
+
+
+def test_delete_stage_actually_deletes_all_variant_files_for_it():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    deleted_paths = []
+
+    def fake_delete_file(self, path, message, branch="main"):
+        deleted_paths.append(path)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_delete_stage")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        delete_button = next(b for b in at.button if b.key == "delete_stage_button")
+        delete_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    assert len(deleted_paths) == 4  # 4 variants for followup4
+    assert all("followup4_" in p for p in deleted_paths)
+
+
 def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
