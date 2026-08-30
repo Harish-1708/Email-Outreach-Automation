@@ -93,3 +93,17 @@ def update_account_address_in_mapping(mapping: Dict[str, Dict], account_name: st
 
 def get_account_names(mapping: Dict[str, Dict]) -> List[str]:
     return sorted(mapping.keys())
+
+
+def read_local_slot_mapping(abs_path: str) -> Dict[str, Dict]:
+    """Local file read (the repo's own checkout), NOT a GitHub API call —
+    same pattern as reading templates/settings.yaml elsewhere in this app.
+    Safe to read directly since this file only ever contains names, slot
+    numbers, and addresses — never a password. Shared by every page that
+    needs to know which accounts exist (Email Accounts, and any
+    campaign's own Settings sender-account picker) so they never
+    silently disagree about which accounts exist."""
+    if not os.path.exists(abs_path):
+        return {}
+    with open(abs_path, "r", encoding="utf-8") as f:
+        return parse_slot_mapping(f.read())
