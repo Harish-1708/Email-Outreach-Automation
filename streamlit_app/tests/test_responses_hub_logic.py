@@ -7,7 +7,7 @@ from responses_hub_logic import (
     tag_responses_with_campaign, response_key, filter_responses, count_unread,
     sort_responses_newest_first, get_campaign_names_present, build_reply_summary_label,
     find_response_by_key, STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD, search_responses,
-    is_response_read, split_keys_by_campaign, build_mark_read_payload,
+    is_response_read, split_keys_by_campaign, build_mark_read_payload, matches_status_filter,
 )
 
 
@@ -312,3 +312,50 @@ def test_build_mark_read_payload_shape():
 def test_build_mark_read_payload_is_json_serializable():
     import json
     json.dumps(build_mark_read_payload(["r1"]))
+
+
+# ---------- matches_status_filter ----------
+
+def test_matches_status_filter_all_matches_everything():
+    assert matches_status_filter(_response(), STATUS_FILTER_ALL) is True
+
+
+def test_matches_status_filter_intent_value_checks_intent_field():
+    response = _response(Classification="Genuine Reply", Intent="Interested")
+    assert matches_status_filter(response, "Interested") is True
+    assert matches_status_filter(response, "Not Interested") is False
+
+
+def test_matches_status_filter_classification_value_checks_classification_field():
+    response = _response(Classification="Auto-Reply", Intent="")
+    assert matches_status_filter(response, "Auto-Reply") is True
+    assert matches_status_filter(response, "Genuine Reply") is False
+
+
+def test_matches_status_filter_genuine_reply_with_blank_intent_still_matches_genuine_reply():
+    """A reply not yet intent-classified (blank Intent) should still be
+    findable via the 'Genuine Reply' Classification filter — this is how
+    you'd find "replies that haven't been intent-classified yet"."""
+    response = _response(Classification="Genuine Reply", Intent="")
+    assert matches_status_filter(response, "Genuine Reply") is True
+
+
+def test_matches_status_filter_intent_value_does_not_match_a_bounce():
+    response = _response(Classification="Bounce (Hard)", Intent="")
+    assert matches_status_filter(response, "Interested") is False
+
+
+def test_filter_responses_by_intent():
+    responses = [
+        _response(ResponseID="r1", Classification="Genuine Reply", Intent="Interested"),
+        _response(ResponseID="r2", Classification="Genuine Reply", Intent="Not Interested"),
+    ]
+    result = filter_responses(responses, "Interested", STATUS_FILTER_ALL, INBOX_FILTER_ALL, set())
+    assert len(result) == 1
+    assert result[0]["ResponseID"] == "r1"
+
+
+def test_filter_responses_lead_followup_never_matches_a_bounce():
+    responses = [_response(Classification="Bounce (Hard)", Intent="")]
+    result = filter_responses(responses, "Lead / Needs Follow-up", STATUS_FILTER_ALL, INBOX_FILTER_ALL, set())
+    assert result == []
