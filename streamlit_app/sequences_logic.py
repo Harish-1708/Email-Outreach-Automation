@@ -96,3 +96,45 @@ def has_content_changed(original: Dict[str, str], edited_subject: str, edited_bo
     used to decide what belongs in the batched Save commit, so an
     untouched variant a user merely glanced at never gets re-committed."""
     return original.get("subject", "") != edited_subject.strip() or original.get("body", "") != edited_body.strip()
+
+
+def can_delete_stage(stages: List[Dict], stage_prefix: str) -> Tuple[bool, str]:
+    """Only the LAST stage in the discovered sequence can be deleted —
+    stages must stay contiguous from Intro (outreach.discover_stages_and_
+    variants stops at the first gap), so removing a middle stage would
+    silently orphan every stage after it: their files would still exist
+    on disk but never be discovered again. Also can never delete down to
+    zero stages — Intro alone is the minimum valid campaign."""
+    if len(stages) <= 1:
+        return False, "A campaign must have at least one stage — Intro can't be deleted."
+    last_stage = stages[-1]
+    if stage_prefix != last_stage["template_prefix"]:
+        return False, (f"Only the last stage ('{last_stage['name']}') can be deleted right now — "
+                        "stages must stay contiguous from Intro.")
+    return True, ""
+
+
+def build_stage_deletion_paths(campaign_name: str, stage_prefix: str, variants: List[str]) -> List[str]:
+    """One file path per existing variant of this stage — every one of
+    them must be deleted together (a stage with only some variants
+    removed would violate the 'every stage offers the same variants'
+    invariant just as badly as leaving the stage there half-deleted)."""
+    return [f"templates/{campaign_name}/{stage_prefix}_{v}.txt" for v in variants]
+
+
+def can_delete_variant(variants: List[str], variant: str) -> Tuple[bool, str]:
+    """Every stage must offer the exact same variant letters, so deleting
+    one must happen campaign-wide, never per-stage — and can never remove
+    the last remaining variant, since every stage needs at least one."""
+    if variant not in variants:
+        return False, f"Variant '{variant}' doesn't exist."
+    if len(variants) <= 1:
+        return False, "Can't delete the only remaining variant — a campaign needs at least one."
+    return True, ""
+
+
+def build_variant_deletion_paths(campaign_name: str, stages: List[Dict], variant: str) -> List[str]:
+    """One file path per stage, all for this one variant letter — deleted
+    together so the campaign is never momentarily inconsistent (some
+    stages still offering this variant, others not)."""
+    return [f"templates/{campaign_name}/{stage['template_prefix']}_{variant}.txt" for stage in stages]
