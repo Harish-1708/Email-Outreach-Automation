@@ -79,6 +79,24 @@ def get_campaign_names_present(responses: List[Dict]) -> List[str]:
     return sorted({r.get("_campaign", "") for r in responses if r.get("_campaign")})
 
 
+def search_responses(responses: List[Dict], query: str) -> List[Dict]:
+    """Substring, case-insensitive match against sender, subject, snippet,
+    and campaign — the fields someone would actually type a name, a
+    company, or a keyword hoping to find. A blank query returns
+    everything unfiltered, same as not searching at all."""
+    query = (query or "").strip().lower()
+    if not query:
+        return responses
+    result = []
+    for r in responses:
+        haystack = " ".join([
+            r.get("From", ""), r.get("Subject", ""), r.get("Snippet", ""), r.get("_campaign", ""),
+        ]).lower()
+        if query in haystack:
+            result.append(r)
+    return result
+
+
 def build_reply_summary_label(response: Dict) -> str:
     """One-line label for a response in the list — sender, subject, and
     which campaign it belongs to, since this page spans every campaign
