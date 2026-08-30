@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Tuple
 import yaml
 from dateutil import parser as dateparser
 import gspread
+import requests
 
 
 # =============================================================================
@@ -114,6 +115,15 @@ RESPONSES_COLUMNS = [
                          # else counts as unread. Written only via mark_responses_read,
                          # triggered through the mark_responses_read.yml workflow — Streamlit
                          # itself never writes to this or any other Sheet column directly.
+    "Intent",            # one of INTENT_OPTIONS — a SEPARATE layer from Classification,
+                         # only meaningful for a Genuine Reply; blank for anything else
+                         # (a bounce/auto-reply/OOO has no "sales intent" to speak of).
+    "IntentConfidence",  # "High" / "Medium" / "Low" — a Low confidence result always has
+                         # Intent="Unclear" too; never trust a low-confidence guess at face
+                         # value in either field.
+    "IntentClassifiedAt",  # when the intent classification actually ran — blank means it
+                           # hasn't been classified yet (including every reply logged
+                           # before this feature existed).
 ]
 
 SEND_LOG_COLUMNS = [
@@ -176,6 +186,22 @@ CLASSIFICATION_AUTOREPLY = "Auto-Reply"
 CLASSIFICATION_OOO = "Out of Office"
 CLASSIFICATION_BOUNCE_HARD = "Bounce (Hard)"
 CLASSIFICATION_BOUNCE_SOFT = "Bounce (Soft)"
+
+# A SEPARATE, independent layer from Classification above — Classification
+# says WHAT KIND of message this mechanically is (a real reply vs. a bounce
+# vs. an auto-reply); Intent says what a Genuine Reply's SENDER actually
+# wants, which Classification alone can't tell you. Named "Intent," not
+# "Sentiment" — someone can write an annoyed-sounding reply that's still a
+# strong lead ("I'm frustrated with our current provider, what does yours
+# cost?"), so sentiment would be the wrong axis to classify on.
+INTENT_INTERESTED = "Interested"
+INTENT_NOT_INTERESTED = "Not Interested"
+INTENT_LEAD_FOLLOWUP = "Lead / Needs Follow-up"
+INTENT_UNCLEAR = "Unclear"
+INTENT_OPTIONS = [INTENT_INTERESTED, INTENT_NOT_INTERESTED, INTENT_LEAD_FOLLOWUP, INTENT_UNCLEAR]
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_INTENT_MODEL = "claude-haiku-4-5-20251001"
 
 # Error monitoring categories.
 ERR_SEND_FAILURE = "Send Failure"
@@ -2294,8 +2320,68 @@ def classify_message(headers: Dict[str, str], subject: str, body: str, from_addr
     return CLASSIFICATION_GENUINE
 
 
+def classify_reply_intent(body: str, api_key: str) -> Dict[str, str]:
+    """Classifies a Genuine Reply's actual sales intent — a SEPARATE call
+    from the mechanical classify_message above, only ever made for
+    replies that are already known to be genuine (never for a bounce or
+    an auto-reply, which have no "intent" to speak of). Returns
+    {"intent": one of INTENT_OPTIONS, "confidence": "High"/"Medium"/"Low"}.
+
+    A low-confidence result is downgraded to Unclear rather than trusted
+    at face value — an ambiguous reply should read as "needs a human to
+    look at it," not risk a wrong business decision (e.g. silently
+    treating a real prospect as Not Interested). The same downgrade
+    applies to any failure — a network error, a rate limit, a malformed
+    response — since a classification hiccup should never block the
+    whole check_replies run, and "we don't know" is always the honest,
+    safe fallback.
+    """
+    fallback = {"intent": INTENT_UNCLEAR, "confidence": "Low"}
+    if not api_key:
+        return fallback
+
+    prompt = (
+        "You are classifying a single email reply from a cold outreach recipient into their sales "
+        "intent. Categories:\n"
+        "- Interested: they want to move forward or learn more now.\n"
+        "- Not Interested: a clear decline, no interest at all, right now or in general.\n"
+        "- Lead / Needs Follow-up: not a flat no — asking questions, deferring to a later time "
+        '(e.g. "not right now, check back in a few months"), or otherwise worth following up on.\n'
+        "- Unclear: genuinely ambiguous, or you are not confident.\n\n"
+        'Reply with ONLY a JSON object, nothing else: {"intent": "<one of the four category names '
+        'above, exactly as written>", "confidence": "High" or "Medium" or "Low"}.\n\n'
+        f"Email reply:\n{(body or '')[:3000]}"
+    )
+    try:
+        resp = requests.post(
+            ANTHROPIC_API_URL,
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": ANTHROPIC_INTENT_MODEL, "max_tokens": 100,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        raw_text = resp.json()["content"][0]["text"].strip()
+        parsed = json.loads(raw_text)
+        intent = parsed.get("intent", "")
+        confidence = parsed.get("confidence", "Low")
+        if intent not in INTENT_OPTIONS or confidence == "Low":
+            return fallback
+        return {"intent": intent, "confidence": confidence}
+    except Exception:  # noqa: BLE001 - any failure here falls back to the safe "Unclear" default
+        return fallback
+
+
 def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], lookback_hours: int,
-                   campaign_name: str = "") -> List[Dict]:
+                   campaign_name: str = "", anthropic_api_key: Optional[str] = None) -> List[Dict]:
+    """anthropic_api_key: when set, every newly-logged Genuine Reply gets
+    a one-time intent classification (see classify_reply_intent) in the
+    same run it's first discovered — never re-classified on a later run,
+    since a message is only ever logged once at all (message_id dedup,
+    below, already guarantees that). When not set, Intent/IntentConfidence/
+    IntentClassifiedAt are simply left blank — this whole feature is
+    opt-in, not required for check_replies to work exactly as it always
+    has."""
     leads = sheets.get_all_leads()
 
     by_message_id = {}
@@ -2375,6 +2461,14 @@ def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], 
                 else:
                     action_taken = ACTION_LOGGED_UNVERIFIED
 
+            intent_fields = {"Intent": "", "IntentConfidence": "", "IntentClassifiedAt": ""}
+            if classification == CLASSIFICATION_GENUINE and anthropic_api_key:
+                intent_result = classify_reply_intent(msg.get("body", ""), anthropic_api_key)
+                intent_fields = {
+                    "Intent": intent_result["intent"], "IntentConfidence": intent_result["confidence"],
+                    "IntentClassifiedAt": now_str,
+                }
+
             try:
                 sheets.update_lead_fields(matched_lead["_row"], master_updates)
                 sheets.append_response({
@@ -2386,6 +2480,7 @@ def check_replies(sheets: SheetsConnector, accounts: Dict[str, Dict[str, str]], 
                     # Sheets caps a single cell at 50,000 characters — 49000 leaves headroom
                     # rather than sending a request Google would reject outright for the
                     # rare very long email.
+                    **intent_fields,
                 })
             except Exception as sheets_exc:  # noqa: BLE001
                 log_error(sheets, campaign_name, ERR_SHEETS_API,
@@ -2904,8 +2999,10 @@ def cmd_check_replies(args):
     sheets = _connect_sheets(campaign_cfg)
     accounts = load_email_accounts()
     lookback_hours = campaign_cfg.get("reply_monitor", {}).get("lookback_hours", 24)
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")  # optional — blank Intent fields if unset
 
-    actions = check_replies(sheets, accounts, lookback_hours, campaign_name=args.campaign)
+    actions = check_replies(sheets, accounts, lookback_hours, campaign_name=args.campaign,
+                             anthropic_api_key=anthropic_api_key)
     if not actions:
         print("No new inbound messages matched to a lead.")
         return
