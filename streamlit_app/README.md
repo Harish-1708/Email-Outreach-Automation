@@ -12,16 +12,19 @@ directly — no GitHub trip, no pull request to approve.
 - **🗂️ Campaigns** — the everyday view, and the only page you need for
   day-to-day work. Every phase (A–H) is now real: search, create a
   campaign inline, see status at a glance, Launch/Pause/Resume, and
-  inside a campaign: Analytics, Preview, Data, Sequences (+ ThreadSubject
-  Maintenance at the bottom), Schedule, Settings (+ Send at the bottom,
-  only available while the campaign is actually Running), and Responses
+  inside a campaign: Analytics, Data, Sequences (+ Delete Variant,
+  Delete Stage, and ThreadSubject Maintenance — all near the bottom),
+  Schedule, Settings (+ Send, only available while the campaign is
+  actually Running, and a Danger Zone to delete the whole campaign — its
+  Sheet data is never touched, only its templates), and Responses
   (+ Check Replies at the top, reply directly from the app — Cc/Bcc, file
   attachments, correctly threaded into the same conversation). Each
   action lives with the thing it's most related to, rather than grouped
   into its own separate tab — Send sits with sending config, Check
-  Replies sits with the replies themselves. A fuller quoted-thread view
-  and scheduling a reply for later are deliberately not built yet — see
-  below.
+  Replies sits with the replies themselves. A single-lead template
+  preview already lives inline in Sequences, so there's no separate
+  Preview tab. A fuller quoted-thread view and scheduling a reply for
+  later are deliberately not built yet — see below.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -125,6 +128,21 @@ Remove buttons on the Email Accounts page instead:
    nothing breaks either way in the meantime.
 
 ## Known limitations (by design, not bugs)
+
+- **Deleting a campaign, a stage, or a variant never touches the Google
+  Sheet.** Only the template files (and the campaign's settings override,
+  for a full campaign delete) are removed — leads, sends, and replies
+  stay exactly where they are, fully readable directly in the Sheet.
+  "Delete" here means "stop treating this as an active campaign," not
+  "erase its history."
+- **You can only delete the *last* stage**, never a middle one — stages
+  must stay contiguous from Intro (the same rule
+  `outreach.discover_stages_and_variants` already enforces), so deleting
+  a middle stage would silently orphan every stage after it.
+- **Deleting a variant always removes it from every stage at once**,
+  never just one — every stage must offer the exact same variant
+  letters, so a per-stage deletion would immediately break that
+  invariant. You also can't delete the last remaining variant.
 
 - **Only 10 account slots by default** (`EMAIL_ACCOUNT_SLOT_1..10`) —
   deliberately not jumped straight to a large number; if you need more,
