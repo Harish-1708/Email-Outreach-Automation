@@ -932,7 +932,28 @@ def test_campaigns_hub_page_renders_without_exceptions():
     assert "Kelson_Creators_Licensing" in markdown_text
 
 
-def test_campaigns_detail_view_renders_analytics_without_exceptions():
+def test_campaigns_hub_refresh_button_clears_caches_without_error():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        refresh_button = next(b for b in at.button if b.key == "refresh_hub_button")
+        refresh_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Refresh raised: {list(at.exception)}"
+    assert list(at.error) == []
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Kelson_Creators_Licensing" in markdown_text  # data still shows after the cache clear + rerun
+
+
+
     """Directly sets selected_campaign in session_state, bypassing the
     click — proves the detail view + Analytics tab (Phase B, real data,
     not a stub) work end to end against realistic Sheet data."""
@@ -1403,8 +1424,7 @@ def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
          patch("github_client.GitHubClient.create_file", fake_create_file), \
-         patch("config.TEMPLATES_ROOT", str(tmp_path)), \
-         patch("preview_logic.TEMPLATES_ROOT", str(tmp_path)):
+         patch("config.TEMPLATES_ROOT", str(tmp_path)):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
@@ -1740,7 +1760,43 @@ def test_temporarily_remove_campaign_sets_deleted_status_without_deleting_files(
     override_commit = next(c for c in commits_captured["commits"] if c["path"].endswith(".yaml"))
     written = _yaml.safe_load(override_commit["content"].decode("utf-8"))
     assert written["status"] == "deleted"
+    assert written["previous_status"] == "active"  # this fixture campaign has no explicit status -> "active"
     assert at.session_state["selected_campaign"] is None  # navigates back to the hub
+
+
+def test_restore_campaign_brings_back_exact_previous_status_not_draft(tmp_path):
+    """The actual bug being fixed: a campaign that was Paused (not just
+    Draft) before Temporarily Remove must come back Paused when
+    restored, not silently reset to Draft."""
+    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+        "status: deleted\nprevious_status: paused\n"
+    )
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path)):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = None
+        at.run(timeout=15)
+
+        restore_button = next(b for b in at.button if b.key == "restore_Kelson_Creators_Licensing")
+        restore_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Restore raised: {list(at.exception)}"
+    assert list(at.error) == []
+
+    import yaml as _yaml
+    override_commit = next(c for c in commits_captured["commits"] if c["path"].endswith(".yaml"))
+    written = _yaml.safe_load(override_commit["content"].decode("utf-8"))
+    assert written["status"] == "paused"  # exact prior status, not "draft"
+    assert "previous_status" not in written
 
 
 def test_delete_variant_allowed_when_multiple_variants_exist():
