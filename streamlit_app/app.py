@@ -36,6 +36,10 @@ Use the sidebar to navigate:
   from here, and open any campaign for Analytics, Preview, Data,
   Sequences, Schedule, Settings (with Send), and Responses (with Check
   Replies). Start here.
+- **💬 Responses** — every reply across every campaign in one place,
+  filterable by status, campaign, and unread. Reply directly from here
+  too — same tools as each campaign's own Responses tab, just spanning
+  everything at once instead of one campaign at a time.
 - **📈 Overview** — every campaign at a glance: sent, pending, replies.
 - **📊 Dashboard** — deep-dive into one campaign's leads, sends, replies,
   and errors.
@@ -51,9 +55,11 @@ Use the sidebar to navigate:
 # bug). Page files themselves now have plain ASCII names.
 home_page = st.Page(_home, title="Home", icon="📬", default=True)
 campaigns_page = st.Page("pages/campaigns.py", title="Campaigns", icon="🗂️")
+responses_page = st.Page("pages/responses.py", title="Responses", icon="💬")
 overview_page = st.Page("pages/overview.py", title="Overview", icon="📈")
 dashboard_page = st.Page("pages/dashboard.py", title="Dashboard", icon="📊")
 email_accounts_page = st.Page("pages/email_accounts.py", title="Email Accounts", icon="📧")
 
-nav = st.navigation([home_page, campaigns_page, overview_page, dashboard_page, email_accounts_page])
+nav = st.navigation([home_page, campaigns_page, responses_page, overview_page, dashboard_page,
+                     email_accounts_page])
 nav.run()
