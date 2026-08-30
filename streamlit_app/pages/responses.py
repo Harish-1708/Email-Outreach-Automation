@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import streamlit as st
 
@@ -7,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from page_state import mark_active_page  # noqa: E402
 from auth import login_gate, current_user  # noqa: E402
-from config import REPO_ROOT, WORKFLOW_CHECK_REPLIES, WORKFLOW_SEND_REPLY  # noqa: E402
+from config import REPO_ROOT, WORKFLOW_CHECK_REPLIES, WORKFLOW_SEND_REPLY, WORKFLOW_MARK_RESPONSES_READ  # noqa: E402
 from preview_logic import list_campaigns, get_campaign_cfg  # noqa: E402
 from sheets_readonly import ReadOnlySheetsConnector, ReadOnlySheetsError  # noqa: E402
 from github_client import GitHubClient, GitHubActionsError  # noqa: E402
@@ -16,6 +17,7 @@ from responses_hub_logic import (  # noqa: E402
     tag_responses_with_campaign, response_key, filter_responses, count_unread,
     sort_responses_newest_first, get_campaign_names_present, CLASSIFICATION_OPTIONS,
     STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD, search_responses,
+    is_response_read, split_keys_by_campaign, build_mark_read_payload,
 )
 from responses_reply_logic import (  # noqa: E402
     find_lead_for_response, build_reply_defaults, parse_email_list, validate_reply,
@@ -103,12 +105,45 @@ if "read_response_keys" not in st.session_state:
     st.session_state["read_response_keys"] = set()
 read_keys = st.session_state["read_response_keys"]
 
-# NOTE: read/unread state lives only in st.session_state right now — it
-# resets on a fresh browser session. Persisting it across sessions would
-# need Streamlit to write back to the Response Sheet (it currently only
-# ever reads it), which is a real permission decision, not something to
-# make silently here.
+if "pending_sync_keys" not in st.session_state:
+    st.session_state["pending_sync_keys"] = set()
+pending_sync_keys = st.session_state["pending_sync_keys"]
+
+# Read/unread is now persistent — each response's own IsRead column in
+# the Response Sheet is the durable source of truth (see
+# responses_hub_logic.is_response_read). read_keys above is only an
+# OPTIMISTIC local overlay for the gap between "you opened this" and
+# "the sync workflow actually wrote IsRead=Yes" — Streamlit itself never
+# writes to the Sheet directly, so that write always goes through
+# mark_responses_read.yml, batched rather than one run per response.
 unread_count = count_unread(all_responses, read_keys)
+
+if pending_sync_keys:
+    if st.button(f"🔄 Sync read status ({len(pending_sync_keys)} pending)"):
+        grouped = split_keys_by_campaign(pending_sync_keys)
+        client = _get_github_client()
+        synced_campaigns = []
+        failed_campaigns = []
+        for campaign_for_sync, response_ids in grouped.items():
+            try:
+                payload = build_mark_read_payload(response_ids)
+                path = f"mark_read/{campaign_for_sync}/{time.strftime('%Y-%m-%d-%H%M%S')}.json"
+                client.create_file(
+                    path, payload_to_bytes(payload),
+                    message=f"Mark {len(response_ids)} response(s) read in {campaign_for_sync} "
+                            f"(via Streamlit, by {current_user()})",
+                )
+                client.dispatch_workflow(WORKFLOW_MARK_RESPONSES_READ,
+                                          {"campaign": campaign_for_sync, "payload_path": path})
+                synced_campaigns.append(campaign_for_sync)
+            except GitHubActionsError:
+                failed_campaigns.append(campaign_for_sync)
+        keys_to_remove = {f"{c}:{rid}" for c in synced_campaigns for rid in grouped[c]}
+        st.session_state["pending_sync_keys"] = pending_sync_keys - keys_to_remove
+        if synced_campaigns:
+            st.success(f"Synced read status for {len(synced_campaigns)} campaign(s).")
+        if failed_campaigns:
+            st.warning(f"Failed to sync: {', '.join(failed_campaigns)}")
 
 search_query = st.text_input("🔍 Search responses (sender, subject, snippet, campaign)",
                               key="responses_search_query")
@@ -139,7 +174,7 @@ else:
     for response in filtered:
         campaign_name = response["_campaign"]
         key = response_key(response)
-        is_unread = key not in read_keys
+        is_unread = not is_response_read(response, read_keys)
         leads = leads_by_campaign.get(campaign_name, [])
         lead = find_lead_for_response(response, leads)
         label = f"{response.get('From', '(unknown sender)')} — {response.get('Subject', '(no subject)')}"
@@ -153,6 +188,16 @@ else:
                            f"{response.get('Classification', '')}")
             with col_b:
                 st.caption(response.get("ActionTaken", ""))
+                if is_unread:
+                    # A deliberate, explicit action — st.expander's body
+                    # runs on every rerun REGARDLESS of whether it's
+                    # actually open, so marking read merely because the
+                    # Reply expander's code executed would mark
+                    # EVERYTHING read on the very first page load.
+                    if st.button("✓ Mark as read", key=f"mark_read_{key}"):
+                        read_keys.add(key)
+                        pending_sync_keys.add(key)
+                        st.rerun()
             st.write(response.get("Snippet", ""))
 
             with st.expander("💬 View full conversation"):
@@ -174,7 +219,6 @@ else:
                         st.divider()
 
             with st.expander("↩️ Reply"):
-                read_keys.add(key)  # opening the reply form counts as having read it
                 defaults = build_reply_defaults(response, lead)
                 to_email = st.text_input("To", value=defaults["to"], key=f"hub_reply_to_{key}")
                 subject = st.text_input("Subject", value=defaults["subject"], key=f"hub_reply_subject_{key}")
@@ -216,6 +260,8 @@ else:
                             )
                             client.dispatch_workflow(WORKFLOW_SEND_REPLY,
                                                       {"campaign": campaign_name, "payload_path": path})
+                            read_keys.add(key)
+                            pending_sync_keys.add(key)
                             st.success("Reply queued — it'll be sent within a minute or two.")
                         except GitHubActionsError as exc:
                             st.error(f"Failed to send: {exc}")
