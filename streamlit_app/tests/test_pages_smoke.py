@@ -8,6 +8,7 @@ boundary; nothing here touches a real network.
 import json
 import os
 import sys
+import tempfile
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -372,9 +373,11 @@ def test_email_accounts_page_renders_without_exceptions():
 
     assert list(at.exception) == [], f"Email Accounts page raised: {list(at.exception)}"
     assert list(at.error) == [], f"Email Accounts page showed an error: {[e.value for e in at.error]}"
-    metric_labels = [m.label for m in at.metric]
-    assert any("sales1" in label for label in metric_labels)
-    assert any("sales2" in label for label in metric_labels)
+    assert len(at.dataframe) >= 1
+    df = at.dataframe[0].value
+    account_col = " ".join(str(v) for v in df["Account"])
+    assert "sales1" in account_col
+    assert "sales2" in account_col
 
 
 def test_email_accounts_page_shows_info_when_no_accounts_configured_at_all():
@@ -416,10 +419,12 @@ def test_email_accounts_page_shows_connection_status_when_health_data_exists():
 
     assert list(at.exception) == [], f"Email Accounts page raised: {list(at.exception)}"
     assert list(at.error) == []
-    caption_texts = " ".join(c.value for c in at.caption)
-    assert "🟢 Connected" in caption_texts
-    assert "🔴 Disconnected" in caption_texts
-    assert "AUTHENTICATIONFAILED" in caption_texts  # the disconnection reason shown, plainly
+    df = at.dataframe[0].value
+    status_col = " ".join(str(v) for v in df["Status"])
+    assert "🟢 Connected" in status_col
+    assert "🔴 Disconnected" in status_col
+    detail_col = " ".join(str(v) for v in df["Detail"])
+    assert "AUTHENTICATIONFAILED" in detail_col  # the disconnection reason shown, plainly
 
 
 def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
@@ -440,8 +445,10 @@ def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
 
     assert list(at.exception) == []
     assert list(at.error) == []
+    df = at.dataframe[0].value
+    status_col = " ".join(str(v) for v in df["Status"])
+    assert "⚪ Unknown" in status_col
     caption_texts = " ".join(c.value for c in at.caption)
-    assert "⚪ Unknown" in caption_texts
     assert "runs automatically every 2 hours" in caption_texts
 
 
@@ -815,10 +822,11 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
     assert list(at.error) == [], f"Campaign detail showed an error: {[e.value for e in at.error]}"
     titles = [t.value for t in at.title]
     assert "Kelson_Creators_Licensing" in titles
-    # 7 outer tabs (Analytics/Preview/Data/Sequences/Schedule/Settings/
-    # Responses), no nesting anymore — Send moved into Settings, Check
-    # Replies into Responses, Maintenance into Sequences.
-    assert len(at.tabs) == 7
+    # 6 outer tabs (Analytics/Data/Sequences/Schedule/Settings/Responses) —
+    # Preview removed (redundant with Sequences' own template preview),
+    # Send lives in Settings, Check Replies in Responses, Maintenance in
+    # Sequences.
+    assert len(at.tabs) == 6
     # Real analytics data should show up as metrics, not just tab labels.
     metric_values = [m.value for m in at.metric]
     assert "1" in metric_values  # Total Leads == 1
@@ -1322,7 +1330,7 @@ def test_settings_tab_shows_info_when_no_accounts_directory_configured():
 
     assert list(at.exception) == []
     info_texts = " ".join(i.value for i in at.info)
-    assert "No accounts configured in Streamlit Secrets" in info_texts
+    assert "No accounts configured yet" in info_texts
 
 
 def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path():
@@ -1465,6 +1473,39 @@ def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_
     import yaml
     written = yaml.safe_load(captured["commits"][0]["content"].decode("utf-8"))
     assert set(written["sending"]["rotation_accounts"]) == {"sales1", "sales2"}  # actually persisted
+
+
+def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too():
+    """The real bug this fixes: an account added via the Email Accounts
+    page's Add Account button lives only in the slot-mapping file, never
+    in the [email_accounts_directory] Streamlit secret — the sender
+    picker here must show it too, not just accounts manually added to
+    Streamlit Secrets."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config_dir = os.path.join(tmp_dir, "config")
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "email_account_slots.yaml"), "w") as f:
+            f.write("sales2:\n  slot: 1\n  address: sales2@gmail.com\n")
+
+        with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+             patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+             patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH",
+                   os.path.join(config_dir, "email_account_slots.yaml")):
+            at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+            secrets = _dashboard_secrets()
+            secrets["email_accounts_directory"] = {"sales1": "sales1@x.com"}  # only the OLD account here
+            at.secrets.update(secrets)
+            for k, v in _authed_session().items():
+                at.session_state[k] = v
+            at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+            at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    account_selector = next(ms for ms in at.multiselect if "sender accounts" in ms.label)
+    assert set(account_selector.options) == {"sales1", "sales2"}  # both sources present
 
 
 def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
@@ -1770,33 +1811,6 @@ def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_aw
 
     assert list(at.exception) == []
     assert not any(b.label == "Confirm Launch" for b in at.button)
-
-
-def test_send_tab_preview_shows_eligible_lead():
-    fake_ws = _campaigns_page_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Master Sheet"] = FakeWorksheet(
-        [{"LeadID": "1", "Email": "a@abc.com", "FirstName": "Sam", "Approval": "Yes",
-          "IntroSentAt": "", "Status": ""}]
-    )
-    fake_spreadsheet = FakeSpreadsheet(fake_ws)
-
-    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
-         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
-        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
-        at.secrets.update(_dashboard_secrets())
-        for k, v in _authed_session().items():
-            at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
-        at.run(timeout=15)
-
-        preview_button = next(b for b in at.button if b.key == "campaigns_run_preview")
-        preview_button.click()
-        at.run(timeout=15)
-
-    assert list(at.exception) == [], f"Preview raised: {list(at.exception)}"
-    assert list(at.error) == []
-    success_texts = " ".join(s.value for s in at.success)
-    assert "1 eligible lead" in success_texts
 
 
 def test_send_tab_send_batch_requires_typed_send_confirmation():
