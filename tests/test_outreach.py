@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -2646,6 +2647,212 @@ def test_check_replies_full_body_capped_at_sheets_cell_limit(monkeypatch):
     outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24)
 
     assert len(fake_sheets.responses[0]["FullBody"]) <= 49000
+
+
+# =============================================================================
+# classify_reply_intent — a SEPARATE layer from mechanical classification,
+# only ever meaningful for a Genuine Reply. Every test here mocks the
+# actual HTTP call — no real Anthropic API traffic in the test suite.
+# =============================================================================
+
+def _fake_anthropic_response(intent, confidence, status_code=200):
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"{self.status_code} error")
+
+        def json(self):
+            return {"content": [{"text": json.dumps({"intent": intent, "confidence": confidence})}]}
+
+    return FakeResponse()
+
+
+def test_classify_reply_intent_no_api_key_returns_unclear_without_calling_out(monkeypatch):
+    call_count = []
+    monkeypatch.setattr(outreach.requests, "post", lambda *a, **kw: call_count.append(1))
+    result = outreach.classify_reply_intent("Yes I'm interested!", api_key="")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+    assert call_count == []  # never even attempted a call with no key configured
+
+
+def test_classify_reply_intent_interested(monkeypatch):
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Interested", "High"))
+    result = outreach.classify_reply_intent("Yes, I'd love to hear more. What are the next steps?",
+                                             api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_INTERESTED, "confidence": "High"}
+
+
+def test_classify_reply_intent_not_interested(monkeypatch):
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Not Interested", "High"))
+    result = outreach.classify_reply_intent("Thanks, but we're not looking for this.", api_key="fake-key")
+    assert result["intent"] == outreach.INTENT_NOT_INTERESTED
+
+
+def test_classify_reply_intent_defer_later_is_lead_followup_not_not_interested(monkeypatch):
+    """The exact nuance this whole feature exists to capture — a
+    'not now, later' reply is a real lead, not a lost one."""
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Lead / Needs Follow-up", "Medium"))
+    result = outreach.classify_reply_intent(
+        "Not interested right now, but reach out again in a few months.", api_key="fake-key")
+    assert result["intent"] == outreach.INTENT_LEAD_FOLLOWUP
+    assert result["intent"] != outreach.INTENT_NOT_INTERESTED
+
+
+def test_classify_reply_intent_low_confidence_downgrades_to_unclear(monkeypatch):
+    """Never trust a low-confidence result at face value — even if the
+    model's raw guess was a real category, Low confidence means the
+    safe, honest answer is 'we don't know', not that specific guess."""
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Interested", "Low"))
+    result = outreach.classify_reply_intent("hmm maybe idk", api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+
+
+def test_classify_reply_intent_invalid_category_from_model_falls_back_to_unclear(monkeypatch):
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Something Weird", "High"))
+    result = outreach.classify_reply_intent("...", api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+
+
+def test_classify_reply_intent_api_error_falls_back_to_unclear_never_raises(monkeypatch):
+    monkeypatch.setattr(outreach.requests, "post",
+                         lambda *a, **kw: _fake_anthropic_response("Interested", "High", status_code=500))
+    result = outreach.classify_reply_intent("test", api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+
+
+def test_classify_reply_intent_network_exception_falls_back_to_unclear_never_raises(monkeypatch):
+    def raise_network_error(*a, **kw):
+        raise requests.ConnectionError("simulated network failure")
+
+    monkeypatch.setattr(outreach.requests, "post", raise_network_error)
+    result = outreach.classify_reply_intent("test", api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+
+
+def test_classify_reply_intent_malformed_json_response_falls_back_to_unclear(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"text": "not valid json at all"}]}
+
+    monkeypatch.setattr(outreach.requests, "post", lambda *a, **kw: FakeResponse())
+    result = outreach.classify_reply_intent("test", api_key="fake-key")
+    assert result == {"intent": outreach.INTENT_UNCLEAR, "confidence": "Low"}
+
+
+def test_classify_reply_intent_truncates_very_long_body_before_sending():
+    """A real cost/latency guard — a 3000-char cap on what's actually
+    sent to the model, regardless of how long the original email is."""
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"text": json.dumps({"intent": "Unclear", "confidence": "Low"})}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["prompt"] = json["messages"][0]["content"]
+        return FakeResponse()
+
+    import unittest.mock as mock
+    with mock.patch.object(outreach.requests, "post", fake_post):
+        outreach.classify_reply_intent("x" * 10_000, api_key="fake-key")
+
+    # The prompt overhead itself is well under 3000 chars, so a truncated
+    # body keeps the whole prompt well short of the full 10,000 chars.
+    assert len(captured["prompt"]) < 4000
+
+
+# =============================================================================
+# check_replies' actual wiring of intent classification
+# =============================================================================
+
+def test_check_replies_classifies_intent_for_genuine_reply_when_key_provided(monkeypatch):
+    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
+        return [{
+            "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
+            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
+            "headers": {}, "body": "Yes I'm very interested, let's talk!", "snippet": "Yes I'm very interested",
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+    monkeypatch.setattr(outreach, "classify_reply_intent",
+                         lambda body, api_key: {"intent": outreach.INTENT_INTERESTED, "confidence": "High"})
+
+    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
+                            anthropic_api_key="fake-key")
+
+    logged = fake_sheets.responses[0]
+    assert logged["Intent"] == outreach.INTENT_INTERESTED
+    assert logged["IntentConfidence"] == "High"
+    assert logged["IntentClassifiedAt"]  # non-empty
+
+
+def test_check_replies_no_api_key_leaves_intent_fields_blank(monkeypatch):
+    """The opt-in guarantee — check_replies behaves exactly as it always
+    has when this feature isn't configured, not just 'roughly the same'."""
+    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+    intent_calls = []
+
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
+        return [{
+            "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
+            "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
+            "headers": {}, "body": "Yes interested!", "snippet": "Yes interested!",
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+    monkeypatch.setattr(outreach, "classify_reply_intent", lambda body, api_key: intent_calls.append(1))
+
+    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
+                            anthropic_api_key=None)
+
+    assert intent_calls == []  # never even called
+    logged = fake_sheets.responses[0]
+    assert logged["Intent"] == ""
+    assert logged["IntentConfidence"] == ""
+    assert logged["IntentClassifiedAt"] == ""
+
+
+def test_check_replies_never_classifies_intent_for_a_bounce(monkeypatch):
+    """Intent is meaningless for a bounce/auto-reply/OOO — classifying
+    one would waste an API call on something with no "sales intent" at
+    all, and could produce a nonsensical result."""
+    leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
+    fake_sheets = FakeSheets(leads)
+    intent_calls = []
+
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
+        return [{
+            "message_id": "<bounce1@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
+            "references": "<intro1@mail.gmail.com>", "subject": "Mail Delivery Failed", "from": "mailer-daemon@abc.com",
+            "headers": {"content-type": "multipart/report; report-type=delivery-status"},
+            "body": "550 no such user", "snippet": "550 no such user",
+        }]
+
+    monkeypatch.setattr(outreach, "imap_fetch_recent", fake_imap_fetch_recent)
+    monkeypatch.setattr(outreach, "classify_reply_intent", lambda body, api_key: intent_calls.append(1))
+
+    outreach.check_replies(fake_sheets, {"sales1": ACCOUNTS["sales1"]}, lookback_hours=24,
+                            anthropic_api_key="fake-key")
+
+    assert intent_calls == []
 
 
 def test_check_replies_one_account_imap_failure_does_not_block_others(monkeypatch):
