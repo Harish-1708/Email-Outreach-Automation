@@ -1323,11 +1323,168 @@ def test_smtp_send_with_no_cc_or_bcc_envelope_unchanged():
 ACCOUNTS_FOR_REPLY = {"sales1": {"address": "sales1@gmail.com", "app_password": "aaaa bbbb cccc dddd"}}
 
 
-def test_send_manual_reply_calls_smtp_send_with_resolved_threading(monkeypatch):
+def test_smtp_connection_settings_defaults_to_gmail():
+    account = {"address": "sales1@gmail.com", "app_password": "x"}
+    host, port, username = outreach.smtp_connection_settings(account)
+    assert host == outreach.DEFAULT_SMTP_HOST
+    assert port == outreach.DEFAULT_SMTP_PORT
+    assert username == "sales1@gmail.com"  # defaults to the address itself
+
+
+def test_smtp_connection_settings_uses_custom_provider_fields():
+    account = {
+        "address": "sales@example.com", "app_password": "x",
+        "smtp_host": "smtp.hostinger.com", "smtp_port": 587, "smtp_username": "sales-login@example.com",
+    }
+    host, port, username = outreach.smtp_connection_settings(account)
+    assert host == "smtp.hostinger.com"
+    assert port == 587
+    assert username == "sales-login@example.com"  # can differ from the address
+
+
+def test_smtp_connection_settings_coerces_string_port_to_int():
+    """A CSV import or a hand-typed form field commonly yields a string
+    port ('587') — smtplib requires an actual int, not a string."""
+    account = {"address": "a@b.com", "app_password": "x", "smtp_port": "587"}
+    _, port, _ = outreach.smtp_connection_settings(account)
+    assert port == 587
+    assert isinstance(port, int)
+
+
+def test_imap_connection_settings_defaults_to_gmail():
+    account = {"address": "sales1@gmail.com", "app_password": "x"}
+    host, port, username = outreach.imap_connection_settings(account)
+    assert host == outreach.DEFAULT_IMAP_HOST
+    assert port == outreach.DEFAULT_IMAP_PORT
+    assert username == "sales1@gmail.com"
+
+
+def test_imap_connection_settings_uses_custom_provider_fields():
+    account = {
+        "address": "sales@example.com", "app_password": "x",
+        "imap_host": "imap.hostinger.com", "imap_port": 143, "imap_username": "sales-login@example.com",
+    }
+    host, port, username = outreach.imap_connection_settings(account)
+    assert host == "imap.hostinger.com"
+    assert port == 143
+    assert username == "sales-login@example.com"
+
+
+def test_get_imap_password_defaults_to_app_password():
+    account = {"address": "a@b.com", "app_password": "smtp-pass"}
+    assert outreach.get_imap_password(account) == "smtp-pass"
+
+
+def test_get_imap_password_uses_distinct_imap_password_when_set():
+    account = {"address": "a@b.com", "app_password": "smtp-pass", "imap_password": "imap-only-pass"}
+    assert outreach.get_imap_password(account) == "imap-only-pass"
+
+
+def test_slot_loader_preserves_custom_provider_fields():
+    """The actual bug found and fixed: the slot loader used to keep only
+    address/app_password, silently dropping smtp_host etc. even after
+    a user carefully filled them in on the Add Account form."""
+    import json as _json
+    slot_json = _json.dumps({
+        "name": "hostinger1", "address": "sales@example.com", "app_password": "x",
+        "smtp_host": "smtp.hostinger.com", "smtp_port": 587,
+        "imap_host": "imap.hostinger.com", "imap_port": 993,
+    })
+    import os as _os
+    _os.environ["EMAIL_ACCOUNT_SLOT_1"] = slot_json
+    try:
+        accounts = outreach._load_email_accounts_from_slots()
+    finally:
+        del _os.environ["EMAIL_ACCOUNT_SLOT_1"]
+    assert accounts["hostinger1"]["smtp_host"] == "smtp.hostinger.com"
+    assert accounts["hostinger1"]["imap_host"] == "imap.hostinger.com"
+
+
+def test_smtp_send_uses_custom_host_and_port(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, context=None):
+            captured["host"] = host
+            captured["port"] = port
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, username, password):
+            captured["login_username"] = username
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            pass
+
+    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
+    outreach.smtp_send("sales@example.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body",
+                        smtp_host="smtp.hostinger.com", smtp_port=587, smtp_username="login@example.com")
+
+    assert captured["host"] == "smtp.hostinger.com"
+    assert captured["port"] == 587
+    assert captured["login_username"] == "login@example.com"  # NOT the From address
+
+
+def test_smtp_send_no_custom_settings_uses_gmail_defaults(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, context=None):
+            captured["host"] = host
+            captured["port"] = port
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, username, password):
+            captured["login_username"] = username
+
+        def sendmail(self, from_addr, to_addrs, msg_string):
+            pass
+
+    monkeypatch.setattr(outreach.smtplib, "SMTP_SSL", FakeSMTP)
+    outreach.smtp_send("sales1@gmail.com", "app-pass", to="lead@abc.com", subject="Hi", body_text="Body")
+
+    assert captured["host"] == "smtp.gmail.com"
+    assert captured["port"] == 465
+    assert captured["login_username"] == "sales1@gmail.com"  # defaults to the address
+
+
+def test_check_single_account_health_uses_custom_imap_host(monkeypatch):
+    captured = {}
+
+    class FakeIMAP:
+        def __init__(self, host, port):
+            captured["host"] = host
+            captured["port"] = port
+
+        def login(self, username, password):
+            captured["login_username"] = username
+
+        def logout(self):
+            pass
+
+    monkeypatch.setattr(outreach.imaplib, "IMAP4_SSL", FakeIMAP)
+    outreach.check_single_account_health("sales@example.com", "app-pass", imap_host="imap.hostinger.com",
+                                          imap_port=143, imap_username="login@example.com")
+
+    assert captured["host"] == "imap.hostinger.com"
+    assert captured["port"] == 143
+    assert captured["login_username"] == "login@example.com"
+
+
+
     captured = {}
 
     def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
-                        cc=None, bcc=None, attachments=None):
+                        cc=None, bcc=None, attachments=None, smtp_host=None, smtp_port=None, smtp_username=None):
         captured.update(locals())
         return {"message_id": "<reply1@mail.gmail.com>"}
 
@@ -1578,7 +1735,7 @@ def test_check_account_health_isolates_broken_account_from_working_ones(monkeypa
         "sales2": {"address": "sales2@gmail.com", "app_password": "bad-pass"},
     }
 
-    def fake_check(address, app_password):
+    def fake_check(address, app_password, imap_host=None, imap_port=None, imap_username=None):
         if app_password == "bad-pass":
             return "Disconnected", "auth failed"
         return "Connected", ""
@@ -1594,7 +1751,7 @@ def test_check_account_health_isolates_broken_account_from_working_ones(monkeypa
 
 def test_check_account_health_never_includes_app_password_field(monkeypatch):
     accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "super-secret"}}
-    monkeypatch.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
+    monkeypatch.setattr(outreach, "check_single_account_health", lambda a, p, **kw: ("Connected", ""))
     results = outreach.check_account_health(accounts)
     assert "app_password" not in results[0]
     assert "super-secret" not in json.dumps(results[0])
@@ -1603,7 +1760,7 @@ def test_check_account_health_never_includes_app_password_field(monkeypatch):
 def test_check_account_health_matches_column_schema():
     accounts = {"sales1": {"address": "sales1@gmail.com", "app_password": "x"}}
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(outreach, "check_single_account_health", lambda a, p: ("Connected", ""))
+        m.setattr(outreach, "check_single_account_health", lambda a, p, **kw: ("Connected", ""))
         results = outreach.check_account_health(accounts)
     assert set(results[0].keys()) == set(outreach.ACCOUNT_HEALTH_COLUMNS)
 
@@ -2180,7 +2337,8 @@ def test_build_batch_ignores_schedule_restriction_preview_still_works(monkeypatc
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
+    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
+                        smtp_host=None, smtp_port=None, smtp_username=None):
         return {"message_id": "<msg1@mail.gmail.com>"}
 
     monkeypatch.setattr(outreach, "smtp_send", fake_smtp_send)
@@ -2254,7 +2412,7 @@ def test_check_replies_matches_by_message_id_header_first(monkeypatch):
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<reply1@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
             "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello",
@@ -2278,7 +2436,7 @@ def test_check_replies_falls_back_to_email_when_no_header_match(monkeypatch):
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<reply2@mail.gmail.com>", "in_reply_to": "", "references": "",
             "subject": "Re: Hello", "from": "john@abc.com",
@@ -2304,7 +2462,7 @@ def test_check_replies_genuine_reply_stops_sequence(monkeypatch):
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="<intro1@mail.gmail.com>")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<reply3@mail.gmail.com>", "in_reply_to": "<intro1@mail.gmail.com>",
             "references": "<intro1@mail.gmail.com>", "subject": "Re: Hello", "from": "john@abc.com",
@@ -2324,7 +2482,7 @@ def test_check_replies_one_account_imap_failure_does_not_block_others(monkeypatc
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
     fake_sheets = FakeSheets(leads)
 
-    def flaky_imap_fetch_recent(address, app_password, since_dt):
+    def flaky_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         if address == "sales1@gmail.com":
             raise RuntimeError("simulated IMAP outage")
         return [{
@@ -3000,7 +3158,7 @@ def test_check_replies_imap_failure_logs_to_error_log(monkeypatch):
     leads = [make_lead(_row=2, LeadID="L1", Email="john@abc.com", MessageID="")]
     fake_sheets = FakeSheets(leads)
 
-    def flaky_imap_fetch_recent(address, app_password, since_dt):
+    def flaky_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         raise RuntimeError("simulated IMAP outage")
 
     monkeypatch.setattr(outreach, "imap_fetch_recent", flaky_imap_fetch_recent)
@@ -3341,7 +3499,8 @@ def test_send_batch_sends_full_round_concurrently_not_sequentially(monkeypatch):
     fake_sheets = FakeSheets(leads)
     intervals = []
 
-    def slow_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
+    def slow_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
+                        smtp_host=None, smtp_port=None, smtp_username=None):
         start = time.monotonic()
         time.sleep(0.2)
         intervals.append((start, time.monotonic()))
@@ -3404,7 +3563,8 @@ def test_send_batch_two_leads_pinned_to_same_account_split_across_rounds(monkeyp
     fake_sheets = FakeSheets(leads)
     call_order = []
 
-    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None):
+    def fake_smtp_send(address, app_password, to, subject, body_text, in_reply_to=None, references=None,
+                        smtp_host=None, smtp_port=None, smtp_username=None):
         call_order.append(to)
         return {"message_id": f"<{to}@mail.gmail.com>"}
 
@@ -3588,7 +3748,7 @@ def test_check_replies_old_campaign_reply_never_stops_new_campaign_sequence(monk
                         IntroSentAt=new_intro_sent_at)]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<old_reply@mail.gmail.com>",
             "in_reply_to": "<old_unrelated_campaign_intro@mail.gmail.com>",  # NOT the current campaign's id
@@ -3625,7 +3785,7 @@ def test_check_replies_email_match_after_contact_logged_unverified_not_stopped(m
                         MessageID="<intro@mail.gmail.com>", IntroSentAt=intro_sent_at)]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<new_thread_reply@mail.gmail.com>", "in_reply_to": "", "references": "",
             "subject": "New conversation", "from": "creator@example.com",
@@ -3654,7 +3814,7 @@ def test_check_replies_header_match_genuine_reply_still_stops_sequence_after_fix
                         MessageID="<current_campaign_intro@mail.gmail.com>")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<real_reply@mail.gmail.com>",
             "in_reply_to": "<current_campaign_intro@mail.gmail.com>",  # matches THIS lead's tracked id
@@ -3681,7 +3841,7 @@ def test_check_replies_email_match_hard_bounce_never_stops_sequence_either(monke
     leads = [make_lead(_row=2, LeadID="L1", Email="creator@example.com", MessageID="")]
     fake_sheets = FakeSheets(leads)
 
-    def fake_imap_fetch_recent(address, app_password, since_dt):
+    def fake_imap_fetch_recent(address, app_password, since_dt, imap_host=None, imap_port=None, imap_username=None):
         return [{
             "message_id": "<weird@mail.gmail.com>", "in_reply_to": "", "references": "",
             "subject": "undeliverable", "from": "creator@example.com",  # unusual, but same lead address
