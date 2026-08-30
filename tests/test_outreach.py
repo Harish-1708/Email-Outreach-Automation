@@ -2634,7 +2634,132 @@ def test_get_or_create_ws_accepts_extra_trailing_custom_columns():
     existing_ws = FakeWs(header=["A", "B", "Industry", "JobTitle"])
     spreadsheet = FakeSpreadsheet(existing={"MyTab": existing_ws})
     ws = outreach._get_or_create_ws(spreadsheet, FakeGspreadModule, "MyTab", ["A", "B"])
-    assert ws is existing_ws  # accepted as-is, no error, custom columns preserved
+    assert ws._real is existing_ws  # accepted as-is, no error, custom columns preserved
+    # ...and wrapped for retry protection, not the raw object directly.
+    assert isinstance(ws, outreach._RetryingWorksheet)
+
+
+# =============================================================================
+# gspread retry logic — fixes a real production issue: a transient 503
+# from Google's own service (or a 429 rate limit) was previously fatal to
+# the whole workflow run, even though it's exactly the kind of error
+# worth simply waiting out and retrying.
+# =============================================================================
+
+def _make_gspread_api_error(status_code):
+    class _FakeResponse:
+        def __init__(self, code):
+            self.status_code = code
+
+        def json(self):
+            return {"error": {"code": self.status_code, "message": "test error"}}
+
+    return outreach.gspread.exceptions.APIError(_FakeResponse(status_code))
+
+
+def test_call_with_gspread_retries_succeeds_immediately_no_retry_needed(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: sleep_calls.append(s))
+    result = outreach._call_with_gspread_retries(lambda: "ok")
+    assert result == "ok"
+    assert sleep_calls == []
+
+
+def test_call_with_gspread_retries_retries_on_503_then_succeeds(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: sleep_calls.append(s))
+    attempts = {"count": 0}
+
+    def flaky():
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise _make_gspread_api_error(503)
+        return "finally worked"
+
+    result = outreach._call_with_gspread_retries(flaky)
+    assert result == "finally worked"
+    assert attempts["count"] == 3
+    assert sleep_calls == [2, 4]  # exponential backoff: 2s, then 4s
+
+
+def test_call_with_gspread_retries_retries_on_429_rate_limit(monkeypatch):
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: None)
+    attempts = {"count": 0}
+
+    def flaky():
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            raise _make_gspread_api_error(429)
+        return "ok"
+
+    assert outreach._call_with_gspread_retries(flaky) == "ok"
+
+
+def test_call_with_gspread_retries_raises_after_max_retries_exhausted(monkeypatch):
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: None)
+    attempts = {"count": 0}
+
+    def always_fails():
+        attempts["count"] += 1
+        raise _make_gspread_api_error(503)
+
+    with pytest.raises(outreach.gspread.exceptions.APIError):
+        outreach._call_with_gspread_retries(always_fails)
+    assert attempts["count"] == outreach.GSPREAD_MAX_RETRIES + 1  # every attempt actually happened
+
+
+def test_call_with_gspread_retries_never_retries_non_retryable_error(monkeypatch):
+    """A 403 Forbidden is a real permissions problem — retrying it would
+    just waste up to 14 seconds on something that will never succeed."""
+    sleep_calls = []
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: sleep_calls.append(s))
+    attempts = {"count": 0}
+
+    def fails_with_403():
+        attempts["count"] += 1
+        raise _make_gspread_api_error(403)
+
+    with pytest.raises(outreach.gspread.exceptions.APIError):
+        outreach._call_with_gspread_retries(fails_with_403)
+    assert attempts["count"] == 1  # never retried
+    assert sleep_calls == []
+
+
+def test_retrying_worksheet_retries_a_flaky_method_call(monkeypatch):
+    monkeypatch.setattr(outreach.time, "sleep", lambda s: None)
+
+    class FlakyRealWorksheet:
+        def __init__(self):
+            self.attempts = 0
+
+        def get_all_records(self):
+            self.attempts += 1
+            if self.attempts < 2:
+                raise _make_gspread_api_error(503)
+            return [{"a": 1}]
+
+    real = FlakyRealWorksheet()
+    wrapped = outreach._RetryingWorksheet(real)
+    assert wrapped.get_all_records() == [{"a": 1}]
+    assert real.attempts == 2
+
+
+def test_retrying_worksheet_passes_through_non_callable_attributes():
+    class RealWorksheet:
+        title = "My Tab"
+
+    wrapped = outreach._RetryingWorksheet(RealWorksheet())
+    assert wrapped.title == "My Tab"  # plain attribute, not wrapped into a callable
+
+
+def test_retrying_worksheet_propagates_non_retryable_error_immediately():
+    class RealWorksheet:
+        def get_all_records(self):
+            raise _make_gspread_api_error(404)
+
+    wrapped = outreach._RetryingWorksheet(RealWorksheet())
+    with pytest.raises(outreach.gspread.exceptions.APIError):
+        wrapped.get_all_records()
 
 
 def test_get_or_create_ws_rejects_missing_required_column():
