@@ -10,6 +10,7 @@ import os
 import re
 import sys
 from datetime import datetime
+from email.utils import parseaddr
 from typing import Dict, List, Optional
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +28,16 @@ def find_lead_for_response(response: Dict, leads: List[Dict]) -> Optional[Dict]:
     return None
 
 
+def extract_email_address(raw: str) -> str:
+    """'Rocky <harishdh16@gmail.com>' -> 'harishdh16@gmail.com'. A bare
+    'harishdh16@gmail.com' passes through unchanged. Uses the standard
+    library's own header-address parser rather than a hand-rolled regex,
+    since "Name <email>" is a real RFC 5322 format with edge cases
+    (quoted names, commas inside quotes) worth not re-deriving."""
+    _, address = parseaddr(raw or "")
+    return address or (raw or "").strip()
+
+
 def build_reply_defaults(response: Dict, lead: Optional[Dict]) -> Dict[str, str]:
     """Sensible starting values for the reply form — every field stays
     fully editable before sending. Sender account defaults to whichever
@@ -36,7 +47,7 @@ def build_reply_defaults(response: Dict, lead: Optional[Dict]) -> Dict[str, str]
     if subject and not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
     return {
-        "to": response.get("From", ""),
+        "to": extract_email_address(response.get("From", "")),
         "subject": subject or "Re:",
         "sender_account": (lead or {}).get("SenderAccount", ""),
     }
@@ -83,15 +94,21 @@ def validate_reply(to_email: str, body: str, sender_account: str, cc: List[str],
     return errors
 
 
-def build_reply_payload(response: Dict, lead: Optional[Dict], sender_account: str, subject: str,
+def build_reply_payload(response: Dict, lead: Optional[Dict], sender_account: str, to_email: str, subject: str,
                          body: str, cc: List[str], bcc: List[str],
                          attachments: Optional[List[Dict[str, str]]] = None) -> Dict:
-    """attachments (optional): [{"filename": str, "content_base64": str}, ...] —
-    already base64-encoded, ready to commit as JSON. See
-    build_attachment_entries for turning raw uploaded bytes into this shape."""
+    """to_email is whatever the caller's "To" field actually holds right
+    now — NOT re-derived from response["From"] here. The person can edit
+    that field (e.g. to fix a malformed address, or reply to someone
+    else entirely), and that edit has to actually take effect; silently
+    overriding it with the original raw From value would make the field
+    decorative. attachments (optional): [{"filename": str,
+    "content_base64": str}, ...] — already base64-encoded, ready to
+    commit as JSON. See build_attachment_entries for turning raw
+    uploaded bytes into this shape."""
     payload = {
         "sender_account": sender_account,
-        "to": response.get("From", ""),
+        "to": to_email,
         "subject": subject,
         "body": body,
         "in_reply_to": response.get("MessageID", ""),
