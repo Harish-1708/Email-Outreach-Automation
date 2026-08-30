@@ -32,9 +32,12 @@ directly — no GitHub trip, no pull request to approve.
   system's own mechanical classifications — Genuine Reply, Auto-Reply,
   Out of Office, Bounce Hard/Soft — not Instantly-style sentiment
   "Interested/Not Interested," which this doesn't do; see Known
-  limitations), by campaign, or to unread only. Reply directly from
-  here too, exactly the same tools as the per-campaign tab. Unread
-  tracking is session-only right now — see Known limitations.
+  limitations), by campaign, or to unread only — plus free-text search.
+  Click "💬 View full conversation" on any response for the real thread:
+  every stage actually sent, re-rendered live from your templates, and
+  every reply, in order. Reply directly from here too. Unread tracking
+  now persists (an explicit "Mark as read" + batched sync) — see Known
+  limitations for exactly how.
 - **📈 Overview** — every campaign at a glance: total leads, pending,
   sent, replies, reply rate.
 - **📊 Dashboard** — read-only deep-dive into one campaign. Uses a
@@ -149,11 +152,13 @@ Remove buttons on the Email Accounts page instead:
   Office, Bounce) — it doesn't judge what a reply actually says. Adding
   that would need a deliberate design decision (a rules engine or an
   LLM call), not a keyword guess that could misclassify a real prospect.
-- **Unread tracking on the Responses page resets each browser session.**
-  It lives in `st.session_state`, not the Sheet — Streamlit only ever
-  reads the Response Sheet today, and persisting read/unread state across
-  sessions would mean giving it a write path there, which is a real
-  permission decision, not something to add silently.
+- **Unread tracking persists across sessions now** — a response's
+  `IsRead` column in the Response Sheet is the source of truth, marked
+  via an explicit "✓ Mark as read" button. Marking is batched: click
+  "🔄 Sync read status (N pending)" to actually write it back, rather
+  than triggering a GitHub Actions run per response. Between marking and
+  syncing, the current session shows it as read immediately (an
+  optimistic local overlay) without waiting for the sync to land.
 - **This app never connects to SMTP/IMAP directly** — only GitHub
   Actions does, using a credential Streamlit never holds. Real email
   credentials living inside a public-facing web app would be a
