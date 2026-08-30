@@ -2015,6 +2015,105 @@ def test_cmd_send_reply_attachment_too_large_logs_and_exits_nonzero(monkeypatch,
 
 
 # =============================================================================
+# mark_responses_read / cmd_mark_responses_read — persistent unread tracking
+# =============================================================================
+
+def test_mark_responses_read_builds_correct_batch_update(monkeypatch):
+    captured = {}
+
+    class FakeResponsesWs:
+        def batch_update(self, updates):
+            captured["updates"] = updates
+
+    class FakeGspreadUtils:
+        @staticmethod
+        def rowcol_to_a1(row, col):
+            return f"R{row}C{col}"
+
+    sheets = outreach.SheetsConnector.__new__(outreach.SheetsConnector)
+    sheets.responses_ws = FakeResponsesWs()
+    sheets._gspread = type("G", (), {"utils": FakeGspreadUtils})()
+
+    result = sheets.mark_responses_read({"r1": 2, "r2": 5})
+
+    assert result == 2
+    assert len(captured["updates"]) == 2
+    assert {"range": "R2C14", "values": [["Yes"]]} in captured["updates"]
+    assert {"range": "R5C14", "values": [["Yes"]]} in captured["updates"]
+
+
+def test_mark_responses_read_empty_mapping_no_api_call(monkeypatch):
+    call_count = []
+
+    class FakeResponsesWs:
+        def batch_update(self, updates):
+            call_count.append(1)
+
+    sheets = outreach.SheetsConnector.__new__(outreach.SheetsConnector)
+    sheets.responses_ws = FakeResponsesWs()
+    sheets._gspread = type("G", (), {"utils": type("U", (), {"rowcol_to_a1": staticmethod(lambda r, c: "")})})()
+
+    result = sheets.mark_responses_read({})
+    assert result == 0
+    assert call_count == []  # never even attempted an empty batch update
+
+
+def test_get_all_responses_tracks_row_numbers():
+    fake_sheets = FakeSheets([])
+    fake_sheets.append_response({"ResponseID": "r1"})
+    fake_sheets.append_response({"ResponseID": "r2"})
+    responses = fake_sheets.get_all_responses()
+    assert responses[0]["_row"] == 2
+    assert responses[1]["_row"] == 3
+
+
+def test_cmd_mark_responses_read_marks_matching_ids(monkeypatch, tmp_path):
+    fake_sheets = FakeSheets([])
+    fake_sheets.append_response({"ResponseID": "r1"})
+    fake_sheets.append_response({"ResponseID": "r2"})
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+
+    payload_path = tmp_path / "mark_read.json"
+    payload_path.write_text(json.dumps({"response_ids": ["r1", "r2"]}))
+    args = argparse.Namespace(campaign="test_campaign", file=str(payload_path))
+    outreach.cmd_mark_responses_read(args)
+
+    assert len(fake_sheets.marked_read_calls) == 1
+    assert fake_sheets.marked_read_calls[0] == {"r1": 2, "r2": 3}
+
+
+def test_cmd_mark_responses_read_skips_ids_no_longer_present(monkeypatch, tmp_path, capsys):
+    fake_sheets = FakeSheets([])
+    fake_sheets.append_response({"ResponseID": "r1"})
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+
+    payload_path = tmp_path / "mark_read.json"
+    payload_path.write_text(json.dumps({"response_ids": ["r1", "r_gone"]}))
+    args = argparse.Namespace(campaign="test_campaign", file=str(payload_path))
+    outreach.cmd_mark_responses_read(args)
+
+    assert fake_sheets.marked_read_calls[0] == {"r1": 2}
+    out = capsys.readouterr().out
+    assert "Marked 1 of 2" in out
+    assert "r_gone" in out
+
+
+def test_cmd_mark_responses_read_empty_list_is_a_noop(monkeypatch, tmp_path, capsys):
+    fake_sheets = FakeSheets([])
+    monkeypatch.setattr(outreach, "get_campaign", lambda name, **kw: _base_campaign_cfg())
+    monkeypatch.setattr(outreach, "_connect_sheets", lambda cfg: fake_sheets)
+
+    payload_path = tmp_path / "mark_read.json"
+    payload_path.write_text(json.dumps({"response_ids": []}))
+    args = argparse.Namespace(campaign="test_campaign", file=str(payload_path))
+    outreach.cmd_mark_responses_read(args)
+
+    assert fake_sheets.marked_read_calls == []
+
+
+# =============================================================================
 # IMAP message parsing (pure — no real network)
 # =============================================================================
 
@@ -2137,6 +2236,7 @@ class FakeSheets:
         self.responses = []
         self.error_log = []
         self._logged_ids = set()
+        self.marked_read_calls = []
 
     def get_all_leads(self):
         return [dict(lead) for lead in self._leads]
@@ -2165,14 +2265,24 @@ class FakeSheets:
         self.responses.append(fields)
         self._logged_ids.add(fields.get("MessageID", ""))
 
+    def get_all_responses(self):
+        # Row numbers assigned in append order, matching the real
+        # SheetsConnector's "row 1 is header, data starts at row 2" rule.
+        return [dict(r, _row=i) for i, r in enumerate(self.responses, start=2)]
+
+    def mark_responses_read(self, response_id_to_row):
+        self.marked_read_calls.append(dict(response_id_to_row))
+        marked_rows = set(response_id_to_row.values())
+        for i, r in enumerate(self.responses, start=2):
+            if i in marked_rows:
+                r["IsRead"] = "Yes"
+        return len(response_id_to_row)
+
     def get_logged_message_ids(self):
         return set(self._logged_ids)
 
     def append_error_log(self, fields):
         self.error_log.append(fields)
-
-    def get_all_responses(self):
-        return list(self.responses)
 
     def get_all_send_log(self):
         return list(self.send_log)
