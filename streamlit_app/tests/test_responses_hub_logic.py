@@ -7,6 +7,7 @@ from responses_hub_logic import (
     tag_responses_with_campaign, response_key, filter_responses, count_unread,
     sort_responses_newest_first, get_campaign_names_present, build_reply_summary_label,
     find_response_by_key, STATUS_FILTER_ALL, INBOX_FILTER_ALL, INBOX_FILTER_UNREAD, search_responses,
+    is_response_read, split_keys_by_campaign, build_mark_read_payload,
 )
 
 
@@ -250,3 +251,64 @@ def test_search_responses_empty_list():
 
 def test_search_responses_handles_missing_fields_gracefully():
     assert search_responses([{}], "anything") == []
+
+
+# ---------- is_response_read ----------
+
+def test_is_response_read_true_when_sheet_says_yes():
+    response = _response(IsRead="Yes")
+    assert is_response_read(response, set()) is True
+
+
+def test_is_response_read_case_insensitive_and_alternate_truthy_values():
+    assert is_response_read(_response(IsRead="yes"), set()) is True
+    assert is_response_read(_response(IsRead="TRUE"), set()) is True
+    assert is_response_read(_response(IsRead="1"), set()) is True
+
+
+def test_is_response_read_false_when_sheet_blank_and_not_in_session():
+    response = _response(IsRead="")
+    assert is_response_read(response, set()) is False
+
+
+def test_is_response_read_true_via_session_overlay_even_if_sheet_blank():
+    """The optimistic local overlay — marked read this session, sync to
+    the Sheet hasn't landed yet, but the UI shouldn't look stuck."""
+    response = _response(_campaign="Foo", ResponseID="r1", IsRead="")
+    assert is_response_read(response, {"Foo:r1"}) is True
+
+
+def test_is_response_read_sheet_value_takes_precedence_regardless():
+    response = _response(_campaign="Foo", ResponseID="r1", IsRead="Yes")
+    assert is_response_read(response, set()) is True  # true even with an empty session overlay
+
+
+# ---------- split_keys_by_campaign ----------
+
+def test_split_keys_by_campaign_groups_correctly():
+    keys = {"Foo:r1", "Foo:r2", "Bar:r3"}
+    grouped = split_keys_by_campaign(keys)
+    assert set(grouped["Foo"]) == {"r1", "r2"}
+    assert grouped["Bar"] == ["r3"]
+
+
+def test_split_keys_by_campaign_empty_set():
+    assert split_keys_by_campaign(set()) == {}
+
+
+def test_split_keys_by_campaign_skips_malformed_keys():
+    keys = {"", "NoColonHere", "Foo:r1"}
+    grouped = split_keys_by_campaign(keys)
+    assert grouped == {"Foo": ["r1"]}
+
+
+# ---------- build_mark_read_payload ----------
+
+def test_build_mark_read_payload_shape():
+    payload = build_mark_read_payload(["r1", "r2"])
+    assert payload == {"response_ids": ["r1", "r2"]}
+
+
+def test_build_mark_read_payload_is_json_serializable():
+    import json
+    json.dumps(build_mark_read_payload(["r1"]))
