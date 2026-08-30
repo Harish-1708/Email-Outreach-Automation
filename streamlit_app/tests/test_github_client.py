@@ -237,6 +237,47 @@ def test_create_file_passes_correct_ref_when_checking_existing_sha(monkeypatch):
     assert captured["params"] == {"ref": "a-feature-branch"}
 
 
+# ---------- delete_file ----------
+
+def test_delete_file_fetches_sha_and_deletes(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(200, {"sha": "abc123"}))
+
+    def fake_delete(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return _fake_response(200, {})
+
+    monkeypatch.setattr(github_client.requests, "delete", fake_delete)
+    _client().delete_file("templates/Foo/followup2_A.txt", "Delete stage")
+
+    assert captured["url"].endswith("/contents/templates/Foo/followup2_A.txt")
+    assert captured["json"]["sha"] == "abc123"
+    assert captured["json"]["message"] == "Delete stage"
+
+
+def test_delete_file_is_a_noop_when_file_already_gone(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(404))
+    delete_called = []
+    monkeypatch.setattr(github_client.requests, "delete", lambda *a, **kw: delete_called.append(1))
+    _client().delete_file("templates/Foo/already_gone.txt", "msg")
+    assert delete_called == []  # never even attempted — nothing to delete
+
+
+def test_delete_file_raises_on_failure(monkeypatch):
+    monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(200, {"sha": "abc123"}))
+    monkeypatch.setattr(github_client.requests, "delete", lambda *a, **kw: _fake_response(422, text="conflict"))
+    with pytest.raises(GitHubActionsError, match="Failed to delete file"):
+        _client().delete_file("templates/Foo/intro_A.txt", "msg")
+
+
+def test_delete_file_accepts_200_or_204(monkeypatch):
+    for status in (200, 204):
+        monkeypatch.setattr(github_client.requests, "get", lambda *a, **kw: _fake_response(200, {"sha": "abc"}))
+        monkeypatch.setattr(github_client.requests, "delete", lambda *a, **kw: _fake_response(status, {}))
+        _client().delete_file("templates/Foo/intro_A.txt", "msg")  # doesn't raise
+
+
 # =============================================================================
 # Repository secrets — set/delete only, matching GitHub's write-only API.
 # encrypt_secret_value's tests use a REAL generated keypair and verify a
