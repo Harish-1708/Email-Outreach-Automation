@@ -953,7 +953,106 @@ def test_campaigns_hub_refresh_button_clears_caches_without_error():
     assert "Kelson_Creators_Licensing" in markdown_text  # data still shows after the cache clear + rerun
 
 
+def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status(tmp_path):
+    (tmp_path / "templates" / "Kelson_Creators_Licensing").mkdir(parents=True)
+    for filename, content in [("intro_A.txt", "Subject: Hi\n\nHello {{FirstName}}."),
+                               ("followup1_A.txt", "Subject: \n\nFollowing up.")]:
+        (tmp_path / "templates" / "Kelson_Creators_Licensing" / filename).write_text(content)
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+    (tmp_path / "config" / "campaigns" / "Kelson_Creators_Licensing.yaml").write_text(
+        "status: active\nsending:\n  daily_limit: 50\n"
+    )
 
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.TEMPLATES_ROOT", str(tmp_path / "templates")), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config" / "campaigns")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button.click()
+        at.run(timeout=15)
+
+        name_input = next(ti for ti in at.text_input if ti.key == "duplicate_campaign_new_name")
+        name_input.set_value("Kelson_Creators_Licensing_V2")
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "duplicate_campaign_confirm")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        duplicate_confirm_button = next(b for b in at.button if b.label == "Duplicate Campaign")
+        duplicate_confirm_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Duplicate raised: {list(at.exception)}"
+    assert list(at.error) == []
+
+    committed_paths = {c["path"] for c in commits_captured["commits"]}
+    assert committed_paths == {
+        "templates/Kelson_Creators_Licensing_V2/intro_A.txt",
+        "templates/Kelson_Creators_Licensing_V2/followup1_A.txt",
+        "config/campaigns/Kelson_Creators_Licensing_V2.yaml",
+    }
+    intro_commit = next(c for c in commits_captured["commits"]
+                         if c["path"] == "templates/Kelson_Creators_Licensing_V2/intro_A.txt")
+    assert intro_commit["content"] == b"Subject: Hi\n\nHello {{FirstName}}."
+
+    import yaml as _yaml
+    config_commit = next(c for c in commits_captured["commits"]
+                          if c["path"] == "config/campaigns/Kelson_Creators_Licensing_V2.yaml")
+    written_config = _yaml.safe_load(config_commit["content"].decode("utf-8"))
+    assert written_config["status"] == "draft"  # never inherits the source's Active status
+    assert written_config["sending"] == {"daily_limit": 50}
+
+
+def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path):
+    (tmp_path / "templates" / "Kelson_Creators_Licensing").mkdir(parents=True)
+    (tmp_path / "templates" / "Kelson_Creators_Licensing" / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    (tmp_path / "templates" / "OtherCampaign").mkdir(parents=True)
+    (tmp_path / "templates" / "OtherCampaign" / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("config.TEMPLATES_ROOT", str(tmp_path / "templates")), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config" / "campaigns")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button.click()
+        at.run(timeout=15)
+
+        name_input = next(ti for ti in at.text_input if ti.key == "duplicate_campaign_new_name")
+        name_input.set_value("OtherCampaign")
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "duplicate_campaign_confirm")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        duplicate_confirm_button = next(b for b in at.button if b.label == "Duplicate Campaign")
+        duplicate_confirm_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "already exists" in error_texts
+    assert commits_captured.get("commits", []) == []  # nothing committed when the name is rejected
+
+
+def test_campaigns_detail_view_renders_analytics_without_exceptions():
     """Directly sets selected_campaign in session_state, bypassing the
     click — proves the detail view + Analytics tab (Phase B, real data,
     not a stub) work end to end against realistic Sheet data."""
