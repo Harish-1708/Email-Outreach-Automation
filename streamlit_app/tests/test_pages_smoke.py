@@ -1886,6 +1886,59 @@ def test_sequences_tab_add_variant_maxed_out_for_real_campaign():
     assert "already has all 5 stages" in info_texts
 
 
+def test_sequences_tab_successive_add_variant_never_carries_over_prior_content(tmp_path):
+    """The actual reported bug: adding Variant B with real content, then
+    later opening 'Add Variant C', showed B's content pre-filled instead
+    of starting blank — because the widgets were keyed only by stage,
+    not by which variant letter was being added, so Streamlit reused
+    the same widget state across the two separate additions."""
+    campaign_dir = tmp_path / "SeqCarryoverCampaign"
+    campaign_dir.mkdir()
+    (campaign_dir / "intro_A.txt").write_text("Subject: Hi\n\nBody.")
+
+    fake_ws = {
+        "SeqCarryoverCampaign Master Sheet": FakeWorksheet([], header=["LeadID", "Email", "Approval"]),
+        "SeqCarryoverCampaign Response Sheet": FakeWorksheet([]),
+        "SeqCarryoverCampaign Custom Log Sheet": FakeWorksheet([]),
+        "SeqCarryoverCampaign Error Log": FakeWorksheet([]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    captured, fake_create_file = _mock_github_writes()
+    variant_state = {"filenames": ["intro_A.txt"]}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": list(variant_state["filenames"])), \
+         patch("config.TEMPLATES_ROOT", str(tmp_path)):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "SeqCarryoverCampaign"
+        at.run(timeout=15)
+
+        # Type distinct content into "Add Variant B" and submit it.
+        subject_b = next(ti for ti in at.text_input if (ti.key or "").endswith("_B"))
+        subject_b.set_value("Variant B's own subject")
+        at.run(timeout=15)
+        add_b_button = next(b for b in at.button if b.label == "Add Variant B")
+        add_b_button.click()
+        at.run(timeout=15)
+
+        # Simulate the commit having landed — B now exists live.
+        variant_state["filenames"] = ["intro_A.txt", "intro_B.txt"]
+        (campaign_dir / "intro_B.txt").write_text("Subject: Variant B's own subject\n\nBody.")
+        at.run(timeout=15)
+
+        # Now "Add Variant C" must start completely blank.
+        subject_c = next(ti for ti in at.text_input if (ti.key or "").endswith("_C"))
+        assert subject_c.value in ("", None)
+
+    assert list(at.exception) == []
+
+
 def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
     """Uses a synthetic partial campaign (2 stages, 1 variant) so "Add
     Variant B" is actually available to test, unlike the real fixture
