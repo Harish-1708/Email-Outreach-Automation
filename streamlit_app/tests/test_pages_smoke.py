@@ -2036,7 +2036,11 @@ def test_delete_variant_actually_deletes_every_stage_file(tmp_path):
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
-         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+         patch("github_client.GitHubClient.delete_file", fake_delete_file), \
+         patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": [f"{stage}_{v}.txt" for stage in
+                                                ["intro", "followup1", "followup2", "followup3", "followup4"]
+                                                for v in "ABCD"]):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
@@ -2083,7 +2087,12 @@ def test_delete_stage_only_offered_for_the_last_stage():
     assert "followup4" in markdown_text  # offered stage is genuinely the last one
 
 
-def test_delete_stage_actually_deletes_all_variant_files_for_it():
+def test_delete_stage_blocks_when_live_github_structure_disagrees_with_the_page():
+    """The actual production bug this fixes: a stale local view can show
+    followup4 as the last stage while GitHub's real, live structure has
+    already changed (e.g. right after a duplication that hadn't fully
+    redeployed yet, or a broken campaign missing some variants). The
+    delete must refuse rather than act on the page's outdated belief."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
@@ -2092,7 +2101,45 @@ def test_delete_stage_actually_deletes_all_variant_files_for_it():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
-         patch("github_client.GitHubClient.delete_file", fake_delete_file):
+         patch("github_client.GitHubClient.delete_file", fake_delete_file), \
+         patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": [f"{stage}_{v}.txt" for stage in ["intro", "followup1"]
+                                                for v in "ABCD"]):  # GitHub's live truth: only 2 stages now
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_delete_stage")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        delete_button = next(b for b in at.button if b.key == "delete_stage_button")
+        delete_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "out of date" in error_texts
+    assert deleted_paths == []  # nothing was deleted based on the stale assumption
+
+
+
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    deleted_paths = []
+
+    def fake_delete_file(self, path, message, branch="main"):
+        deleted_paths.append(path)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.delete_file", fake_delete_file), \
+         patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": [f"{stage}_{v}.txt" for stage in
+                                                ["intro", "followup1", "followup2", "followup3", "followup4"]
+                                                for v in "ABCD"]):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
