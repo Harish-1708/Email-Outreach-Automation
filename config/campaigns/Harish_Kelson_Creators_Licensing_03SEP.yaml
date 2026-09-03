@@ -9,3 +9,8 @@ schedule:
   - thu
   - fri
 status: paused
+sending:
+  daily_limit: 100
+  sender_rotation: false
+  rotation_accounts:
+  - sales1
