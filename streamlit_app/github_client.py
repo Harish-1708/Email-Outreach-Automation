@@ -98,6 +98,36 @@ class GitHubClient:
             raise GitHubActionsError(f"Failed to check existing file '{path}': {resp.status_code} {resp.text[:300]}")
         return resp.json().get("sha")
 
+    def list_directory_files(self, path: str, ref: str = "main") -> List[str]:
+        """Filenames (not full paths) directly inside a repo directory,
+        read fresh from GitHub's own current state — deliberately NOT the
+        local filesystem Streamlit Cloud happens to have checked out,
+        which can lag behind a very recent commit until the next
+        redeploy finishes. Returns [] if the directory doesn't exist,
+        rather than raising — callers that need "must actually have
+        files" should check for that themselves (see
+        campaign_builder.build_campaign_duplication_files, which refuses
+        to proceed on an empty result rather than silently creating a
+        duplicate with nothing in it)."""
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/contents/{path}"
+        resp = requests.get(url, headers=self._headers, params={"ref": ref}, timeout=self.timeout)
+        if resp.status_code == 404:
+            return []
+        if resp.status_code != 200:
+            raise GitHubActionsError(f"Failed to list '{path}': {resp.status_code} {resp.text[:300]}")
+        entries = resp.json()
+        return [entry["name"] for entry in entries if entry.get("type") == "file"]
+
+    def get_file_content(self, path: str, ref: str = "main") -> bytes:
+        """Raw bytes of one file's current content, read fresh from
+        GitHub — same "authoritative, never the local checkout" reason
+        as list_directory_files. Raises if the file doesn't exist."""
+        url = f"{GITHUB_API}/repos/{self.owner}/{self.repo}/contents/{path}"
+        resp = requests.get(url, headers=self._headers, params={"ref": ref}, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise GitHubActionsError(f"Failed to read '{path}': {resp.status_code} {resp.text[:300]}")
+        return base64.b64decode(resp.json()["content"])
+
     def create_file(self, path: str, content_bytes: bytes, message: str, branch: str = "main") -> None:
         """Creates OR updates a file at `path`. Every write in this app —
         new templates, edited templates, campaign settings — goes through
