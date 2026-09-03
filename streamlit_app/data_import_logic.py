@@ -181,7 +181,7 @@ def filter_leads(leads: List[Dict], status_filter: str) -> List[Dict]:
         return [l for l in leads if l.get("Status") == "Stopped - Bounced"]
     if status_filter == FILTER_IN_PROGRESS:
         return [l for l in leads
-                if l.get("Approval") == "Yes" and not (l.get("Status") or "").startswith("Stopped")
+                if (l.get("IntroSentAt") or "").strip() and not (l.get("Status") or "").startswith("Stopped")
                 and l.get("Status") != "Removed"]
     return leads
 
@@ -197,3 +197,32 @@ def search_leads(leads: List[Dict], query: str) -> List[Dict]:
         or q in (l.get("Email") or "").lower()
         or q in (l.get("Company") or "").lower()
     ]
+
+
+def build_full_lead_table(leads: List[Dict], header_order: Optional[List[str]] = None) -> Dict[str, List]:
+    """Builds a {column_name: [values]} dict covering EVERY field
+    present across the leads, not a fixed subset — so custom columns
+    from a CSV import (Client, Product, Content Score, etc.) show up in
+    the table automatically, the same way they already do in the Sheet
+    itself. '_row' (internal bookkeeping — the Sheet row number, never
+    meant for display) is always excluded.
+
+    Column order: header_order (the Sheet's own actual column order,
+    fetched separately) determines the order for any column it names;
+    anything present in the leads but not in header_order (shouldn't
+    normally happen, but a defensive fallback in case a lead somehow
+    has a field the current header doesn't) is appended afterward,
+    alphabetically, so nothing is ever silently dropped from view."""
+    all_keys = set()
+    for lead in leads:
+        all_keys.update(lead.keys())
+    all_keys.discard("_row")
+
+    if header_order:
+        ordered_keys = [k for k in header_order if k in all_keys]
+        remaining = sorted(all_keys - set(header_order))
+        ordered_keys += remaining
+    else:
+        ordered_keys = sorted(all_keys)
+
+    return {key: [lead.get(key, "") for lead in leads] for key in ordered_keys}
