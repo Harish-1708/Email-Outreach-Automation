@@ -14,3 +14,6 @@ sending:
   sender_rotation: false
   rotation_accounts:
   - sales1
+asana:
+  enabled: true
+  project_name: Creator Outreach
