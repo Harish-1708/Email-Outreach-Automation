@@ -1,6 +1,6 @@
 status: active
 asana:
-  enabled: true
+  enabled: false
   project_name: Creator Outreach
 schedule:
   timezone: America/New_York
