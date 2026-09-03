@@ -176,13 +176,31 @@ Remove buttons on the Email Accounts page instead:
   own widget state works, not something a live data source can override.
   A fresh page load (closing and reopening, or a different tab) always
   reflects the current truth.
-- **CSV import can create a genuinely new custom field**, not just map
-  a column to one that already exists as a Sheet column from some
-  earlier import — pick "➕ New custom field..." and type the exact
-  name (e.g. `Client`, `Product`, `Content Score` — anything Asana Sync
-  looks for). Naming it the same as one of the system's own tracked
-  columns (`Status`, `IntroSentAt`, etc.) is rejected outright, since
-  that would silently corrupt real tracking data on the next import.
+- **A CSV column that doesn't match anything existing defaults straight
+  to a new custom field using its own name** — no extra click, no
+  retyping the same name you can already see in the column header.
+  "➕ New custom field..." stays available if you actually want a
+  DIFFERENT name than the CSV's own header. Naming a custom field the
+  same as one of the system's own tracked columns (`Status`,
+  `IntroSentAt`, etc.) is rejected outright, since that would silently
+  corrupt real tracking data on the next import.
+- **A brand-new custom field name is only useful if the Master Sheet
+  actually gains that column** — import now widens the Sheet's header
+  first, for every field name across every lead in the batch, before
+  writing any rows. An earlier version silently dropped anything that
+  wasn't already a column, which meant a CSV import could report success
+  on GitHub while custom field data (Client, Product, etc.) never
+  actually reached the Sheet at all. Widening also expands the Sheet's
+  own grid width first if needed — a tab's column count is fixed at
+  whatever it was when first created, and writing past that limit is
+  rejected outright by Google's API regardless of how correct the
+  content is.
+- **A CSV with the same column name twice is detected and warned about,
+  never a crash.** Python's own CSV parser silently keeps only the
+  LAST duplicate-named column's value per row before this app even
+  sees the data — the warning names which column(s) are affected so you
+  can fix it in the source file (rename one) and re-upload, rather than
+  silently importing with data already missing.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
