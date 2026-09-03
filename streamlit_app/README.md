@@ -214,6 +214,20 @@ Remove buttons on the Email Accounts page instead:
   outright with a 400, regardless of how correct the project name is.
   Every workspace the token's owner belongs to is searched, not just
   the first, in case the account spans more than one.
+- **A task's name is kept in sync on every update, not just set once at
+  creation** — the naming convention (`Client | CreatorHandle –
+  Product`) falls back to a plain "Creator" column for the handle when
+  there's no separate "CreatorHandle" column, matching how a real
+  campaign's sheet commonly labels it. Because the name updates every
+  sync, any task created before this fallback existed self-corrects
+  automatically the next time sync runs — no manual renaming needed
+  in Asana.
+- **Lead fields are always coerced to strings before use in Asana
+  sync** — gspread types a cell's value by what it LOOKS like, not
+  what column it's in, so a numeric-looking value (an Asana task GID
+  is a long run of digits) comes back as a Python `int`. Every
+  already-synced lead hit exactly this on the next sync run before it
+  was fixed.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
