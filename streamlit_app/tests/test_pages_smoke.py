@@ -1367,6 +1367,53 @@ def test_data_tab_shows_error_when_no_column_mapped_to_email():
     assert "Email" in error_texts
 
 
+def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks():
+    """The actual UX fix — an unmatched CSV column must default straight
+    to a new custom field using its own name, with no need to pick
+    "New custom field" and retype the exact same name that's already
+    right there as the column header."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured["content"] = content_bytes
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"Email,Client,Product\nsam@abc.com,DudeRobe,SheRobe\n", "text/csv")
+        at.run(timeout=15)
+
+        # No interaction with the dropdowns at all — the default must
+        # already be correct.
+        client_select = next(sb for sb in at.selectbox if sb.key == "map_Client")
+        assert client_select.value == "Client"
+        product_select = next(sb for sb in at.selectbox if sb.key == "map_Product")
+        assert product_select.value == "Product"
+
+        import_button = next(b for b in at.button if b.label == "Import Leads")
+        import_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Import raised: {list(at.exception)}"
+    assert list(at.error) == []
+    import json
+    payload = json.loads(captured["content"].decode("utf-8"))
+    assert payload["leads"][0]["Client"] == "DudeRobe"
+    assert payload["leads"][0]["Product"] == "SheRobe"
+
+
 def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
     """The real gap this fixes: a column with no existing match (never
     imported before) previously had no way to become a custom field at
