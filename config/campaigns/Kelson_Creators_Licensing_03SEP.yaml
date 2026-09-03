@@ -9,3 +9,6 @@ schedule:
   - wed
   - thu
   - fri
+asana:
+  enabled: false
+  project_name: ''
