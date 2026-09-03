@@ -1550,6 +1550,49 @@ def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
     assert len(matching_selects) == 2
 
 
+def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
+    """The tool built for exactly the reported issue: leads confirmed
+    in the real Sheet not showing up in the app after repeated
+    refreshing. This lets the actual tab name and a live (uncached)
+    count be checked directly, rather than guessing at the cause."""
+    fake_ws = _campaigns_page_fake_ws()
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    # Simulate the real scenario: more leads exist live than the cached
+    # value the page rendered with.
+    original_get_all_leads = fake_ws["Kelson_Creators_Licensing Master Sheet"].get_all_records
+    call_count = {"n": 0}
+
+    def flaky_get_all_records():
+        call_count["n"] += 1
+        records = original_get_all_leads()
+        if call_count["n"] == 1:
+            return records  # the page's own initial (cached) render
+        return records + [{"Email": "new@abc.com", "Approval": "Pending"}]  # the live check
+
+    fake_ws["Kelson_Creators_Licensing Master Sheet"].get_all_records = flaky_get_all_records
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        markdown_text = " ".join(m.value for m in at.markdown)
+        assert "Kelson_Creators_Licensing Master Sheet" in markdown_text  # the exact tab name, visible
+
+        live_check_button = next(b for b in at.button if b.key == "data_tab_live_diagnostic")
+        live_check_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "differ" in warning_texts.lower()  # correctly detects the mismatch
+
+
 def test_data_tab_lead_table_and_remove_flow():
     fake_ws = {
         "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
