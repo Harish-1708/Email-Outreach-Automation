@@ -479,8 +479,10 @@ def _render_data_tab(campaign_cfg, leads):
             "Jane,Smith,jane@example.com,Acme Inc",
             language="csv",
         )
-        st.caption(f"Recognized fields: {', '.join(KNOWN_FIELDS)}. Only Email is required — any other "
-                   "column becomes a custom field on the lead (visible in the Master Sheet as extra columns).")
+        st.caption(f"{', '.join(KNOWN_FIELDS)} are recognized automatically. Only Email is required — any "
+                   "other column becomes a custom field on the lead using its own column name (visible in "
+                   "the Master Sheet as extra columns, and picked up automatically by Asana Sync if the "
+                   "name matches one of its fields — Client, Product, Content Score, etc.).")
         uploaded = st.file_uploader("Upload CSV", type=["csv"], key="data_csv_upload")
         if uploaded is not None:
             columns, rows = parse_csv_bytes(uploaded.getvalue())
@@ -493,17 +495,24 @@ def _render_data_tab(campaign_cfg, leads):
                 except Exception:  # noqa: BLE001 - tab may not exist yet for a brand new campaign
                     custom_columns = []
 
-                st.caption(f"{len(rows)} row(s) detected. Map each column below (or leave as Skip). To "
-                           "bring in creator-outreach data (Client, Product, Content Score, etc. — anything "
-                           "Asana Sync looks for), pick \"➕ New custom field...\" and type the exact name.")
+                st.caption(f"{len(rows)} row(s) detected. Every column is mapped automatically below — "
+                           "change any of them, or pick Skip to leave one out.")
                 mapping = {}
                 custom_field_name_errors = []
-                default_mapping = build_default_mapping(columns, custom_columns)
-                target_options = ["-- Skip --"] + KNOWN_FIELDS + custom_columns + [NEW_CUSTOM_FIELD_OPTION]
+                default_mapping = build_default_mapping(columns, custom_columns, outreach.MASTER_COLUMNS)
                 for col in columns:
                     default = default_mapping.get(col) or "-- Skip --"
-                    default_idx = target_options.index(default) if default in target_options else 0
-                    choice = st.selectbox(f"'{col}' maps to", target_options, index=default_idx,
+                    # The column's own name is always a valid option in ITS
+                    # OWN dropdown, even when it isn't yet a known or
+                    # existing field — this is what lets a brand-new custom
+                    # field default automatically, with no extra clicks or
+                    # retyping the same name a second time.
+                    col_options = ["-- Skip --"] + KNOWN_FIELDS + custom_columns
+                    if default not in col_options and default != "-- Skip --":
+                        col_options = col_options + [default]
+                    col_options = col_options + [NEW_CUSTOM_FIELD_OPTION]
+                    default_idx = col_options.index(default) if default in col_options else 0
+                    choice = st.selectbox(f"'{col}' maps to", col_options, index=default_idx,
                                            key=f"map_{col}")
                     if choice == NEW_CUSTOM_FIELD_OPTION:
                         new_field_name = st.text_input(f"New field name for '{col}'", key=f"map_new_field_{col}")
