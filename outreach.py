@@ -2910,6 +2910,14 @@ ASANA_MANUAL_ONLY_STAGES = {ASANA_STAGE_RIGHTS_SECURED, ASANA_STAGE_DECLINED_DEA
 # data" signal in build_asana_custom_fields_payload.
 _ASANA_RESERVED_LEAD_FIELDS = set(MASTER_COLUMNS) | {"_row", "AsanaTaskGID"}
 
+# A handful of Asana field names have an obvious, exact equivalent already
+# tracked by the email system under a different name — falling back to that
+# rather than requiring the SAME data typed twice under a second column.
+# Checked only when the lead has no column of its own with a matching name.
+_ASANA_FIELD_NAME_FALLBACKS = {
+    "creator email": "Email",
+}
+
 
 def compute_lead_asana_stage(lead: Dict) -> str:
     """Derives where a lead sits in the Asana creator-outreach pipeline
@@ -2965,6 +2973,28 @@ def _match_asana_option(value: str, options: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _apply_value_to_asana_field(payload: Dict[str, object], defn: Dict, value_str: str) -> None:
+    field_type = defn["type"]
+    if field_type == "text":
+        payload[defn["gid"]] = value_str
+    elif field_type == "number":
+        try:
+            payload[defn["gid"]] = float(value_str)
+        except ValueError:
+            pass
+    elif field_type == "date":
+        payload[defn["gid"]] = {"date": value_str[:10]}
+    elif field_type == "enum":
+        option_gid = _match_asana_option(value_str, defn["options"])
+        if option_gid:
+            payload[defn["gid"]] = option_gid
+    elif field_type == "multi_enum":
+        tokens = [t.strip() for t in value_str.split(",") if t.strip()]
+        option_gids = [g for g in (_match_asana_option(t, defn["options"]) for t in tokens) if g]
+        if option_gids:
+            payload[defn["gid"]] = option_gids
+
+
 def build_asana_custom_fields_payload(lead: Dict, custom_field_defs: Dict[str, Dict]) -> Dict[str, object]:
     """Maps whatever EXTRA columns a lead has (anything beyond the
     standard outreach-tracking ones in MASTER_COLUMNS) onto the target
@@ -2977,12 +3007,21 @@ def build_asana_custom_fields_payload(lead: Dict, custom_field_defs: Dict[str, D
     every field); an enum/multi_enum value with no matching option is
     also skipped rather than guessed at.
 
+    A small set of Asana field names (_ASANA_FIELD_NAME_FALLBACKS) fall
+    back to an equivalent column the email system already has under a
+    different name (e.g. Asana's "Creator Email" <- the lead's own
+    "Email") — but only when the lead has no column of its own that
+    directly matches that Asana field name; an explicit column always
+    wins over a fallback.
+
     custom_field_defs: {field_name: {"gid": str, "type": str,
     "options": {option_name: option_gid}}} — see
     asana_get_project_structure, which builds this from the live
     project."""
     field_defs_by_lower_name = {name.lower(): defn for name, defn in custom_field_defs.items()}
     payload: Dict[str, object] = {}
+    matched_field_names_lower = set()
+
     for key, raw_value in lead.items():
         if key in _ASANA_RESERVED_LEAD_FIELDS:
             continue
@@ -2992,25 +3031,21 @@ def build_asana_custom_fields_payload(lead: Dict, custom_field_defs: Dict[str, D
         defn = field_defs_by_lower_name.get(key.lower())
         if not defn:
             continue
-        field_type = defn["type"]
-        if field_type == "text":
-            payload[defn["gid"]] = value_str
-        elif field_type == "number":
-            try:
-                payload[defn["gid"]] = float(value_str)
-            except ValueError:
-                continue
-        elif field_type == "date":
-            payload[defn["gid"]] = {"date": value_str[:10]}
-        elif field_type == "enum":
-            option_gid = _match_asana_option(value_str, defn["options"])
-            if option_gid:
-                payload[defn["gid"]] = option_gid
-        elif field_type == "multi_enum":
-            tokens = [t.strip() for t in value_str.split(",") if t.strip()]
-            option_gids = [g for g in (_match_asana_option(t, defn["options"]) for t in tokens) if g]
-            if option_gids:
-                payload[defn["gid"]] = option_gids
+        _apply_value_to_asana_field(payload, defn, value_str)
+        matched_field_names_lower.add(key.lower())
+
+    for target_field_lower, source_column in _ASANA_FIELD_NAME_FALLBACKS.items():
+        if target_field_lower in matched_field_names_lower:
+            continue
+        defn = field_defs_by_lower_name.get(target_field_lower)
+        if not defn:
+            continue
+        raw_value = lead.get(source_column)
+        value_str = str(raw_value).strip() if raw_value is not None else ""
+        if not value_str:
+            continue
+        _apply_value_to_asana_field(payload, defn, value_str)
+
     return payload
 
 
