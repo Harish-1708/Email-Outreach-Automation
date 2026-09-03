@@ -1397,9 +1397,9 @@ def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks():
 
         # No interaction with the dropdowns at all — the default must
         # already be correct.
-        client_select = next(sb for sb in at.selectbox if sb.key == "map_Client")
+        client_select = next(sb for sb in at.selectbox if (sb.key or "").endswith("_Client"))
         assert client_select.value == "Client"
-        product_select = next(sb for sb in at.selectbox if sb.key == "map_Product")
+        product_select = next(sb for sb in at.selectbox if (sb.key or "").endswith("_Product"))
         assert product_select.value == "Product"
 
         import_button = next(b for b in at.button if b.label == "Import Leads")
@@ -1441,11 +1441,11 @@ def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
         at.run(timeout=15)
 
-        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select = next(sb for sb in at.selectbox if (sb.key or "").endswith("_Brand"))
         brand_select.set_value("\u2795 New custom field...")
         at.run(timeout=15)
 
-        new_field_input = next(ti for ti in at.text_input if ti.key == "map_new_field_Brand")
+        new_field_input = next(ti for ti in at.text_input if (ti.key or "").endswith("_Brand"))
         new_field_input.set_value("Client")
         at.run(timeout=15)
 
@@ -1478,11 +1478,11 @@ def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name():
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
         at.run(timeout=15)
 
-        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select = next(sb for sb in at.selectbox if (sb.key or "").endswith("_Brand"))
         brand_select.set_value("\u2795 New custom field...")
         at.run(timeout=15)
 
-        new_field_input = next(ti for ti in at.text_input if ti.key == "map_new_field_Brand")
+        new_field_input = next(ti for ti in at.text_input if (ti.key or "").endswith("_Brand"))
         new_field_input.set_value("Status")  # a real MASTER_COLUMNS name
         at.run(timeout=15)
 
@@ -1507,13 +1507,47 @@ def test_data_tab_new_custom_field_blank_name_blocks_import():
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
         at.run(timeout=15)
 
-        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select = next(sb for sb in at.selectbox if (sb.key or "").endswith("_Brand"))
         brand_select.set_value("\u2795 New custom field...")
         at.run(timeout=15)
 
     assert list(at.exception) == []
     error_texts = " ".join(e.value for e in at.error)
     assert "Enter a name" in error_texts
+
+
+def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
+    """The actual reported crash: a CSV with the same column header
+    twice caused a StreamlitDuplicateElementKey error, since both
+    dropdowns shared a key built purely from the column name. Must
+    never crash, and must warn clearly that data behind the earlier
+    duplicate is already gone (a real Python csv.DictReader behavior,
+    not something this page can recover after the fact)."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload(
+            "leads.csv",
+            b"Email,Last Contact Date,Last Contact Date\nsam@abc.com,2026-08-01,2026-08-02\n",
+            "text/csv",
+        )
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Duplicate column crashed the page: {list(at.exception)}"
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "Last Contact Date" in warning_texts
+    assert "only" in warning_texts.lower() and "last" in warning_texts.lower()
+    # Two distinct dropdowns really were rendered — no silent collapse.
+    matching_selects = [sb for sb in at.selectbox if "Last Contact Date" in (sb.label or "")]
+    assert len(matching_selects) == 2
 
 
 def test_data_tab_lead_table_and_remove_flow():
