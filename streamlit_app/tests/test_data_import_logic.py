@@ -8,7 +8,7 @@ from data_import_logic import (
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping,
     count_valid_rows, build_import_payload, import_payload_path,
     build_removal_payload, removal_payload_path, payload_to_bytes,
-    filter_leads, search_leads,
+    filter_leads, search_leads, validate_custom_field_name,
     FILTER_ALL, FILTER_PENDING_APPROVAL, FILTER_IN_PROGRESS, FILTER_REPLIED,
     FILTER_BOUNCED, FILTER_REMOVED,
 )
@@ -196,3 +196,39 @@ def test_search_empty_query_returns_all():
 def test_search_no_match_returns_empty():
     leads = [_lead()]
     assert search_leads(leads, "nomatch") == []
+
+
+# ---------- validate_custom_field_name ----------
+
+def test_validate_custom_field_name_accepts_a_reasonable_new_name():
+    assert validate_custom_field_name("Client", reserved_names=["Email", "Status"]) is None
+
+
+def test_validate_custom_field_name_rejects_blank():
+    error = validate_custom_field_name("", reserved_names=["Email"])
+    assert error is not None
+    assert "Enter a name" in error
+
+
+def test_validate_custom_field_name_rejects_whitespace_only():
+    error = validate_custom_field_name("   ", reserved_names=["Email"])
+    assert error is not None
+
+
+def test_validate_custom_field_name_rejects_reserved_system_column():
+    """The actual data-corruption risk this exists to prevent — a custom
+    field literally named the same as a real system-tracked column
+    (e.g. 'Status', 'IntroSentAt') would silently overwrite that
+    column's real tracking data on the next import."""
+    error = validate_custom_field_name("Status", reserved_names=["Email", "Status", "IntroSentAt"])
+    assert error is not None
+    assert "already used internally" in error
+
+
+def test_validate_custom_field_name_rejects_reserved_name_case_insensitively():
+    error = validate_custom_field_name("status", reserved_names=["Status"])
+    assert error is not None
+
+
+def test_validate_custom_field_name_allows_name_after_stripping_whitespace():
+    assert validate_custom_field_name("  Client  ", reserved_names=["Email"]) is None
