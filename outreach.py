@@ -86,6 +86,10 @@ MASTER_COLUMNS = [
                                 # line blank to continue this same thread
                                 # ("Re: <ThreadSubject>") instead of starting a
                                 # new one — see render_email / Section 5.
+    "AsanaTaskGID",            # Set automatically the first time a lead is synced
+                                # to Asana — checked before every future sync so a
+                                # lead never gets a second task created for it.
+                                # Never edit this by hand.
 ]
 # NOTE: this is the REQUIRED prefix of the Master header row. You may add
 # extra columns of your own AFTER these (e.g. "Industry", "JobTitle") and
@@ -2884,6 +2888,365 @@ def cmd_remove_leads(args):
         print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
 
 
+ASANA_API_BASE = "https://app.asana.com/api/1.0"
+ASANA_MAX_RETRIES = 3
+ASANA_RETRY_BASE_DELAY_SECONDS = 2
+
+# The Asana pipeline stage a lead sits in. The first four are auto-derived
+# from data the email system already tracks (see compute_lead_asana_stage);
+# the last two are real human business decisions — a sync run must NEVER
+# set or move a task into or out of either one on its own. See
+# decide_asana_sync_action for how that's actually enforced.
+ASANA_STAGE_SOURCED = "Sourced"
+ASANA_STAGE_OUTREACH_SENT = "Outreach Sent"
+ASANA_STAGE_FOLLOWUP = "Follow-up"
+ASANA_STAGE_NEGOTIATING = "Negotiating"
+ASANA_STAGE_RIGHTS_SECURED = "Rights Secured"
+ASANA_STAGE_DECLINED_DEAD = "Declined / Dead"
+ASANA_MANUAL_ONLY_STAGES = {ASANA_STAGE_RIGHTS_SECURED, ASANA_STAGE_DECLINED_DEAD}
+
+# Columns the email system itself owns — never treated as a custom field to
+# push to Asana, and never used as the "does this look like extra creator
+# data" signal in build_asana_custom_fields_payload.
+_ASANA_RESERVED_LEAD_FIELDS = set(MASTER_COLUMNS) | {"_row", "AsanaTaskGID"}
+
+
+def compute_lead_asana_stage(lead: Dict) -> str:
+    """Derives where a lead sits in the Asana creator-outreach pipeline
+    from data the email system already tracks — never guesses Rights
+    Secured or Declined / Dead, since those are real human decisions,
+    not something inferable from send/reply timestamps. Checked most-
+    advanced-state-first, so a lead with both a follow-up sent AND a
+    reply logged correctly lands on Negotiating, not Follow-up."""
+    if (lead.get("ReplyStatus") or "").strip() == "Replied":
+        return ASANA_STAGE_NEGOTIATING
+    for index in range(1, 5):
+        if (lead.get(f"FollowUp{index}SentAt") or "").strip():
+            return ASANA_STAGE_FOLLOWUP
+    if (lead.get("IntroSentAt") or "").strip():
+        return ASANA_STAGE_OUTREACH_SENT
+    return ASANA_STAGE_SOURCED
+
+
+def decide_asana_sync_action(lead: Dict, current_asana_section_name: Optional[str]) -> Dict:
+    """Pure decision logic — no network calls here, which is exactly why
+    this is tested exhaustively on its own. Returns
+    {"action": "create" | "update", "target_stage": str or None}.
+
+    "create" only ever happens when the lead has no AsanaTaskGID stored
+    yet — this, plus the caller always writing that GID back immediately
+    after creating, is the entire no-duplicates guarantee: re-running
+    sync any number of times against the same lead is a no-op for
+    creation, every time.
+
+    target_stage is None when the task's current section is a manual-
+    only stage (Rights Secured / Declined / Dead) — the caller must
+    still update the task's other fields, but must never move it out of
+    a stage a human deliberately put it in."""
+    has_existing_task = bool((lead.get("AsanaTaskGID") or "").strip())
+    computed_stage = compute_lead_asana_stage(lead)
+    if not has_existing_task:
+        return {"action": "create", "target_stage": computed_stage}
+    if current_asana_section_name in ASANA_MANUAL_ONLY_STAGES:
+        return {"action": "update", "target_stage": None}
+    return {"action": "update", "target_stage": computed_stage}
+
+
+def _match_asana_option(value: str, options: Dict[str, str]) -> Optional[str]:
+    """Case-insensitive exact match of a raw Sheet value against an
+    Asana enum/multi_enum field's registered option names. No fuzzy
+    matching — a value that doesn't cleanly match an existing option is
+    skipped rather than guessed at, since silently picking the "closest"
+    option could misrepresent a real business fact (e.g. usage rights)."""
+    value_lower = value.strip().lower()
+    for name, gid in options.items():
+        if name.strip().lower() == value_lower:
+            return gid
+    return None
+
+
+def build_asana_custom_fields_payload(lead: Dict, custom_field_defs: Dict[str, Dict]) -> Dict[str, object]:
+    """Maps whatever EXTRA columns a lead has (anything beyond the
+    standard outreach-tracking ones in MASTER_COLUMNS) onto the target
+    Asana project's ACTUALLY REGISTERED custom fields, matched by name
+    (case-insensitive). This is deliberately generic — it works
+    unmodified for any campaign's own custom columns and any Asana
+    project's own field set, rather than hardcoding one fixed "creator
+    outreach" schema into the core engine. A lead column with no
+    matching Asana field is silently skipped (not every campaign needs
+    every field); an enum/multi_enum value with no matching option is
+    also skipped rather than guessed at.
+
+    custom_field_defs: {field_name: {"gid": str, "type": str,
+    "options": {option_name: option_gid}}} — see
+    asana_get_project_structure, which builds this from the live
+    project."""
+    field_defs_by_lower_name = {name.lower(): defn for name, defn in custom_field_defs.items()}
+    payload: Dict[str, object] = {}
+    for key, raw_value in lead.items():
+        if key in _ASANA_RESERVED_LEAD_FIELDS:
+            continue
+        value_str = str(raw_value).strip() if raw_value is not None else ""
+        if not value_str:
+            continue
+        defn = field_defs_by_lower_name.get(key.lower())
+        if not defn:
+            continue
+        field_type = defn["type"]
+        if field_type == "text":
+            payload[defn["gid"]] = value_str
+        elif field_type == "number":
+            try:
+                payload[defn["gid"]] = float(value_str)
+            except ValueError:
+                continue
+        elif field_type == "date":
+            payload[defn["gid"]] = {"date": value_str[:10]}
+        elif field_type == "enum":
+            option_gid = _match_asana_option(value_str, defn["options"])
+            if option_gid:
+                payload[defn["gid"]] = option_gid
+        elif field_type == "multi_enum":
+            tokens = [t.strip() for t in value_str.split(",") if t.strip()]
+            option_gids = [g for g in (_match_asana_option(t, defn["options"]) for t in tokens) if g]
+            if option_gids:
+                payload[defn["gid"]] = option_gids
+    return payload
+
+
+def build_asana_task_name(lead: Dict) -> str:
+    """[Client] | [CreatorHandle] – [Product], matching the naming
+    convention already used in the Creator Outreach Asana project.
+    Reserved lead column names for this: "Client", "CreatorHandle",
+    "Product" — a campaign wanting a well-formatted task title should
+    include those columns; anything present still gets joined, so a
+    lead missing one or two of them still gets a reasonable name rather
+    than an error. A lead with none of the three falls back to its
+    email address, so a task is never created with a blank name."""
+    client = (lead.get("Client") or "").strip()
+    handle = (lead.get("CreatorHandle") or "").strip()
+    product = (lead.get("Product") or "").strip()
+    if client and handle and product:
+        return f"{client} | {handle} \u2013 {product}"
+    parts = [p for p in (client, handle, product) if p]
+    if parts:
+        return " | ".join(parts)
+    return (lead.get("Email") or "Unnamed creator").strip()
+
+
+def _call_with_asana_retries(func, *args, **kwargs):
+    """Same principle as _call_with_gspread_retries: a 429 (rate limit)
+    or 5xx (Asana's own service hiccup) is worth waiting out; any other
+    error (403, 404, a real auth problem) is raised immediately rather
+    than wasting time retrying something that will never succeed."""
+    for attempt in range(ASANA_MAX_RETRIES + 1):
+        resp = func(*args, **kwargs)
+        if resp.status_code not in (429, 500, 502, 503, 504):
+            return resp
+        if attempt == ASANA_MAX_RETRIES:
+            return resp
+        time.sleep(ASANA_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+    return resp  # pragma: no cover - unreachable given the returns above
+
+
+def _asana_request(method: str, path: str, api_key: str, **kwargs) -> Dict:
+    url = f"{ASANA_API_BASE}{path}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = _call_with_asana_retries(requests.request, method, url, headers=headers, timeout=20, **kwargs)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def asana_find_project_gid(project_name: str, api_key: str) -> Optional[str]:
+    data = _asana_request("GET", "/projects?opt_fields=name&limit=100", api_key)
+    project_name_lower = project_name.strip().lower()
+    for project in data.get("data", []):
+        if project.get("name", "").strip().lower() == project_name_lower:
+            return project["gid"]
+    return None
+
+
+def asana_get_project_structure(project_gid: str, api_key: str) -> Dict:
+    """Returns {"sections": {name: gid}, "custom_fields": {name: {"gid":
+    ..., "type": ..., "options": {option_name: option_gid}}}} — read
+    fresh from the live project on every sync run, never cached across
+    runs, so a field or section Paula renames or adds in Asana is
+    picked up automatically next time."""
+    opt_fields = (
+        "sections.name,sections.gid,"
+        "custom_field_settings.custom_field.name,custom_field_settings.custom_field.gid,"
+        "custom_field_settings.custom_field.resource_subtype,"
+        "custom_field_settings.custom_field.enum_options.name,"
+        "custom_field_settings.custom_field.enum_options.gid"
+    )
+    data = _asana_request("GET", f"/projects/{project_gid}?opt_fields={opt_fields}", api_key)
+    project = data["data"]
+    sections = {s["name"]: s["gid"] for s in project.get("sections", [])}
+    custom_fields = {}
+    for setting in project.get("custom_field_settings", []):
+        cf = setting["custom_field"]
+        options = {o["name"]: o["gid"] for o in (cf.get("enum_options") or [])}
+        custom_fields[cf["name"]] = {"gid": cf["gid"], "type": cf["resource_subtype"], "options": options}
+    return {"sections": sections, "custom_fields": custom_fields}
+
+
+def asana_create_task(project_gid: str, section_gid: str, name: str, custom_fields: Dict, api_key: str) -> str:
+    body = {"data": {"projects": [project_gid], "name": name, "custom_fields": custom_fields}}
+    result = _asana_request("POST", "/tasks", api_key, json=body)
+    task_gid = result["data"]["gid"]
+    _asana_request("POST", f"/sections/{section_gid}/addTask", api_key, json={"data": {"task": task_gid}})
+    return task_gid
+
+
+def asana_update_task_custom_fields(task_gid: str, custom_fields: Dict, api_key: str) -> None:
+    if custom_fields:
+        _asana_request("PUT", f"/tasks/{task_gid}", api_key, json={"data": {"custom_fields": custom_fields}})
+
+
+def asana_move_task_to_section(task_gid: str, section_gid: str, api_key: str) -> None:
+    _asana_request("POST", f"/sections/{section_gid}/addTask", api_key, json={"data": {"task": task_gid}})
+
+
+def asana_get_task_current_section(task_gid: str, project_gid: str, api_key: str) -> Optional[str]:
+    data = _asana_request("GET", f"/tasks/{task_gid}?opt_fields=memberships.section.name,memberships.project.gid",
+                           api_key)
+    for membership in data["data"].get("memberships", []):
+        if (membership.get("project") or {}).get("gid") == project_gid:
+            return (membership.get("section") or {}).get("name")
+    return None
+
+
+def sync_campaign_to_asana(sheets: SheetsConnector, campaign_cfg: Dict, api_key: str) -> Dict:
+    """The one entry point. Reads every lead, creates or updates its
+    Asana task, and writes the resulting AsanaTaskGID back to the Sheet
+    for any newly-created task — that write-back, checked before every
+    future sync, is what makes re-running this any number of times safe
+    rather than creating duplicate tasks. Never moves a task out of
+    Rights Secured or Declined / Dead once a human has put it there
+    (see decide_asana_sync_action). One lead's failure never blocks the
+    rest of the sync — collected in errors instead.
+
+    campaign_cfg["asana"]: {"enabled": bool, "project_name": str}."""
+    asana_settings = campaign_cfg.get("asana") or {}
+    if not asana_settings.get("enabled"):
+        return {"skipped_disabled": True, "created": 0, "updated": 0, "skipped_no_email": 0, "errors": []}
+
+    project_name = (asana_settings.get("project_name") or "").strip()
+    if not project_name:
+        raise RuntimeError("Asana sync is enabled for this campaign but no project_name is configured.")
+
+    project_gid = asana_find_project_gid(project_name, api_key)
+    if not project_gid:
+        raise RuntimeError(f"No Asana project named '{project_name}' was found in this workspace.")
+    structure = asana_get_project_structure(project_gid, api_key)
+
+    created = 0
+    updated = 0
+    skipped_no_email = 0
+    errors = []
+
+    for lead in sheets.get_all_leads():
+        email = (lead.get("Email") or "").strip()
+        if not email:
+            skipped_no_email += 1
+            continue
+        try:
+            existing_gid = (lead.get("AsanaTaskGID") or "").strip()
+            current_section_name = None
+            if existing_gid:
+                current_section_name = asana_get_task_current_section(existing_gid, project_gid, api_key)
+
+            decision = decide_asana_sync_action(lead, current_section_name)
+            custom_fields = build_asana_custom_fields_payload(lead, structure["custom_fields"])
+
+            if decision["action"] == "create":
+                target_section_gid = structure["sections"].get(decision["target_stage"])
+                if not target_section_gid:
+                    raise RuntimeError(f"Asana project has no section named '{decision['target_stage']}'.")
+                new_gid = asana_create_task(project_gid, target_section_gid, build_asana_task_name(lead),
+                                             custom_fields, api_key)
+                sheets.update_lead_fields(lead["_row"], {"AsanaTaskGID": new_gid})
+                created += 1
+            else:
+                asana_update_task_custom_fields(existing_gid, custom_fields, api_key)
+                target_stage = decision["target_stage"]
+                if target_stage and target_stage != current_section_name:
+                    target_section_gid = structure["sections"].get(target_stage)
+                    if target_section_gid:
+                        asana_move_task_to_section(existing_gid, target_section_gid, api_key)
+                updated += 1
+        except Exception as exc:  # noqa: BLE001 - one bad lead shouldn't sink the whole sync
+            errors.append({"email": email, "error": str(exc)})
+
+    return {"created": created, "updated": updated, "skipped_no_email": skipped_no_email, "errors": errors}
+
+
+def cmd_sync_asana(args):
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    api_key = os.environ.get("ASANA_ACCESS_TOKEN", "")
+    if not api_key:
+        print("ASANA_ACCESS_TOKEN is not set — nothing to do.")
+        sys.exit(1)
+
+    result = sync_campaign_to_asana(sheets, campaign_cfg, api_key)
+    if result.get("skipped_disabled"):
+        print(f"Asana sync is not enabled for '{args.campaign}' — nothing to do.")
+        return
+
+    print(f"Created {result['created']}, updated {result['updated']}, "
+          f"skipped {result['skipped_no_email']} (no email).")
+    if result["errors"]:
+        print(f"{len(result['errors'])} lead(s) failed to sync:")
+        for err in result["errors"]:
+            print(f"  {err['email']}: {err['error']}")
+        sys.exit(1)
+
+
+def cmd_sync_asana_all(args):
+    """The scheduled trigger's entry point — loops over EVERY discovered
+    campaign, syncing only the ones with asana.enabled set, rather than
+    a single hardcoded default campaign. One campaign's failure is
+    reported but never blocks the others from being synced in the same
+    run."""
+    api_key = os.environ.get("ASANA_ACCESS_TOKEN", "")
+    if not api_key:
+        print("ASANA_ACCESS_TOKEN is not set — nothing to do.")
+        sys.exit(1)
+
+    any_enabled = False
+    any_errors = False
+    for campaign_name in discover_campaign_names():
+        try:
+            campaign_cfg = get_campaign(campaign_name)
+        except Exception as exc:  # noqa: BLE001 - a broken campaign config shouldn't sink the whole run
+            print(f"{campaign_name}: couldn't load config ({exc}) — skipped.")
+            any_errors = True
+            continue
+
+        if not (campaign_cfg.get("asana") or {}).get("enabled"):
+            continue
+        any_enabled = True
+
+        try:
+            sheets = _connect_sheets(campaign_cfg)
+            result = sync_campaign_to_asana(sheets, campaign_cfg, api_key)
+            print(f"{campaign_name}: created {result['created']}, updated {result['updated']}, "
+                  f"skipped {result['skipped_no_email']} (no email).")
+            if result["errors"]:
+                any_errors = True
+                for err in result["errors"]:
+                    print(f"  {campaign_name} — {err['email']}: {err['error']}")
+        except Exception as exc:  # noqa: BLE001 - one campaign's failure shouldn't block the others
+            print(f"{campaign_name}: sync failed entirely ({exc}).")
+            any_errors = True
+
+    if not any_enabled:
+        print("No campaign has Asana sync enabled — nothing to do.")
+    if any_errors:
+        sys.exit(1)
+
+
 def cmd_mark_responses_read(args):
     """Reads {"response_ids": [...]} from --file and sets IsRead=Yes for
     each one that still exists in this campaign's Response Sheet — a
@@ -3135,6 +3498,14 @@ def main():
     p_mark_read.add_argument("--campaign", required=True)
     p_mark_read.add_argument("--file", required=True, help='Path to a JSON file: {"response_ids": ["r1", "r2"]}')
     p_mark_read.set_defaults(func=cmd_mark_responses_read)
+
+    p_sync_asana = sub.add_parser("sync-asana", help="Create/update Asana tasks for this campaign's leads")
+    p_sync_asana.add_argument("--campaign", required=True)
+    p_sync_asana.set_defaults(func=cmd_sync_asana)
+
+    p_sync_asana_all = sub.add_parser("sync-asana-all",
+                                       help="Sync every campaign with asana.enabled set to true")
+    p_sync_asana_all.set_defaults(func=cmd_sync_asana_all)
 
     p_health = sub.add_parser("check-account-health",
                                help="Check every configured account's IMAP connectivity and write results "
