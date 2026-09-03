@@ -953,24 +953,33 @@ def test_campaigns_hub_refresh_button_clears_caches_without_error():
     assert "Kelson_Creators_Licensing" in markdown_text  # data still shows after the cache clear + rerun
 
 
-def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status(tmp_path):
-    (tmp_path / "templates" / "Kelson_Creators_Licensing").mkdir(parents=True)
-    for filename, content in [("intro_A.txt", "Subject: Hi\n\nHello {{FirstName}}."),
-                               ("followup1_A.txt", "Subject: \n\nFollowing up.")]:
-        (tmp_path / "templates" / "Kelson_Creators_Licensing" / filename).write_text(content)
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)
-    (tmp_path / "config" / "campaigns" / "Kelson_Creators_Licensing.yaml").write_text(
-        "status: active\nsending:\n  daily_limit: 50\n"
-    )
-
+def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
+    source_files = {
+        "intro_A.txt": b"Subject: Hi\n\nHello {{FirstName}}.",
+        "followup1_A.txt": b"Subject: \n\nFollowing up.",
+    }
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     commits_captured, fake_create_file = _mock_github_writes()
+
+    def fake_list_directory_files(self, path, ref="main"):
+        assert path == "templates/Kelson_Creators_Licensing"
+        return list(source_files.keys())
+
+    def fake_get_file_content(self, path, ref="main"):
+        if path.endswith(".yaml"):
+            return b"status: active\nsending:\n  daily_limit: 50\n"
+        filename = path.rsplit("/", 1)[-1]
+        return source_files[filename]
+
+    def fake_get_file_sha(self, path, ref="main"):
+        return "some-sha" if path.endswith(".yaml") else None
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
          patch("github_client.GitHubClient.create_file", fake_create_file), \
-         patch("config.TEMPLATES_ROOT", str(tmp_path / "templates")), \
-         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config" / "campaigns")):
+         patch("github_client.GitHubClient.list_directory_files", fake_list_directory_files), \
+         patch("github_client.GitHubClient.get_file_content", fake_get_file_content), \
+         patch("github_client.GitHubClient.get_file_sha", fake_get_file_sha):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
@@ -1010,6 +1019,47 @@ def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status(tm
     written_config = _yaml.safe_load(config_commit["content"].decode("utf-8"))
     assert written_config["status"] == "draft"  # never inherits the source's Active status
     assert written_config["sending"] == {"daily_limit": 50}
+
+    success_texts = " ".join(s.value for s in at.success)
+    assert "2 template file(s)" in success_texts  # the concrete count you can sanity-check against
+
+
+def test_duplicate_campaign_refuses_when_source_has_no_templates():
+    """The actual production bug this fixes — a source read that comes
+    back with zero files must show an error, never a false 'success'
+    with an empty duplicate silently created."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.list_directory_files", lambda self, path, ref="main": []), \
+         patch("github_client.GitHubClient.get_file_sha", lambda self, path, ref="main": None):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.run(timeout=15)
+
+        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button.click()
+        at.run(timeout=15)
+
+        name_input = next(ti for ti in at.text_input if ti.key == "duplicate_campaign_new_name")
+        name_input.set_value("Kelson_Creators_Licensing_V2")
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "duplicate_campaign_confirm")
+        confirm_checkbox.set_value(True)
+        at.run(timeout=15)
+
+        duplicate_confirm_button = next(b for b in at.button if b.label == "Duplicate Campaign")
+        duplicate_confirm_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "No template files were found" in error_texts
+    assert commits_captured.get("commits", []) == []  # nothing committed — no empty duplicate created
 
 
 def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path):
