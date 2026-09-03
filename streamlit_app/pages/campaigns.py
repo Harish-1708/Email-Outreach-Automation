@@ -28,7 +28,7 @@ from data_import_logic import (  # noqa: E402
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping, count_valid_rows,
     build_import_payload, import_payload_path, build_removal_payload, removal_payload_path,
     payload_to_bytes, filter_leads, search_leads, KNOWN_FIELDS, FILTER_OPTIONS,
-    NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name,
+    NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name, find_duplicate_columns,
 )
 from sequences_logic import (  # noqa: E402
     next_available_variant_letter,
@@ -497,10 +497,20 @@ def _render_data_tab(campaign_cfg, leads):
 
                 st.caption(f"{len(rows)} row(s) detected. Every column is mapped automatically below — "
                            "change any of them, or pick Skip to leave one out.")
+
+                duplicate_columns = find_duplicate_columns(columns)
+                if duplicate_columns:
+                    st.warning(
+                        f"This CSV has the same column name more than once: {', '.join(duplicate_columns)}. "
+                        "Only the LAST one's data survived when the file was read — the earlier column(s) "
+                        "with that name are already gone, not just hidden here. Rename one of them in the "
+                        "source file and re-upload if you need both."
+                    )
+
                 mapping = {}
                 custom_field_name_errors = []
                 default_mapping = build_default_mapping(columns, custom_columns, outreach.MASTER_COLUMNS)
-                for col in columns:
+                for col_idx, col in enumerate(columns):
                     default = default_mapping.get(col) or "-- Skip --"
                     # The column's own name is always a valid option in ITS
                     # OWN dropdown, even when it isn't yet a known or
@@ -512,10 +522,16 @@ def _render_data_tab(campaign_cfg, leads):
                         col_options = col_options + [default]
                     col_options = col_options + [NEW_CUSTOM_FIELD_OPTION]
                     default_idx = col_options.index(default) if default in col_options else 0
+                    # Keyed by POSITION as well as name — two columns can
+                    # share the same name (see the duplicate-column warning
+                    # above), and a key built from the name alone would
+                    # crash Streamlit outright rather than just producing
+                    # confusing data.
                     choice = st.selectbox(f"'{col}' maps to", col_options, index=default_idx,
-                                           key=f"map_{col}")
+                                           key=f"map_{col_idx}_{col}")
                     if choice == NEW_CUSTOM_FIELD_OPTION:
-                        new_field_name = st.text_input(f"New field name for '{col}'", key=f"map_new_field_{col}")
+                        new_field_name = st.text_input(f"New field name for '{col}'",
+                                                        key=f"map_new_field_{col_idx}_{col}")
                         field_name_error = validate_custom_field_name(new_field_name, outreach.MASTER_COLUMNS)
                         if field_name_error:
                             custom_field_name_errors.append(f"'{col}': {field_name_error}")
