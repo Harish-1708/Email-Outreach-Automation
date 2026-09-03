@@ -35,12 +35,36 @@ def validate_custom_field_name(name: str, reserved_names: List[str]) -> Optional
 
 def parse_csv_bytes(raw_bytes: bytes) -> Tuple[List[str], List[Dict[str, str]]]:
     """Returns (column_names, rows). utf-8-sig handles a BOM from Excel
-    exports without choking on it."""
+    exports without choking on it.
+
+    A genuinely duplicate column NAME in the source CSV isn't corrected
+    here — Python's own csv.DictReader silently keeps only the LAST
+    duplicate-named column's value per row, discarding the earlier
+    one(s), before this function ever sees the data. See
+    find_duplicate_columns, which the Data tab calls separately to warn
+    about this rather than staying silent about data that's already
+    gone by this point."""
     text = raw_bytes.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     columns = reader.fieldnames or []
     rows = [dict(row) for row in reader]
     return columns, rows
+
+
+def find_duplicate_columns(columns: List[str]) -> List[str]:
+    """Column names appearing more than once in the CSV's own header row
+    — sorted, de-duplicated. A real, actionable warning signal: for any
+    name in this list, Python's csv.DictReader has already silently
+    kept only the LAST occurrence's value per row and discarded the
+    earlier one(s) before parse_csv_bytes even returns — the fix has to
+    happen in the source file (rename one of the columns), not here."""
+    seen = set()
+    duplicates = set()
+    for col in columns:
+        if col in seen:
+            duplicates.add(col)
+        seen.add(col)
+    return sorted(duplicates)
 
 
 def _normalize(name: str) -> str:
