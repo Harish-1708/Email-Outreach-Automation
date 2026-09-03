@@ -37,7 +37,7 @@ from sequences_logic import (  # noqa: E402
 from campaign_builder import (  # noqa: E402
     get_next_stage_for_campaign, build_campaign_files, validate_variant_content,
     validate_campaign_name, commit_message_for_campaign, confirmation_matches_campaign_name,
-    list_campaign_files_to_delete,
+    list_campaign_files_to_delete, build_campaign_duplication_files,
 )
 from settings_logic import (  # noqa: E402
     load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
@@ -174,6 +174,51 @@ PLACEHOLDER_INTRO_BODY = (
 )
 
 
+@st.dialog("Duplicate Campaign")
+def _duplicate_campaign_dialog(source_campaign_name, existing_campaigns):
+    st.caption(
+        f"Copies every template (every stage x every variant) from '{source_campaign_name}' under a "
+        "brand new name — completely independent files from the moment this runs, so editing or "
+        "deleting a template on the duplicate later can never affect the original. Settings (sending "
+        "limits, schedule, Asana sync) carry over too, except status, which always starts as Draft. "
+        "Leads, sends, and replies are never copied — the duplicate starts with none."
+    )
+    new_name = st.text_input("New campaign name (letters, numbers, underscores only)",
+                              key="duplicate_campaign_new_name")
+    confirm = st.checkbox("Duplicate now", key="duplicate_campaign_confirm")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        duplicate_clicked = st.button("Duplicate Campaign", type="primary", disabled=not confirm)
+    with col2:
+        if st.button("Cancel", key="cancel_duplicate_campaign"):
+            st.session_state["duplicating_campaign"] = None
+            st.rerun()
+
+    if duplicate_clicked:
+        name_error = validate_campaign_name(new_name, existing_campaigns)
+        if name_error:
+            st.error(name_error)
+        else:
+            try:
+                files = build_campaign_duplication_files(source_campaign_name, new_name, TEMPLATES_ROOT,
+                                                          CAMPAIGNS_DIR)
+                client = _get_github_client()
+                client.commit_campaign_files_directly(
+                    files=files,
+                    commit_message=f"Duplicate '{source_campaign_name}' as '{new_name}' "
+                                    f"(via Streamlit, by {current_user()})",
+                )
+                _load_hub_rows.clear()
+                st.session_state["duplicating_campaign"] = None
+                st.success(
+                    f"'{new_name}' created as a Draft copy of '{source_campaign_name}'. It'll appear in "
+                    "the list below within a minute or so, once the app finishes redeploying."
+                )
+            except GitHubActionsError as exc:
+                st.error(f"Failed to duplicate: {exc}")
+
+
 @st.dialog("New Campaign")
 def _new_campaign_dialog(existing_campaigns):
     st.caption(
@@ -273,6 +318,15 @@ def _render_hub(just_arrived: bool):
                 existing_campaigns = []
             _new_campaign_dialog(existing_campaigns)
 
+    if just_arrived:
+        st.session_state["duplicating_campaign"] = None
+    if st.session_state.get("duplicating_campaign"):
+        try:
+            existing_campaigns = list_campaigns()
+        except Exception:  # noqa: BLE001
+            existing_campaigns = []
+        _duplicate_campaign_dialog(st.session_state["duplicating_campaign"], existing_campaigns)
+
     try:
         rows, deleted_rows, errors = _load_hub_rows()
     except Exception as exc:  # noqa: BLE001
@@ -295,9 +349,15 @@ def _render_hub(just_arrived: bool):
                 c6.write(f"Last activity: {_relative_time(row['last_activity'])}")
                 if row["problems"]:
                     c2.caption(", ".join(row["problems"]))
-                if st.button("Open", key=f"open_{row['name']}"):
-                    st.session_state["selected_campaign"] = row["name"]
-                    st.rerun()
+                button_col1, button_col2 = st.columns(2)
+                with button_col1:
+                    if st.button("Open", key=f"open_{row['name']}", width="stretch"):
+                        st.session_state["selected_campaign"] = row["name"]
+                        st.rerun()
+                with button_col2:
+                    if st.button("⧉ Duplicate", key=f"duplicate_{row['name']}", width="stretch"):
+                        st.session_state["duplicating_campaign"] = row["name"]
+                        st.rerun()
 
     if errors:
         with st.expander(f"{len(errors)} campaign(s) couldn't be loaded"):
