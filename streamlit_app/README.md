@@ -201,6 +201,19 @@ Remove buttons on the Email Accounts page instead:
   sees the data — the warning names which column(s) are affected so you
   can fix it in the source file (rename one) and re-upload, rather than
   silently importing with data already missing.
+- **Approval is informational only, everywhere** — it no longer gates
+  sending, Launch readiness, "campaign complete" status, or the "In
+  Progress" filter. A lead needs a valid email and nothing else to be
+  eligible.
+- **The leads table in the Data tab shows every column that exists on
+  a lead**, not a fixed subset — custom fields from a CSV import
+  (Client, Product, Content Score, etc.) appear automatically, in the
+  same order as the Sheet's own header where that's known.
+- **Asana project lookup specifies a workspace**, which Asana's own API
+  requires for listing projects — a request without one is rejected
+  outright with a 400, regardless of how correct the project name is.
+  Every workspace the token's owner belongs to is searched, not just
+  the first, in case the account spans more than one.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
