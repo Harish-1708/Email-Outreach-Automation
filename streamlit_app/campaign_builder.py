@@ -32,7 +32,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import outreach  # noqa: E402
-from settings_logic import load_raw_override, override_to_yaml_bytes  # noqa: E402
+from settings_logic import override_to_yaml_bytes  # noqa: E402
 
 
 def validate_campaign_name(name: str, existing_campaigns: List[str]) -> Optional[str]:
@@ -161,13 +161,20 @@ def build_duplicated_config_override(raw_override: Dict) -> Dict:
     return updated
 
 
-def build_campaign_duplication_files(source_campaign_name: str, new_campaign_name: str,
-                                      templates_root: str, campaigns_dir: str) -> List[Dict]:
-    """Copies every template file (every stage x every variant) under a
-    BRAND NEW folder name — the duplicate's files are entirely separate
-    from the moment this commits, not shared references, so editing or
-    deleting a template on the duplicate later can never affect the
-    source campaign's own files, and vice versa.
+def build_campaign_duplication_files(new_campaign_name: str, source_template_files: Dict[str, bytes],
+                                      source_raw_override: Optional[Dict]) -> List[Dict]:
+    """source_template_files: {filename: content_bytes} — MUST already be
+    fetched from the AUTHORITATIVE source (GitHubClient.list_directory_files
+    + get_file_content, reading the real, current repo state), never from
+    Streamlit's own local filesystem checkout. That checkout can lag
+    behind a very recent commit until the next redeploy finishes —
+    reading from it here previously produced a duplicate campaign with
+    ZERO template files whenever that lag happened to be in effect at
+    the exact moment of duplication, with no error raised at all. This
+    function now refuses outright rather than ever repeating that.
+
+    source_raw_override: the source campaign's config override dict, or
+    None if it never had one.
 
     Never touches the source campaign's Google Sheet — leads, sends,
     and replies stay exactly where they are; duplicating a campaign
@@ -177,21 +184,24 @@ def build_campaign_duplication_files(source_campaign_name: str, new_campaign_nam
     into it.
 
     Returns [{'path':..., 'content': bytes}], ready for
-    GitHubClient.commit_campaign_files_directly."""
-    source_dir = os.path.join(templates_root, source_campaign_name)
-    files = []
-    if os.path.isdir(source_dir):
-        for filename in sorted(os.listdir(source_dir)):
-            if not filename.endswith(".txt"):
-                continue
-            with open(os.path.join(source_dir, filename), "rb") as f:
-                content = f.read()
-            files.append({"path": f"templates/{new_campaign_name}/{filename}", "content": content})
+    GitHubClient.commit_campaign_files_directly.
 
-    override_path = os.path.join(campaigns_dir, f"{source_campaign_name}.yaml")
-    if os.path.isfile(override_path):
-        raw_override = load_raw_override(source_campaign_name, campaigns_dir)
-        duplicated_override = build_duplicated_config_override(raw_override)
+    Raises ValueError if source_template_files is empty — a duplicate
+    is never silently created with no templates in it."""
+    if not source_template_files:
+        raise ValueError(
+            "No template files were found for the source campaign — refusing to create an empty "
+            "duplicate. If this campaign clearly has templates, this was likely a transient read; "
+            "try duplicating again in a moment."
+        )
+
+    files = [
+        {"path": f"templates/{new_campaign_name}/{filename}", "content": content}
+        for filename, content in sorted(source_template_files.items())
+    ]
+
+    if source_raw_override is not None:
+        duplicated_override = build_duplicated_config_override(source_raw_override)
         files.append({
             "path": f"config/campaigns/{new_campaign_name}.yaml",
             "content": override_to_yaml_bytes(duplicated_override),
