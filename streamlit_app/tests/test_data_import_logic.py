@@ -9,6 +9,7 @@ from data_import_logic import (
     count_valid_rows, build_import_payload, import_payload_path,
     build_removal_payload, removal_payload_path, payload_to_bytes,
     filter_leads, search_leads, validate_custom_field_name, find_duplicate_columns,
+    build_full_lead_table,
     FILTER_ALL, FILTER_PENDING_APPROVAL, FILTER_IN_PROGRESS, FILTER_REPLIED,
     FILTER_BOUNCED, FILTER_REMOVED,
 )
@@ -158,11 +159,13 @@ def test_filter_pending_approval():
 
 
 def test_filter_in_progress_excludes_terminal_and_removed():
+    """In Progress means 'has been sent something and hasn't stopped' —
+    Approval is informational only and no longer determines this."""
     leads = [
-        _lead(Approval="Yes", Status=""),                    # in progress
-        _lead(Approval="Yes", Status="Stopped - Replied"),    # terminal, excluded
-        _lead(Approval="Yes", Status="Removed"),              # removed, excluded
-        _lead(Approval="", Status=""),                        # not approved, excluded
+        _lead(IntroSentAt="2026-08-01 09:00:00", Status=""),                    # in progress
+        _lead(IntroSentAt="2026-08-01 09:00:00", Status="Stopped - Replied"),    # terminal, excluded
+        _lead(IntroSentAt="2026-08-01 09:00:00", Status="Removed"),              # removed, excluded
+        _lead(IntroSentAt="", Status=""),                                       # nothing sent yet, excluded
     ]
     result = filter_leads(leads, FILTER_IN_PROGRESS)
     assert len(result) == 1
@@ -278,3 +281,56 @@ def test_parse_csv_bytes_confirms_duplicate_header_data_loss():
     columns, rows = parse_csv_bytes(raw)
     assert columns.count("Last Contact Date") == 2  # the header itself still shows both
     assert rows[0]["Last Contact Date"] == "2026-08-02"  # but only the LAST value survived
+
+
+# ---------- build_full_lead_table ----------
+
+def test_build_full_lead_table_includes_custom_columns():
+    """The actual reported gap — custom CSV columns (Client, Product,
+    etc.) must appear in the table, not just the original fixed set
+    (LeadID, Name, Email, Company, Approval, Status)."""
+    leads = [{"LeadID": "1", "Email": "a@abc.com", "Client": "DudeRobe", "Content Score": "5"}]
+    table = build_full_lead_table(leads)
+    assert "Client" in table
+    assert "Content Score" in table
+    assert table["Client"] == ["DudeRobe"]
+
+
+def test_build_full_lead_table_excludes_internal_row_bookkeeping():
+    leads = [{"LeadID": "1", "Email": "a@abc.com", "_row": 2}]
+    table = build_full_lead_table(leads)
+    assert "_row" not in table
+
+
+def test_build_full_lead_table_missing_field_on_some_leads_shows_blank_not_dropped():
+    leads = [
+        {"LeadID": "1", "Email": "a@abc.com", "Client": "DudeRobe"},
+        {"LeadID": "2", "Email": "b@abc.com"},  # no Client at all
+    ]
+    table = build_full_lead_table(leads)
+    assert table["Client"] == ["DudeRobe", ""]
+
+
+def test_build_full_lead_table_respects_header_order():
+    leads = [{"LeadID": "1", "Email": "a@abc.com", "Client": "DudeRobe", "Product": "SheRobe"}]
+    table = build_full_lead_table(leads, header_order=["LeadID", "Product", "Email", "Client"])
+    assert list(table.keys()) == ["LeadID", "Product", "Email", "Client"]
+
+
+def test_build_full_lead_table_appends_fields_not_in_header_order():
+    """A field present on a lead but not in the known header (shouldn't
+    normally happen, but defensively) must still show up, not vanish."""
+    leads = [{"LeadID": "1", "Email": "a@abc.com", "SurpriseField": "x"}]
+    table = build_full_lead_table(leads, header_order=["LeadID", "Email"])
+    assert "SurpriseField" in table
+    assert table["SurpriseField"] == ["x"]
+
+
+def test_build_full_lead_table_no_header_order_falls_back_to_alphabetical():
+    leads = [{"Zebra": "z", "Apple": "a"}]
+    table = build_full_lead_table(leads)
+    assert list(table.keys()) == ["Apple", "Zebra"]
+
+
+def test_build_full_lead_table_empty_leads_returns_empty():
+    assert build_full_lead_table([]) == {}
