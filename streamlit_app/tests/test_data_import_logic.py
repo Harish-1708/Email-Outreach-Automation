@@ -49,13 +49,24 @@ def test_default_mapping_matches_known_fields_case_and_punctuation_insensitive()
 def test_default_mapping_matches_custom_columns():
     mapping = build_default_mapping(["Job Title", "Website"], ["Title", "Website"])
     assert mapping["Website"] == "Website"
-    # "Job Title" doesn't normalize-match "Title" (extra word) — stays unmapped, which is correct/safe
-    assert mapping["Job Title"] == ""
+    # "Job Title" doesn't normalize-match "Title" (extra word) — defaults to
+    # a NEW custom field using its own name, not the unrelated "Title" column.
+    assert mapping["Job Title"] == "Job Title"
 
 
-def test_default_mapping_leaves_unrecognized_columns_unmapped():
+def test_default_mapping_unrecognized_column_defaults_to_its_own_name_as_a_new_custom_field():
+    """The actual UX fix — a column matching nothing existing shouldn't
+    require picking '+ New custom field...' and retyping the exact same
+    name; it should just default to itself, zero extra clicks."""
     mapping = build_default_mapping(["Random Column"], [])
-    assert mapping["Random Column"] == ""
+    assert mapping["Random Column"] == "Random Column"
+
+
+def test_default_mapping_reserved_system_column_name_defaults_to_skip_not_itself():
+    """The one safety exception — a column whose own name collides with
+    a real system-tracked column must NOT default to overwriting it."""
+    mapping = build_default_mapping(["Status"], [], reserved_names=["Status", "Email"])
+    assert mapping["Status"] == ""
 
 
 def test_default_mapping_prefers_known_field_over_same_named_custom_column():
