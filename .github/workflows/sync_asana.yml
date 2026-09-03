@@ -1,0 +1,58 @@
+name: Sync Asana
+
+# Two ways to trigger, matching the two things this needs to do:
+#  - workflow_dispatch with a campaign input: the Settings tab's "Sync
+#    to Asana" button, for one specific campaign, on demand.
+#  - schedule: loops over EVERY campaign that has asana.enabled set to
+#    true (see outreach.py's cmd_sync_asana_all) — not a single
+#    hardcoded default campaign, since more than one campaign will have
+#    this turned on over time.
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "Campaign name — leave blank to sync every enabled campaign instead"
+        required: false
+  schedule:
+    # Once a day. Asana sync isn't as time-sensitive as checking for
+    # replies — adjust the interval here if that stops being true.
+    - cron: "0 13 * * *"
+
+# Same reasoning as check_replies.yml's concurrency block: two overlapping
+# syncs (a scheduled run and a manual click close together) could both
+# decide the same lead needs a NEW task at the same time, before either
+# has written the resulting AsanaTaskGID back — that's exactly the
+# duplicate-creation race this queues away instead of risking.
+concurrency:
+  group: sync-asana
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync-asana:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Sync Asana
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+        run: |
+          set -o pipefail
+          if [ -n "${{ github.event.inputs.campaign }}" ]; then
+            python outreach.py sync-asana --campaign "${{ github.event.inputs.campaign }}" | tee sync_asana_output.txt
+          else
+            python outreach.py sync-asana-all | tee sync_asana_output.txt
+          fi
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat sync_asana_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
