@@ -35,6 +35,28 @@ def _reset_streamlit_global_caches():
     st.cache_data.clear()
 
 
+@pytest.fixture(autouse=True)
+def _default_live_template_structure():
+    """The Sequences tab (and Delete Stage / Delete Variant specifically)
+    now reads a campaign's stage/variant structure live from
+    GitHubClient.list_directory_files, never Streamlit's local checkout
+    — see pages.campaigns._fetch_live_stages_and_variants's docstring
+    for why. Streamlit executes every tab's body on every rerun
+    regardless of which tab is visually selected, so ANY test that opens
+    a campaign detail view at all now needs this mocked, not just tests
+    that specifically exercise Sequences. This default — the real
+    Kelson_Creators_Licensing structure, 5 stages x 4 variants — covers
+    every test that doesn't care about this specifically; a test that
+    DOES care (the delete-stage/variant tests, duplication tests using a
+    different campaign) overrides it locally with its own `with
+    patch(...)`, which always wins over this outer one."""
+    default_filenames = [f"{stage}_{v}.txt" for stage in
+                          ["intro", "followup1", "followup2", "followup3", "followup4"] for v in "ABCD"]
+    with patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": list(default_filenames)):
+        yield
+
+
 class FakeWorksheet:
     def __init__(self, records, header=None):
         self._records = records
@@ -1335,6 +1357,108 @@ def test_data_tab_shows_error_when_no_column_mapped_to_email():
     assert "Email" in error_texts
 
 
+def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
+    """The real gap this fixes: a column with no existing match (never
+    imported before) previously had no way to become a custom field at
+    all — only Skip or an already-existing column name were options."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured["content"] = content_bytes
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
+        at.run(timeout=15)
+
+        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select.set_value("\u2795 New custom field...")
+        at.run(timeout=15)
+
+        new_field_input = next(ti for ti in at.text_input if ti.key == "map_new_field_Brand")
+        new_field_input.set_value("Client")
+        at.run(timeout=15)
+
+        import_button = next(b for b in at.button if b.label == "Import Leads")
+        import_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Import raised: {list(at.exception)}"
+    assert list(at.error) == []
+    import json
+    payload = json.loads(captured["content"].decode("utf-8"))
+    assert payload["leads"][0]["Client"] == "DudeRobe"
+
+
+def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name():
+    """The safety property this exists for — naming a custom field the
+    same as one of the system's own tracked columns (e.g. 'Status')
+    would silently corrupt real tracking data on the next import."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
+        at.run(timeout=15)
+
+        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select.set_value("\u2795 New custom field...")
+        at.run(timeout=15)
+
+        new_field_input = next(ti for ti in at.text_input if ti.key == "map_new_field_Brand")
+        new_field_input.set_value("Status")  # a real MASTER_COLUMNS name
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "already used internally" in error_texts
+    assert not any(b.label == "Import Leads" for b in at.button)  # Import stays hidden
+
+
+def test_data_tab_new_custom_field_blank_name_blocks_import():
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
+        at.run(timeout=15)
+
+        brand_select = next(sb for sb in at.selectbox if sb.key == "map_Brand")
+        brand_select.set_value("\u2795 New custom field...")
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "Enter a name" in error_texts
+
+
 def test_data_tab_lead_table_and_remove_flow():
     fake_ws = {
         "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
@@ -1573,6 +1697,8 @@ def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
          patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.list_directory_files",
+               lambda self, path, ref="main": ["intro_A.txt", "followup1_A.txt"]), \
          patch("config.TEMPLATES_ROOT", str(tmp_path)):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
@@ -2087,24 +2213,32 @@ def test_delete_stage_only_offered_for_the_last_stage():
     assert "followup4" in markdown_text  # offered stage is genuinely the last one
 
 
-def test_delete_stage_blocks_when_live_github_structure_disagrees_with_the_page():
-    """The actual production bug this fixes: a stale local view can show
-    followup4 as the last stage while GitHub's real, live structure has
-    already changed (e.g. right after a duplication that hadn't fully
-    redeployed yet, or a broken campaign missing some variants). The
-    delete must refuse rather than act on the page's outdated belief."""
+def test_delete_stage_blocks_when_live_structure_is_already_inconsistent():
+    """The actual scenario reported in production: the campaign's real,
+    live structure is already broken (a stage missing some variants —
+    exactly the FollowUp3-missing-A/B incident) by the time anyone
+    tries to act on it. The delete must surface a clear error and touch
+    nothing, rather than half-succeeding or crashing unhelpfully."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
     def fake_delete_file(self, path, message, branch="main"):
         deleted_paths.append(path)
 
+    # Live truth: followup3 is missing variants A and B — genuinely
+    # inconsistent, exactly like the real incident.
+    inconsistent_filenames = (
+        [f"intro_{v}.txt" for v in "ABCD"]
+        + [f"followup1_{v}.txt" for v in "ABCD"]
+        + [f"followup2_{v}.txt" for v in "ABCD"]
+        + ["followup3_C.txt", "followup3_D.txt"]
+    )
+
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
          patch("github_client.GitHubClient.delete_file", fake_delete_file), \
          patch("github_client.GitHubClient.list_directory_files",
-               lambda self, path, ref="main": [f"{stage}_{v}.txt" for stage in ["intro", "followup1"]
-                                                for v in "ABCD"]):  # GitHub's live truth: only 2 stages now
+               lambda self, path, ref="main": list(inconsistent_filenames)):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
@@ -2112,21 +2246,54 @@ def test_delete_stage_blocks_when_live_github_structure_disagrees_with_the_page(
         at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
         at.run(timeout=15)
 
-        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_delete_stage")
-        confirm_checkbox.set_value(True)
-        at.run(timeout=15)
+    assert list(at.exception) == []
+    error_texts = " ".join(e.value for e in at.error)
+    assert "followup3" in error_texts
+    assert deleted_paths == []
 
-        delete_button = next(b for b in at.button if b.key == "delete_stage_button")
-        delete_button.click()
+
+def test_sequences_tab_delete_stage_reflects_live_structure_immediately_after_a_change():
+    """The actual complaint this fixes: after deleting FollowUp4, the
+    Sequences tab must show FollowUp3 as the new last stage on the very
+    next render — not keep showing FollowUp4 because of a stale local
+    view that no amount of in-app refreshing could clear."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    call_count = {"n": 0}
+
+    def fake_list_directory_files(self, path, ref="main"):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return [f"{stage}_{v}.txt" for stage in
+                    ["intro", "followup1", "followup2", "followup3", "followup4"] for v in "ABCD"]
+        # FollowUp4 has just been deleted — every render from here on
+        # must reflect that immediately, with no separate "refresh" step.
+        return [f"{stage}_{v}.txt" for stage in
+                ["intro", "followup1", "followup2", "followup3"] for v in "ABCD"]
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.list_directory_files", fake_list_directory_files):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+        first_render_warnings = " ".join(w.value for w in at.warning).lower()
+        assert "followup4" in first_render_warnings
+
+        # A second render — simulating the user clicking Refresh, reopening
+        # the tab, or just Streamlit rerunning — must show FollowUp3 now,
+        # with no special action needed beyond the page simply rerunning.
         at.run(timeout=15)
 
     assert list(at.exception) == []
-    error_texts = " ".join(e.value for e in at.error)
-    assert "out of date" in error_texts
-    assert deleted_paths == []  # nothing was deleted based on the stale assumption
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "followup4" not in warning_texts.lower()
+    assert "followup3" in warning_texts.lower()
 
 
-
+def test_delete_stage_actually_deletes_all_variant_files_for_it():
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
