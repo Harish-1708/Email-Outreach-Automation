@@ -1729,7 +1729,68 @@ def test_delete_campaign_deletes_every_template_file(tmp_path):
     assert all(p.startswith("templates/Kelson_Creators_Licensing/") for p in deleted_paths)
 
 
-def test_temporarily_remove_campaign_sets_deleted_status_without_deleting_files():
+def test_asana_sync_settings_save_and_dispatch(tmp_path):
+    (tmp_path / "config").mkdir()
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+    commits_captured, fake_create_file = _mock_github_writes()
+    dispatched = []
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        dispatched.append((workflow_file, inputs.get("campaign")))
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "asana_sync_enabled")
+        confirm_checkbox.set_value(True)
+        project_input = next(ti for ti in at.text_input if ti.key == "asana_sync_project_name")
+        project_input.set_value("Creator Outreach")
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.key == "asana_sync_save")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Save raised: {list(at.exception)}"
+    assert list(at.error) == []
+    import yaml as _yaml
+    override_commit = next(c for c in commits_captured["commits"] if c["path"].endswith(".yaml"))
+    written = _yaml.safe_load(override_commit["content"].decode("utf-8"))
+    assert written["asana"] == {"enabled": True, "project_name": "Creator Outreach"}
+
+
+def test_asana_sync_now_button_only_shows_when_enabled(tmp_path):
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text(
+        "asana:\n  enabled: true\n  project_name: Creator Outreach\n"
+    )
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert any(b.key == "asana_sync_now" for b in at.button)
+
+
+
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     commits_captured, fake_create_file = _mock_github_writes()
     deleted_paths = []
