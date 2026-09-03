@@ -59,10 +59,13 @@ def test_readiness_fails_with_no_stages():
     assert "No template stages found" in problems
 
 
-def test_readiness_fails_with_no_approved_leads():
+def test_readiness_ignores_approval_status():
+    """Approval is informational only — a lead with Approval=No (or
+    Pending, or blank) must not block readiness as long as it has a
+    valid email."""
     ready, problems = compute_campaign_readiness(_cfg(), [_lead(Approval="No")])
-    assert ready is False
-    assert any("approved" in p for p in problems)
+    assert ready is True
+    assert problems == []
 
 
 def test_readiness_fails_with_approved_lead_missing_email():
@@ -110,8 +113,17 @@ def test_campaign_not_complete_when_one_lead_still_pending():
     assert compute_campaign_is_complete(_cfg(), leads) is False
 
 
-def test_campaign_complete_ignores_unapproved_leads():
+def test_campaign_not_complete_while_an_unsent_lead_remains_regardless_of_approval():
+    """Approval is informational only — a lead with Approval=No that
+    hasn't been sent anything still counts toward completion (it has a
+    valid email), so the campaign is correctly NOT complete yet."""
     leads = [_lead(FollowUp1SentAt="2026-08-01 09:00:00"), _lead(Approval="No", IntroSentAt="")]
+    assert compute_campaign_is_complete(_cfg(), leads) is False
+
+
+def test_campaign_complete_when_every_lead_with_email_is_finished():
+    leads = [_lead(FollowUp1SentAt="2026-08-01 09:00:00", Approval="No"),
+              _lead(FollowUp1SentAt="2026-08-02 09:00:00", Approval="")]
     assert compute_campaign_is_complete(_cfg(), leads) is True
 
 
