@@ -147,6 +147,26 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
+  Personal Access Token from whichever Asana account should own the
+  sync (Asana → My Settings → Apps → Manage Developer Apps → Personal
+  Access Tokens). Enable it per campaign in Settings → "🔗 Asana Sync",
+  with the exact Asana project name. A lead's stage (Sourced / Outreach
+  Sent / Follow-up / Negotiating) is derived automatically from its
+  send/reply history; Rights Secured and Declined / Dead are always set
+  by hand in Asana and a sync will never move a task out of either —
+  see `outreach.decide_asana_sync_action`. Re-running sync any number
+  of times never creates a duplicate task — each lead's task is tracked
+  via a stored `AsanaTaskGID` the moment it's first created.
+- **Which custom Sheet columns map to which Asana fields is by name
+  match, not a fixed list** — any lead column whose name matches a
+  registered custom field on the target Asana project gets pushed
+  there automatically; a column with no matching field is simply
+  skipped. This means it works differently for different Asana
+  projects without any code change, but also means a typo'd column
+  name silently doesn't sync — worth checking the created/updated task
+  in Asana against what you expected, at least the first few times.
+
 - **Intent classification (Interested / Not Interested / Lead-Needs-Follow-up
   / Unclear) is a genuinely separate layer from mechanical classification**
   (Genuine Reply / Auto-Reply / Out of Office / Bounce), only ever run for
