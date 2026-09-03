@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from datetime import datetime
 
 import streamlit as st
 import yaml
@@ -101,11 +102,21 @@ def _fetch_full_campaign_data_cached(campaign_name: str):
     — every mapping dropdown touched while setting up a CSV import, every
     filter change, every keystroke in search — so without this cache, a
     few minutes of ordinary use on this page alone can comfortably exceed
-    Google's 60-reads/minute/user quota and return a 429."""
+    Google's 60-reads/minute/user quota and return a 429.
+
+    Returns (leads, responses, send_log, error_log, fetched_at) —
+    fetched_at is computed HERE, inside the cached function, so it only
+    changes when a real fetch actually happens, not on every rerun. This
+    is what lets the Data tab show "as of HH:MM:SS" — Streamlit reruns
+    the script on interaction, not on a timer, so a page left open
+    without being touched will keep showing whatever it last rendered no
+    matter how long real time passes; a visible timestamp is what makes
+    that fact obvious instead of confusing."""
     campaign_cfg = get_campaign_cfg(campaign_name)
     leads, responses, send_log = _fetch_sheet_data(campaign_cfg)
     error_log = _get_connector().get_all_error_log(campaign_cfg["error_log_tab"])
-    return leads, responses, send_log, error_log
+    fetched_at = datetime.now().strftime("%H:%M:%S")
+    return leads, responses, send_log, error_log, fetched_at
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -127,7 +138,6 @@ def _relative_time(timestamp_str: str) -> str:
     if not timestamp_str:
         return "—"
     try:
-        from datetime import datetime
         dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
         return timestamp_str
@@ -467,6 +477,32 @@ def _render_analytics_tab(campaign_cfg, leads, responses, send_log, error_log):
 
 def _render_data_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
+
+    with st.expander("🔍 Diagnose: what is this page actually reading?"):
+        st.caption(
+            "If leads you've confirmed are in the Sheet aren't showing up here, this tells you exactly "
+            "which tab this page is reading and whether the problem is a stale cache or something else "
+            "entirely — compare the tab name below against the ACTUAL tab name in Google Sheets."
+        )
+        st.write(f"**Tab this page reads:** `{campaign_cfg['master_tab']}`")
+        st.write(f"**Leads currently shown (cached, up to 30s old):** {len(leads)}")
+        if st.button("Force a live check (bypasses every cache)", key="data_tab_live_diagnostic"):
+            try:
+                live_leads = _get_connector().get_all_leads(campaign_cfg["master_tab"])
+                st.write(f"**Leads actually on the Sheet right now, read live:** {len(live_leads)}")
+                if len(live_leads) != len(leads):
+                    st.warning(
+                        "These numbers differ — the cache genuinely is stale. Click '🔄 Refresh data' "
+                        "above (or reload the page) to clear it."
+                    )
+                else:
+                    st.info(
+                        "These numbers match — the cache isn't the problem. If leads you've confirmed "
+                        "are in the Sheet still aren't in this count, the issue is which TAB is being "
+                        "read (check the tab name above against Google Sheets' actual tab name), not caching."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Live check failed: {exc}")
 
     with st.expander("➕ Add Leads (upload CSV)", expanded=not leads):
         st.caption(
@@ -1527,12 +1563,15 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     if is_draft:
         st.info("📝 Draft — this campaign hasn't been launched yet.")
         leads, responses, send_log, error_log = [], [], [], []
+        st.session_state["_data_fetched_at"] = None
     else:
         try:
-            leads, responses, send_log, error_log = _fetch_full_campaign_data_cached(campaign_name)
+            leads, responses, send_log, error_log, fetched_at = _fetch_full_campaign_data_cached(campaign_name)
+            st.session_state["_data_fetched_at"] = fetched_at
         except Exception as exc:  # noqa: BLE001
             st.warning(f"Couldn't load Sheet data yet: {exc}")
             leads, responses, send_log, error_log = [], [], [], []
+            st.session_state["_data_fetched_at"] = None
 
     _render_status_controls(campaign_cfg, leads, just_arrived)
     st.divider()
