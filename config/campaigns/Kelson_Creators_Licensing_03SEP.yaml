@@ -2,3 +2,13 @@ status: paused
 asana:
   enabled: true
   project_name: Creator Outreach
+schedule:
+  timezone: America/Los_Angeles
+  window_start: 09:00
+  window_end: '17:00'
+  send_days:
+  - mon
+  - tue
+  - wed
+  - thu
+  - fri
