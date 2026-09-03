@@ -160,13 +160,21 @@ Remove buttons on the Email Accounts page instead:
   lag was in effect at the exact moment; it now refuses outright with a
   clear error if the source ever comes back empty, and reports exactly
   how many files it copied so you can confirm the count yourself.
-- **Delete Stage and Delete Variant re-verify the campaign's live
-  structure against GitHub's API immediately before deleting anything**,
-  for the same reason as above — a Delete performed shortly after some
-  other change (a duplication, another edit) could otherwise act on a
-  stale local view of which stages/variants actually exist. If the live
-  structure doesn't match what the page believes, the action is refused
-  with a clear message instead of proceeding on an outdated assumption.
+- **The whole Sequences tab reads its stage/variant structure live from
+  GitHub's API on every render**, not just as a pre-delete safety check
+  — the local checkout could otherwise keep showing an already-deleted
+  stage indefinitely, with no in-app refresh or re-login able to fix
+  it, since the staleness lived in the checkout itself, not in any
+  session state. Delete Stage and Delete Variant also independently
+  re-verify immediately before deleting anything, so even a change
+  within the same session can't be acted on from an outdated view.
+- **CSV import can create a genuinely new custom field**, not just map
+  a column to one that already exists as a Sheet column from some
+  earlier import — pick "➕ New custom field..." and type the exact
+  name (e.g. `Client`, `Product`, `Content Score` — anything Asana Sync
+  looks for). Naming it the same as one of the system's own tracked
+  columns (`Status`, `IntroSentAt`, etc.) is rejected outright, since
+  that would silently corrupt real tracking data on the next import.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
