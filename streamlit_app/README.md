@@ -152,6 +152,15 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **Duplicating a campaign reads the source fresh from GitHub's API**,
+  deliberately not from Streamlit's own local checkout of the repo —
+  that checkout can lag behind a very recent commit for a short window
+  until the next redeploy finishes. An earlier version read locally and
+  could silently create a duplicate with zero template files if that
+  lag was in effect at the exact moment; it now refuses outright with a
+  clear error if the source ever comes back empty, and reports exactly
+  how many files it copied so you can confirm the count yourself.
+
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
   sync (Asana → My Settings → Apps → Manage Developer Apps → Personal
