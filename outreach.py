@@ -737,11 +737,23 @@ class SheetsConnector:
         custom field name (one this campaign's Sheet has never seen
         before) actually gets a real column instead of being silently
         dropped by append_lead, which can only ever fill in columns the
-        header already has."""
+        header already has.
+
+        Also widens the sheet's own GRID first if needed, not just the
+        header ROW's content — a Sheet tab has a fixed column count set
+        whenever it was first created (this one had been sitting at 38
+        for a long time), and writing a cell beyond that is rejected
+        outright by a real 400 error, regardless of how correct the
+        header content itself is. Resizes with some headroom beyond
+        what's immediately needed, so a future single new custom field
+        doesn't require another resize right away."""
         current_header = self.master_ws.row_values(1)
         missing = [c for c in column_names if c and c not in current_header]
         if not missing:
             return
+        needed_col_count = len(current_header) + len(missing)
+        if needed_col_count > self.master_ws.col_count:
+            self.master_ws.resize(cols=needed_col_count + 10)
         start_col = len(current_header) + 1
         for i, col_name in enumerate(missing):
             self.master_ws.update_cell(1, start_col + i, col_name)
