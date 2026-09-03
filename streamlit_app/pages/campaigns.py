@@ -1562,16 +1562,14 @@ def _render_campaign_detail(campaign_name: str, just_arrived: bool):
     is_draft = (campaign_cfg.get("status") or "active") == "draft"
     if is_draft:
         st.info("📝 Draft — this campaign hasn't been launched yet.")
+    try:
+        leads, responses, send_log, error_log, fetched_at = _fetch_full_campaign_data_cached(campaign_name)
+        st.session_state["_data_fetched_at"] = fetched_at
+    except Exception as exc:  # noqa: BLE001 - genuinely no Sheet tab yet for a never-touched campaign
+        if not is_draft:
+            st.warning(f"Couldn't load Sheet data yet: {exc}")
         leads, responses, send_log, error_log = [], [], [], []
         st.session_state["_data_fetched_at"] = None
-    else:
-        try:
-            leads, responses, send_log, error_log, fetched_at = _fetch_full_campaign_data_cached(campaign_name)
-            st.session_state["_data_fetched_at"] = fetched_at
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"Couldn't load Sheet data yet: {exc}")
-            leads, responses, send_log, error_log = [], [], [], []
-            st.session_state["_data_fetched_at"] = None
 
     _render_status_controls(campaign_cfg, leads, just_arrived)
     st.divider()
