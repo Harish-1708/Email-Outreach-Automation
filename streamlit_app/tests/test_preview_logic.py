@@ -36,12 +36,15 @@ def test_run_preview_renders_real_templates_for_a_fake_lead():
     assert plan[0]["lead"]["Email"] == "jordan@example.com"
 
 
-def test_run_preview_excludes_leads_missing_approval():
+def test_run_preview_no_longer_excludes_leads_missing_approval():
+    """Approval is informational only now — a blank Approval must not
+    exclude a lead from preview, matching the same removed gate in
+    outreach.get_eligible_leads."""
     leads = [{
         "_row": 2, "LeadID": "L1", "Email": "jordan@example.com", "Approval": "",
     }]
     plan = run_preview("Kelson_Creators_Licensing", "intro", 10, leads)
-    assert plan == []
+    assert len(plan) == 1
 
 
 def test_run_preview_respects_forced_variant():
