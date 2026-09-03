@@ -11,19 +11,24 @@ directly — no GitHub trip, no pull request to approve.
 
 - **🗂️ Campaigns** — the everyday view, and the only page you need for
   day-to-day work. Every phase (A–H) is now real: search, create a
-  campaign inline, see status at a glance, Launch/Pause/Resume, a
-  "🗑️ Deleted Campaigns" section to Restore anything temporarily removed,
-  and inside a campaign: Analytics, Data, Sequences (+ Delete Variant,
-  Delete Stage, and ThreadSubject Maintenance — all near the bottom),
-  Schedule, Settings (+ Send, only available while the campaign is
-  actually Running, and a Danger Zone with two tiers — Temporarily
-  Remove, which just hides it and can be undone, and Permanently Delete,
-  which can't be — neither ever touches the Sheet, only templates), and
-  Responses (+ Check Replies at the top, reply directly from the app —
-  Cc/Bcc, file attachments, correctly threaded into the same
-  conversation). Each action lives with the thing it's most related to,
-  rather than grouped into its own separate tab — Send sits with sending
-  config, Check Replies sits with the replies themselves. A single-lead
+  campaign inline, "⧉ Duplicate" any campaign under a brand new name
+  (every template file copied as a genuinely independent file — editing
+  or deleting one on the duplicate can never touch the original; leads,
+  sends, and replies are never copied, and the duplicate always starts
+  as a Draft regardless of the source's status), see status at a
+  glance, Launch/Pause/Resume, a "🗑️ Deleted Campaigns" section to
+  Restore anything temporarily removed, and inside a campaign:
+  Analytics, Data, Sequences (+ Delete Variant, Delete Stage, and
+  ThreadSubject Maintenance — all near the bottom), Schedule, Settings
+  (+ Asana Sync, + Send, only available while the campaign is actually
+  Running, and a Danger Zone with two tiers — Temporarily Remove, which
+  just hides it and can be undone, and Permanently Delete, which can't
+  be — neither ever touches the Sheet, only templates), and Responses
+  (+ Check Replies at the top, reply directly from the app — Cc/Bcc,
+  file attachments, correctly threaded into the same conversation).
+  Each action lives with the thing it's most related to, rather than
+  grouped into its own separate tab — Send sits with sending config,
+  Check Replies sits with the replies themselves. A single-lead
   template preview already lives inline in Sequences, so there's no
   separate Preview tab. A fuller quoted-thread view and scheduling a
   reply for later are deliberately not built yet — see below.
