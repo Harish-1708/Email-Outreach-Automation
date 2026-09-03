@@ -32,6 +32,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import outreach  # noqa: E402
+from settings_logic import load_raw_override, override_to_yaml_bytes  # noqa: E402
 
 
 def validate_campaign_name(name: str, existing_campaigns: List[str]) -> Optional[str]:
@@ -146,3 +147,54 @@ def list_campaign_files_to_delete(campaign_name: str, templates_root: str, campa
         paths.append(f"config/campaigns/{campaign_name}.yaml")
 
     return paths
+
+
+def build_duplicated_config_override(raw_override: Dict) -> Dict:
+    """Everything from the source campaign's settings carries over
+    (sending limits, schedule, sender rotation, Asana sync settings)
+    EXCEPT status, which always resets to 'draft' — a fresh duplicate
+    with zero leads yet shouldn't inherit a Running or Paused state it
+    was never actually launched into. You decide when to launch it,
+    same as any brand-new campaign."""
+    updated = dict(raw_override)
+    updated["status"] = "draft"
+    return updated
+
+
+def build_campaign_duplication_files(source_campaign_name: str, new_campaign_name: str,
+                                      templates_root: str, campaigns_dir: str) -> List[Dict]:
+    """Copies every template file (every stage x every variant) under a
+    BRAND NEW folder name — the duplicate's files are entirely separate
+    from the moment this commits, not shared references, so editing or
+    deleting a template on the duplicate later can never affect the
+    source campaign's own files, and vice versa.
+
+    Never touches the source campaign's Google Sheet — leads, sends,
+    and replies stay exactly where they are; duplicating a campaign
+    means duplicating its SETUP, not its history. The new campaign
+    starts with no Master Sheet data of its own at all, exactly like
+    any other brand-new campaign, until leads are actually imported
+    into it.
+
+    Returns [{'path':..., 'content': bytes}], ready for
+    GitHubClient.commit_campaign_files_directly."""
+    source_dir = os.path.join(templates_root, source_campaign_name)
+    files = []
+    if os.path.isdir(source_dir):
+        for filename in sorted(os.listdir(source_dir)):
+            if not filename.endswith(".txt"):
+                continue
+            with open(os.path.join(source_dir, filename), "rb") as f:
+                content = f.read()
+            files.append({"path": f"templates/{new_campaign_name}/{filename}", "content": content})
+
+    override_path = os.path.join(campaigns_dir, f"{source_campaign_name}.yaml")
+    if os.path.isfile(override_path):
+        raw_override = load_raw_override(source_campaign_name, campaigns_dir)
+        duplicated_override = build_duplicated_config_override(raw_override)
+        files.append({
+            "path": f"config/campaigns/{new_campaign_name}.yaml",
+            "content": override_to_yaml_bytes(duplicated_override),
+        })
+
+    return files
