@@ -3178,11 +3178,25 @@ def _asana_request(method: str, path: str, api_key: str, **kwargs) -> Dict:
 
 
 def asana_find_project_gid(project_name: str, api_key: str) -> Optional[str]:
-    data = _asana_request("GET", "/projects?opt_fields=name&limit=100", api_key)
+    """Asana's own API requires an explicit workspace to list projects —
+    there's no "search across everything this token can see" option, and
+    calling /projects without one is rejected outright with a 400. This
+    searches every workspace the token's owner belongs to (not just the
+    first), in case the account spans more than one, and returns the
+    first name match found."""
     project_name_lower = project_name.strip().lower()
-    for project in data.get("data", []):
-        if project.get("name", "").strip().lower() == project_name_lower:
-            return project["gid"]
+    workspaces_data = _asana_request("GET", "/workspaces", api_key)
+    workspaces = workspaces_data.get("data", [])
+    if not workspaces:
+        raise RuntimeError(
+            "The Asana token has no accessible workspaces — double-check the Personal Access Token "
+            "was generated from the correct Asana account."
+        )
+    for workspace in workspaces:
+        data = _asana_request("GET", f"/projects?workspace={workspace['gid']}&opt_fields=name&limit=100", api_key)
+        for project in data.get("data", []):
+            if project.get("name", "").strip().lower() == project_name_lower:
+                return project["gid"]
     return None
 
 
