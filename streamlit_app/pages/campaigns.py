@@ -28,9 +28,10 @@ from data_import_logic import (  # noqa: E402
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping, count_valid_rows,
     build_import_payload, import_payload_path, build_removal_payload, removal_payload_path,
     payload_to_bytes, filter_leads, search_leads, KNOWN_FIELDS, FILTER_OPTIONS,
+    NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name,
 )
 from sequences_logic import (  # noqa: E402
-    get_existing_stages_and_variants, load_variant_content, next_available_variant_letter,
+    load_variant_content, next_available_variant_letter,
     build_variant_edit_file, build_new_variant_files_for_all_stages, validate_new_variant_contents,
     has_content_changed, can_delete_stage, build_stage_deletion_paths, can_delete_variant,
     build_variant_deletion_paths,
@@ -492,16 +493,28 @@ def _render_data_tab(campaign_cfg, leads):
                 except Exception:  # noqa: BLE001 - tab may not exist yet for a brand new campaign
                     custom_columns = []
 
-                st.caption(f"{len(rows)} row(s) detected. Map each column below (or leave as Skip).")
+                st.caption(f"{len(rows)} row(s) detected. Map each column below (or leave as Skip). To "
+                           "bring in creator-outreach data (Client, Product, Content Score, etc. — anything "
+                           "Asana Sync looks for), pick \"➕ New custom field...\" and type the exact name.")
                 mapping = {}
+                custom_field_name_errors = []
                 default_mapping = build_default_mapping(columns, custom_columns)
-                target_options = ["-- Skip --"] + KNOWN_FIELDS + custom_columns
+                target_options = ["-- Skip --"] + KNOWN_FIELDS + custom_columns + [NEW_CUSTOM_FIELD_OPTION]
                 for col in columns:
                     default = default_mapping.get(col) or "-- Skip --"
                     default_idx = target_options.index(default) if default in target_options else 0
                     choice = st.selectbox(f"'{col}' maps to", target_options, index=default_idx,
                                            key=f"map_{col}")
-                    mapping[col] = "" if choice == "-- Skip --" else choice
+                    if choice == NEW_CUSTOM_FIELD_OPTION:
+                        new_field_name = st.text_input(f"New field name for '{col}'", key=f"map_new_field_{col}")
+                        field_name_error = validate_custom_field_name(new_field_name, outreach.MASTER_COLUMNS)
+                        if field_name_error:
+                            custom_field_name_errors.append(f"'{col}': {field_name_error}")
+                            mapping[col] = ""
+                        else:
+                            mapping[col] = new_field_name.strip()
+                    else:
+                        mapping[col] = "" if choice == "-- Skip --" else choice
 
                 mapped_rows = apply_mapping(rows, mapping)
                 valid_count = count_valid_rows(mapped_rows)
@@ -512,9 +525,13 @@ def _render_data_tab(campaign_cfg, leads):
                          "are also skipped automatically, checked at import time.")
                 st.caption("Imported leads start as **Pending** — approve them below before they're eligible to send.")
 
+                for field_name_error in custom_field_name_errors:
+                    st.error(field_name_error)
                 if mapping_error:
                     st.error(mapping_error)
-                elif st.button("Import Leads", type="primary", key="confirm_import"):
+
+                if not custom_field_name_errors and not mapping_error and st.button(
+                        "Import Leads", type="primary", key="confirm_import"):
                     try:
                         client = _get_github_client()
                         payload = build_import_payload(mapped_rows)
@@ -585,15 +602,12 @@ def _render_data_tab(campaign_cfg, leads):
 def _fetch_live_stages_and_variants(client, campaign_name):
     """Re-reads the campaign's template structure fresh from GitHub's
     own API — deliberately NOT from Streamlit's local checkout, which
-    can lag behind a very recent commit for a short window until the
-    next redeploy finishes. A stage/variant deletion decided from that
-    stale local view is exactly what produced a genuinely broken,
-    unopenable campaign in production — a quick duplication followed
-    immediately by a stage deletion, where the delete acted on a local
-    view that hadn't yet caught up with the duplication's own commit.
-    Called right before Delete Stage / Delete Variant actually execute,
-    never at page-render time (that would defeat the purpose — the
-    whole risk window is between page load and the button click)."""
+    can lag behind a recent commit, sometimes for a while rather than
+    the few seconds a redeploy is supposed to take. Used both to RENDER
+    the Sequences tab (so what you see is never stale) and immediately
+    before Delete Stage / Delete Variant actually execute (so a
+    destructive action can never be decided from an outdated view even
+    if it somehow slipped past the render)."""
     filenames = client.list_directory_files(f"templates/{campaign_name}")
     return outreach.parse_stages_and_variants_from_filenames(filenames, {})
 
@@ -602,7 +616,8 @@ def _render_sequences_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
 
     try:
-        stages, existing_variants = get_existing_stages_and_variants(campaign_name, TEMPLATES_ROOT)
+        client = _get_github_client()
+        stages, existing_variants = _fetch_live_stages_and_variants(client, campaign_name)
     except Exception as exc:  # noqa: BLE001
         st.error(f"Couldn't read templates for '{campaign_name}': {exc}")
         return
