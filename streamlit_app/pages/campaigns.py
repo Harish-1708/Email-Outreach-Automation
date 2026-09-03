@@ -29,7 +29,7 @@ from data_import_logic import (  # noqa: E402
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping, count_valid_rows,
     build_import_payload, import_payload_path, build_removal_payload, removal_payload_path,
     payload_to_bytes, filter_leads, search_leads, KNOWN_FIELDS, FILTER_OPTIONS,
-    NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name, find_duplicate_columns,
+    NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name, find_duplicate_columns, build_full_lead_table,
 )
 from sequences_logic import (  # noqa: E402
     next_available_variant_letter,
@@ -624,15 +624,12 @@ def _render_data_tab(campaign_cfg, leads):
     st.caption(f"Showing {len(filtered)} of {len(leads)} lead(s)")
 
     if filtered:
+        try:
+            header_order = _get_master_header_cached(campaign_name)
+        except Exception:  # noqa: BLE001 - fall back to alphabetical if the header can't be read
+            header_order = None
         st.dataframe(
-            {
-                "LeadID": [l.get("LeadID", "") for l in filtered],
-                "Name": [f"{l.get('FirstName', '')} {l.get('LastName', '')}".strip() for l in filtered],
-                "Email": [l.get("Email", "") for l in filtered],
-                "Company": [l.get("Company", "") for l in filtered],
-                "Approval": [l.get("Approval", "") or "Pending" for l in filtered],
-                "Status": [l.get("Status", "") or "—" for l in filtered],
-            },
+            build_full_lead_table(filtered, header_order=header_order),
             width="stretch", hide_index=True,
         )
 
