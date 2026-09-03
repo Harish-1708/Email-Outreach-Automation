@@ -39,21 +39,31 @@ def _reset_streamlit_global_caches():
 def _default_live_template_structure():
     """The Sequences tab (and Delete Stage / Delete Variant specifically)
     now reads a campaign's stage/variant structure live from
-    GitHubClient.list_directory_files, never Streamlit's local checkout
-    — see pages.campaigns._fetch_live_stages_and_variants's docstring
-    for why. Streamlit executes every tab's body on every rerun
-    regardless of which tab is visually selected, so ANY test that opens
-    a campaign detail view at all now needs this mocked, not just tests
+    GitHubClient.list_directory_files, and each variant's actual
+    subject/body live from GitHubClient.get_file_content — never
+    Streamlit's local checkout — see pages.campaigns._fetch_live_stages_
+    and_variants and _fetch_live_template_content's docstrings for why.
+    Streamlit executes every tab's body on every rerun regardless of
+    which tab is visually selected, so ANY test that opens a campaign
+    detail view at all now needs both of these mocked, not just tests
     that specifically exercise Sequences. This default — the real
-    Kelson_Creators_Licensing structure, 5 stages x 4 variants — covers
-    every test that doesn't care about this specifically; a test that
-    DOES care (the delete-stage/variant tests, duplication tests using a
-    different campaign) overrides it locally with its own `with
-    patch(...)`, which always wins over this outer one."""
+    Kelson_Creators_Licensing structure (5 stages x 4 variants) with a
+    generic, valid, non-blank Subject/body per file — covers every test
+    that doesn't care about the SPECIFIC content; a test that does
+    (editing content, checking an exact rendered value) overrides
+    either mock locally with its own `with patch(...)`, which always
+    wins over this outer one."""
     default_filenames = [f"{stage}_{v}.txt" for stage in
                           ["intro", "followup1", "followup2", "followup3", "followup4"] for v in "ABCD"]
+
+    def default_get_file_content(self, path, ref="main"):
+        filename = path.rsplit("/", 1)[-1]
+        stage_variant = filename[:-4]  # strip ".txt"
+        return f"Subject: {stage_variant}\n\nBody for {stage_variant}.".encode("utf-8")
+
     with patch("github_client.GitHubClient.list_directory_files",
-               lambda self, path, ref="main": list(default_filenames)):
+               lambda self, path, ref="main": list(default_filenames)), \
+         patch("github_client.GitHubClient.get_file_content", default_get_file_content):
         yield
 
 
@@ -1521,6 +1531,46 @@ def _mock_github_writes():
         captured.setdefault("commits", []).append({"path": path, "content": content_bytes, "message": message})
 
     return captured, fake_create_file
+
+
+def test_sequences_tab_template_content_reads_live_not_from_local_disk():
+    """The other half of the reported problem: not just stage/variant
+    counts going stale, but the actual template TEXT showing an old
+    version. A genuinely fresh page load (a new session — closing and
+    reopening the app, or a different browser tab) must always show
+    whatever's actually on GitHub right now, never a snapshot from
+    whenever Streamlit's local checkout last happened to sync.
+
+    Note the scope this covers: it's the local-checkout staleness that's
+    eliminated. An already-open, already-rendered text box in the SAME
+    running session won't retroactively update just because the file
+    changed in the background — that's Streamlit's own widget/session
+    state model (a widget's value, once set, persists across reruns
+    independent of what value= is passed on a later rerun), not
+    something a data-source fix can override. A fresh load always
+    reflects the truth; a page left open the whole time doesn't
+    silently show something wrong either — it just doesn't self-update
+    without being reopened, same as any other web app tab."""
+    fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
+
+    def fake_get_file_content(self, path, ref="main"):
+        if "intro_A" in path:
+            return b"Subject: Freshly fetched from GitHub\n\nThis came from the live API, not disk."
+        return b"Subject: generic\n\ngeneric body."
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.get_file_content", fake_get_file_content):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    subject_input = next(ti for ti in at.text_input if ti.key == "subject_intro_A")
+    assert subject_input.value == "Freshly fetched from GitHub"
 
 
 def test_sequences_tab_shows_locked_variants_for_real_campaign():
