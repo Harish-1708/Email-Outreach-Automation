@@ -12,3 +12,8 @@ schedule:
   - wed
   - thu
   - fri
+sending:
+  daily_limit: 100
+  sender_rotation: false
+  rotation_accounts:
+  - sales1
