@@ -292,16 +292,13 @@ def test_build_duplicated_config_override_paused_also_resets_to_draft():
 
 # ---------- build_campaign_duplication_files ----------
 
-def test_build_campaign_duplication_files_copies_every_template_under_new_name(tmp_path):
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello there.")
-    (source_dir / "intro_B.txt").write_text("Subject: Hey\n\nHi there.")
-    (source_dir / "followup1_A.txt").write_text("Subject: \n\nFollowing up.")
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)
-
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
-                                              str(tmp_path / "config" / "campaigns"))
+def test_build_campaign_duplication_files_copies_every_template_under_new_name():
+    source_files = {
+        "intro_A.txt": b"Subject: Hi\n\nHello there.",
+        "intro_B.txt": b"Subject: Hey\n\nHi there.",
+        "followup1_A.txt": b"Subject: \n\nFollowing up.",
+    }
+    files = build_campaign_duplication_files("Bar", source_files, source_raw_override=None)
 
     paths = {f["path"] for f in files}
     assert paths == {
@@ -309,43 +306,32 @@ def test_build_campaign_duplication_files_copies_every_template_under_new_name(t
     }
 
 
-def test_build_campaign_duplication_files_content_matches_source_exactly(tmp_path):
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello there, {{FirstName}}.")
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)
-
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
-                                              str(tmp_path / "config" / "campaigns"))
+def test_build_campaign_duplication_files_content_matches_source_exactly():
+    source_files = {"intro_A.txt": b"Subject: Hi\n\nHello there, {{FirstName}}."}
+    files = build_campaign_duplication_files("Bar", source_files, source_raw_override=None)
 
     intro_file = next(f for f in files if f["path"] == "templates/Bar/intro_A.txt")
     assert intro_file["content"] == b"Subject: Hi\n\nHello there, {{FirstName}}."
 
 
-def test_build_campaign_duplication_files_never_writes_under_source_name(tmp_path):
+def test_build_campaign_duplication_files_never_writes_under_source_name():
     """The actual safety property the request is about — the duplicate's
     files must never share a path with the source's, so a later delete
-    on one can never touch the other."""
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)
-
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
-                                              str(tmp_path / "config" / "campaigns"))
-
-    assert all("templates/Foo/" not in f["path"] for f in files)
+    on one can never touch the other. There's no "Foo" name anywhere in
+    this call at all now — the function only ever knows the NEW name,
+    which is itself part of why this can't regress the way it did
+    before (see the real production bug this fixed: a stale local
+    filesystem read silently producing zero files, with no error)."""
+    source_files = {"intro_A.txt": b"Subject: Hi\n\nHello."}
+    files = build_campaign_duplication_files("Bar", source_files, source_raw_override=None)
+    assert all(f["path"].startswith("templates/Bar/") for f in files)
 
 
-def test_build_campaign_duplication_files_includes_config_override_with_draft_status(tmp_path):
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
-    config_dir = tmp_path / "config" / "campaigns"
-    config_dir.mkdir(parents=True)
-    (config_dir / "Foo.yaml").write_text("status: active\nsending:\n  daily_limit: 100\n")
+def test_build_campaign_duplication_files_includes_config_override_with_draft_status():
+    source_files = {"intro_A.txt": b"Subject: Hi\n\nHello."}
+    raw_override = {"status": "active", "sending": {"daily_limit": 100}}
 
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"), str(config_dir))
+    files = build_campaign_duplication_files("Bar", source_files, raw_override)
 
     config_file = next(f for f in files if f["path"] == "config/campaigns/Bar.yaml")
     import yaml as _yaml
@@ -354,27 +340,17 @@ def test_build_campaign_duplication_files_includes_config_override_with_draft_st
     assert written["sending"] == {"daily_limit": 100}
 
 
-def test_build_campaign_duplication_files_no_config_override_means_none_created(tmp_path):
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)  # exists, but no Foo.yaml in it
-
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
-                                              str(tmp_path / "config" / "campaigns"))
-
+def test_build_campaign_duplication_files_no_config_override_means_none_created():
+    source_files = {"intro_A.txt": b"Subject: Hi\n\nHello."}
+    files = build_campaign_duplication_files("Bar", source_files, source_raw_override=None)
     assert not any(f["path"].endswith(".yaml") for f in files)
 
 
-def test_build_campaign_duplication_files_ignores_non_txt_files(tmp_path):
-    source_dir = tmp_path / "templates" / "Foo"
-    source_dir.mkdir(parents=True)
-    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
-    (source_dir / "notes.md").write_text("some unrelated notes file")
-    (tmp_path / "config" / "campaigns").mkdir(parents=True)
-
-    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
-                                              str(tmp_path / "config" / "campaigns"))
-
-    assert all(f["path"].endswith(".txt") or f["path"].endswith(".yaml") for f in files)
-    assert not any("notes.md" in f["path"] for f in files)
+def test_build_campaign_duplication_files_raises_on_empty_source():
+    """The actual bug fix — a real duplicate that was reported: the
+    source read came back empty and a completely empty campaign got
+    silently created with a 'success' message anyway. This must now
+    raise instead, every time, regardless of why the source came back
+    empty."""
+    with pytest.raises(ValueError, match="No template files were found"):
+        build_campaign_duplication_files("Bar", {}, source_raw_override=None)
