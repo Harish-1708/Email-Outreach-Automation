@@ -55,7 +55,7 @@ MASTER_COLUMNS = [
     "Email",                 # MANDATORY — the only required field per lead
     "Company",                # Optional — blank renders as "your team"
     "Campaign",
-    "Approval",               # Pending | Yes | No | Paused (blank behaves as Pending)
+    "Approval",               # Informational only — no longer gates sending. Pending | Yes | No | Paused
     "SenderAccount",          # Optional — which account to send from. Locked in
                                 # after first send so later stages match.
     "RequestedAction",        # Free-text, NOT read by the system.
@@ -1164,8 +1164,6 @@ def get_eligible_leads(leads: List[Dict], stages: List[Dict], stage_index: int,
     for lead in leads:
         if not (lead.get("Email") or "").strip():
             continue  # Email is mandatory
-        if lead.get("Approval") != APPROVAL_YES:
-            continue
         if lead.get("Status", "") in TERMINAL_STATUSES:
             continue
         if lead.get("ReplyStatus", "") == "Replied":
