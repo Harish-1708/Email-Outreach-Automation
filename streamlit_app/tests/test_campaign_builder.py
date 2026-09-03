@@ -8,6 +8,7 @@ from campaign_builder import (
     validate_campaign_name, validate_variant_content, build_template_file_content,
     build_campaign_files, get_next_stage_for_campaign, commit_message_for_campaign,
     confirmation_matches_campaign_name, list_campaign_files_to_delete,
+    build_duplicated_config_override, build_campaign_duplication_files,
 )
 
 TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "templates")
@@ -261,3 +262,119 @@ def test_list_campaign_files_to_delete_ignores_non_txt_files(tmp_path):
 
     paths = list_campaign_files_to_delete("Foo", str(tmp_path / "templates"), str(campaigns_dir))
     assert paths == ["templates/Foo/intro_A.txt"]
+
+
+# ---------- build_duplicated_config_override ----------
+
+def test_build_duplicated_config_override_resets_status_to_draft():
+    raw = {"status": "active", "sending": {"daily_limit": 100}}
+    updated = build_duplicated_config_override(raw)
+    assert updated["status"] == "draft"
+
+
+def test_build_duplicated_config_override_preserves_other_settings():
+    raw = {"status": "active", "sending": {"daily_limit": 100}, "asana": {"enabled": True, "project_name": "X"}}
+    updated = build_duplicated_config_override(raw)
+    assert updated["sending"] == {"daily_limit": 100}
+    assert updated["asana"] == {"enabled": True, "project_name": "X"}
+
+
+def test_build_duplicated_config_override_never_mutates_input():
+    raw = {"status": "active"}
+    build_duplicated_config_override(raw)
+    assert raw == {"status": "active"}
+
+
+def test_build_duplicated_config_override_paused_also_resets_to_draft():
+    updated = build_duplicated_config_override({"status": "paused"})
+    assert updated["status"] == "draft"
+
+
+# ---------- build_campaign_duplication_files ----------
+
+def test_build_campaign_duplication_files_copies_every_template_under_new_name(tmp_path):
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello there.")
+    (source_dir / "intro_B.txt").write_text("Subject: Hey\n\nHi there.")
+    (source_dir / "followup1_A.txt").write_text("Subject: \n\nFollowing up.")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
+                                              str(tmp_path / "config" / "campaigns"))
+
+    paths = {f["path"] for f in files}
+    assert paths == {
+        "templates/Bar/intro_A.txt", "templates/Bar/intro_B.txt", "templates/Bar/followup1_A.txt",
+    }
+
+
+def test_build_campaign_duplication_files_content_matches_source_exactly(tmp_path):
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello there, {{FirstName}}.")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
+                                              str(tmp_path / "config" / "campaigns"))
+
+    intro_file = next(f for f in files if f["path"] == "templates/Bar/intro_A.txt")
+    assert intro_file["content"] == b"Subject: Hi\n\nHello there, {{FirstName}}."
+
+
+def test_build_campaign_duplication_files_never_writes_under_source_name(tmp_path):
+    """The actual safety property the request is about — the duplicate's
+    files must never share a path with the source's, so a later delete
+    on one can never touch the other."""
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
+                                              str(tmp_path / "config" / "campaigns"))
+
+    assert all("templates/Foo/" not in f["path"] for f in files)
+
+
+def test_build_campaign_duplication_files_includes_config_override_with_draft_status(tmp_path):
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    config_dir = tmp_path / "config" / "campaigns"
+    config_dir.mkdir(parents=True)
+    (config_dir / "Foo.yaml").write_text("status: active\nsending:\n  daily_limit: 100\n")
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"), str(config_dir))
+
+    config_file = next(f for f in files if f["path"] == "config/campaigns/Bar.yaml")
+    import yaml as _yaml
+    written = _yaml.safe_load(config_file["content"].decode("utf-8"))
+    assert written["status"] == "draft"
+    assert written["sending"] == {"daily_limit": 100}
+
+
+def test_build_campaign_duplication_files_no_config_override_means_none_created(tmp_path):
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)  # exists, but no Foo.yaml in it
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
+                                              str(tmp_path / "config" / "campaigns"))
+
+    assert not any(f["path"].endswith(".yaml") for f in files)
+
+
+def test_build_campaign_duplication_files_ignores_non_txt_files(tmp_path):
+    source_dir = tmp_path / "templates" / "Foo"
+    source_dir.mkdir(parents=True)
+    (source_dir / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+    (source_dir / "notes.md").write_text("some unrelated notes file")
+    (tmp_path / "config" / "campaigns").mkdir(parents=True)
+
+    files = build_campaign_duplication_files("Foo", "Bar", str(tmp_path / "templates"),
+                                              str(tmp_path / "config" / "campaigns"))
+
+    assert all(f["path"].endswith(".txt") or f["path"].endswith(".yaml") for f in files)
+    assert not any("notes.md" in f["path"] for f in files)
