@@ -10,7 +10,7 @@ from auth import login_gate, current_user  # noqa: E402
 from page_state import mark_active_page  # noqa: E402
 from config import (  # noqa: E402
     WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, WORKFLOW_SEND_REPLY,
-    WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT,
+    WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT, WORKFLOW_SYNC_ASANA,
     TEMPLATES_ROOT, CAMPAIGNS_DIR, EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH,
 )
 from email_account_slots_logic import read_local_slot_mapping  # noqa: E402
@@ -41,6 +41,7 @@ from campaign_builder import (  # noqa: E402
 )
 from settings_logic import (  # noqa: E402
     load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
+    build_asana_settings_override,
 )
 from schedule_logic import (  # noqa: E402
     validate_schedule, build_updated_schedule_override, get_current_schedule,
@@ -794,6 +795,7 @@ def _render_settings_tab(campaign_cfg, leads):
                 st.error(f"Save failed: {exc}")
 
     _render_maintenance_section_in_settings(campaign_cfg)
+    _render_asana_sync_section_in_settings(campaign_cfg)
     _render_send_section_in_settings(campaign_cfg, leads)
     _render_delete_campaign_section(campaign_cfg)
 
@@ -1105,6 +1107,56 @@ def _render_status_controls(campaign_cfg, leads, just_arrived: bool):
             if st.button("Cancel", key="cancel_launch_button"):
                 st.session_state[launch_confirm_key] = False
                 st.rerun()
+
+
+def _render_asana_sync_section_in_settings(campaign_cfg):
+    """Enable/configure syncing this campaign's leads to an Asana
+    project, and trigger an on-demand sync. The actual sync (create/
+    update tasks, decide which stage a task belongs in, never create a
+    duplicate) all happens in sync_asana.yml / outreach.py — this is
+    only ever the settings + trigger, matching every other "does real
+    work elsewhere" action in this app."""
+    campaign_name = campaign_cfg["_campaign_name"]
+    asana_settings = campaign_cfg.get("asana") or {}
+    with st.expander("🔗 Asana Sync", expanded=bool(asana_settings.get("enabled"))):
+        st.caption(
+            "Creates or updates one Asana task per lead — never a duplicate, since each lead's task is "
+            "tracked once it's first created. A lead's stage (Sourced / Outreach Sent / Follow-up / "
+            "Negotiating) is set automatically from its send/reply history; Rights Secured and "
+            "Declined / Dead are only ever set by hand in Asana and are never overwritten by a sync."
+        )
+        enabled = st.checkbox("Enable Asana sync for this campaign", value=bool(asana_settings.get("enabled")),
+                               key="asana_sync_enabled")
+        project_name = st.text_input("Asana project name (exact match)",
+                                      value=asana_settings.get("project_name", ""), key="asana_sync_project_name")
+
+        if st.button("💾 Save Asana Settings", key="asana_sync_save"):
+            if enabled and not project_name.strip():
+                st.error("Enter the Asana project name, or uncheck Enable.")
+            else:
+                try:
+                    raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+                    updated = build_asana_settings_override(raw_override, enabled, project_name.strip())
+                    client = _get_github_client()
+                    client.create_file(
+                        override_file_path(campaign_name), override_to_yaml_bytes(updated),
+                        message=f"Update Asana sync settings for {campaign_name} (via Streamlit, "
+                                f"by {current_user()})",
+                    )
+                    st.success("Asana settings saved. May take a minute to reflect here while the app redeploys.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to save: {exc}")
+
+        if asana_settings.get("enabled"):
+            if st.button("🔄 Sync to Asana Now", key="asana_sync_now"):
+                try:
+                    client = _get_github_client()
+                    client.dispatch_workflow(WORKFLOW_SYNC_ASANA, {"campaign": campaign_name})
+                    st.success(f"Asana sync triggered for '{campaign_name}'. Check the Actions tab for progress.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to trigger sync: {exc}")
+        else:
+            st.caption("Enable and save first to sync.")
 
 
 def _render_send_section_in_settings(campaign_cfg, leads):
