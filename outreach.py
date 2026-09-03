@@ -859,23 +859,41 @@ class TemplateError(Exception):
     pass
 
 
-def load_template(templates_dir: str, template_prefix: str, variant: str) -> Dict[str, str]:
-    """Template file format: first line = 'Subject: ...', blank line, then body."""
-    path = os.path.join(templates_dir, f"{template_prefix}_{variant}.txt")
-    if not os.path.exists(path):
-        raise TemplateError(f"Template file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+def parse_template_content(content: str, source_description: str = "") -> Dict[str, str]:
+    """The actual parsing logic, decoupled from HOW the raw text was
+    obtained — local disk, GitHub's API, anything. Template format:
+    first line = 'Subject: ...', blank line, then the body. See
+    load_template for the local-filesystem convenience wrapper most
+    callers use; this exists so a caller that already has freshly-
+    fetched content (e.g. from GitHub's API directly, to sidestep
+    Streamlit's local checkout potentially lagging behind a very recent
+    edit) can validate and parse it without going through disk at all.
 
+    source_description: an optional string appended after "Template"
+    in the error message for context (e.g. " templates/Foo/intro_A.txt"
+    — note the leading space), matching what load_template has always
+    produced."""
     if not content.startswith("Subject:"):
         raise TemplateError(
-            f"Template {path} must start with a 'Subject: ...' line, followed by a "
+            f"Template{source_description} must start with a 'Subject: ...' line, followed by a "
             "blank line and then the email body."
         )
     lines = content.split("\n")
     subject = lines[0][len("Subject:"):].strip()
     body = "\n".join(lines[1:]).lstrip("\n")
     return {"subject": subject, "body": body}
+
+
+def load_template(templates_dir: str, template_prefix: str, variant: str) -> Dict[str, str]:
+    """Reads a template file from local disk. See parse_template_content
+    for validating already-fetched content directly instead — the
+    exact same rules, decoupled from where the text came from."""
+    path = os.path.join(templates_dir, f"{template_prefix}_{variant}.txt")
+    if not os.path.exists(path):
+        raise TemplateError(f"Template file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return parse_template_content(content, f" {path}")
 
 
 def render_text(text: str, lead: Dict[str, str], missing_out: Optional[List[str]] = None) -> str:
