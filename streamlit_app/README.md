@@ -160,14 +160,22 @@ Remove buttons on the Email Accounts page instead:
   lag was in effect at the exact moment; it now refuses outright with a
   clear error if the source ever comes back empty, and reports exactly
   how many files it copied so you can confirm the count yourself.
-- **The whole Sequences tab reads its stage/variant structure live from
-  GitHub's API on every render**, not just as a pre-delete safety check
-  — the local checkout could otherwise keep showing an already-deleted
-  stage indefinitely, with no in-app refresh or re-login able to fix
-  it, since the staleness lived in the checkout itself, not in any
-  session state. Delete Stage and Delete Variant also independently
-  re-verify immediately before deleting anything, so even a change
-  within the same session can't be acted on from an outdated view.
+- **The whole Sequences tab reads its stage/variant structure — and now
+  every template's actual subject/body text too — live from GitHub's
+  API on every render**, not just as a pre-delete safety check. The
+  local checkout could otherwise keep showing an already-deleted stage,
+  or a template's old text after a recent save, indefinitely — no
+  in-app refresh or re-login could ever fix it, since the staleness
+  lived in the checkout itself, not in any session state. Delete Stage
+  and Delete Variant also independently re-verify immediately before
+  deleting anything, so even a change within the same session can't be
+  acted on from an outdated view. One inherent limitation worth
+  knowing: an already-open, already-rendered edit box in a session
+  that's stayed open the whole time won't retroactively update just
+  because the file changed in the background — that's how Streamlit's
+  own widget state works, not something a live data source can override.
+  A fresh page load (closing and reopening, or a different tab) always
+  reflects the current truth.
 - **CSV import can create a genuinely new custom field**, not just map
   a column to one that already exists as a Sheet column from some
   earlier import — pick "➕ New custom field..." and type the exact
