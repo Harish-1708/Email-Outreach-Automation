@@ -720,10 +720,31 @@ class SheetsConnector:
         columns (Title, Website, LinkedIn, ...) get filled in correctly
         too. Any field not present in `fields` is left blank in that
         column, not an error — a CSV import commonly won't map every
-        column."""
+        column. IMPORTANT: a field name that ISN'T already in the header
+        is silently dropped here, not an error — see
+        ensure_master_header_includes, which import_leads calls first
+        specifically so a brand-new custom field name actually gets a
+        real column instead of being lost this way."""
         header = self.master_ws.row_values(1)
         row = [str(fields.get(col, "")) for col in header]
         self.master_ws.append_row(row, value_input_option="RAW")
+
+    def ensure_master_header_includes(self, column_names: List[str]) -> None:
+        """Widens the Master Sheet's header to include any of the given
+        column names it doesn't already have — appended at the end,
+        every existing column and its position left untouched. Called
+        by import_leads before appending any rows, so a brand-new
+        custom field name (one this campaign's Sheet has never seen
+        before) actually gets a real column instead of being silently
+        dropped by append_lead, which can only ever fill in columns the
+        header already has."""
+        current_header = self.master_ws.row_values(1)
+        missing = [c for c in column_names if c and c not in current_header]
+        if not missing:
+            return
+        start_col = len(current_header) + 1
+        for i, col_name in enumerate(missing):
+            self.master_ws.update_cell(1, start_col + i, col_name)
 
     def update_lead_statuses(self, row_numbers_to_status: Dict[int, str]) -> None:
         """Bulk status update (e.g. soft-remove) — one batch_update call
@@ -1854,6 +1875,17 @@ def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Di
     existing_ids = [int(l["LeadID"]) for l in existing if str(l.get("LeadID", "")).strip().isdigit()]
     next_id = (max(existing_ids) + 1) if existing_ids else 1
     existing_emails = {(l.get("Email") or "").strip().lower() for l in existing if (l.get("Email") or "").strip()}
+
+    # Widen the header ONCE, before appending anything — otherwise a
+    # brand-new custom field name (never seen before on this campaign's
+    # Sheet) gets silently dropped by append_lead, which only fills in
+    # columns the header already has. Every incoming field name across
+    # every lead is considered, not just the first row's, in case
+    # different rows map different custom columns.
+    all_field_names = set()
+    for lead in new_leads:
+        all_field_names.update(lead.keys())
+    sheets.ensure_master_header_includes(sorted(all_field_names))
 
     imported = 0
     skipped_duplicate = 0
