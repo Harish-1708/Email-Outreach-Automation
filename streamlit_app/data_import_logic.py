@@ -47,18 +47,37 @@ def _normalize(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-def build_default_mapping(csv_columns: List[str], custom_columns: List[str]) -> Dict[str, str]:
+def build_default_mapping(csv_columns: List[str], custom_columns: List[str],
+                           reserved_names: Optional[List[str]] = None) -> Dict[str, str]:
     """Best-effort auto-mapping by normalized name match, so the user
     usually just reviews/adjusts rather than mapping from scratch.
     Returns {csv_column: target_field_or_empty_string} — "" means
     unmapped/skip. Known fields (FirstName/LastName/Email/Company) are
-    preferred over a same-named custom column, in case of a clash."""
+    preferred over a same-named custom column, in case of a clash.
+
+    A column that doesn't match anything (including no existing custom
+    column) defaults to a NEW custom field using ITS OWN name — the
+    common case, bringing in creator-outreach data that's never been
+    imported before, needs zero extra clicks or retyping. The one
+    exception: a column whose own name collides with one of the
+    system's own reserved tracking columns defaults to Skip instead,
+    rather than risking a silent overwrite of real tracking data —
+    same rule validate_custom_field_name enforces when someone
+    explicitly types a new field name instead of using this default."""
+    reserved_lower = {r.lower() for r in (reserved_names or [])}
     known_by_norm = {_normalize(f): f for f in KNOWN_FIELDS}
     custom_by_norm = {_normalize(c): c for c in custom_columns}
     mapping = {}
     for col in csv_columns:
         key = _normalize(col)
-        mapping[col] = known_by_norm.get(key) or custom_by_norm.get(key) or ""
+        if key in known_by_norm:
+            mapping[col] = known_by_norm[key]
+        elif key in custom_by_norm:
+            mapping[col] = custom_by_norm[key]
+        elif col.strip().lower() in reserved_lower:
+            mapping[col] = ""
+        else:
+            mapping[col] = col.strip()
     return mapping
 
 
