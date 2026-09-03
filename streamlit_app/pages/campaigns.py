@@ -3,6 +3,7 @@ import sys
 import time
 
 import streamlit as st
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -201,9 +202,26 @@ def _duplicate_campaign_dialog(source_campaign_name, existing_campaigns):
             st.error(name_error)
         else:
             try:
-                files = build_campaign_duplication_files(source_campaign_name, new_name, TEMPLATES_ROOT,
-                                                          CAMPAIGNS_DIR)
                 client = _get_github_client()
+                # Read the SOURCE fresh from GitHub itself, never from
+                # Streamlit's own local checkout — that checkout can lag
+                # behind a very recent commit until the next redeploy
+                # finishes, and reading it here previously produced a
+                # duplicate with ZERO template files whenever that lag
+                # was in effect, with no error at all.
+                filenames = client.list_directory_files(f"templates/{source_campaign_name}")
+                source_template_files = {
+                    filename: client.get_file_content(f"templates/{source_campaign_name}/{filename}")
+                    for filename in filenames if filename.endswith(".txt")
+                }
+
+                override_path = f"config/campaigns/{source_campaign_name}.yaml"
+                source_raw_override = None
+                if client.get_file_sha(override_path) is not None:
+                    override_bytes = client.get_file_content(override_path)
+                    source_raw_override = yaml.safe_load(override_bytes.decode("utf-8")) or {}
+
+                files = build_campaign_duplication_files(new_name, source_template_files, source_raw_override)
                 client.commit_campaign_files_directly(
                     files=files,
                     commit_message=f"Duplicate '{source_campaign_name}' as '{new_name}' "
@@ -212,10 +230,12 @@ def _duplicate_campaign_dialog(source_campaign_name, existing_campaigns):
                 _load_hub_rows.clear()
                 st.session_state["duplicating_campaign"] = None
                 st.success(
-                    f"'{new_name}' created as a Draft copy of '{source_campaign_name}'. It'll appear in "
-                    "the list below within a minute or so, once the app finishes redeploying."
+                    f"'{new_name}' created as a Draft copy of '{source_campaign_name}' with "
+                    f"{len(source_template_files)} template file(s). It'll appear in the list below "
+                    "within a minute or so, once the app finishes redeploying — worth double-checking "
+                    "that file count matches what you expected."
                 )
-            except GitHubActionsError as exc:
+            except (GitHubActionsError, ValueError) as exc:
                 st.error(f"Failed to duplicate: {exc}")
 
 
