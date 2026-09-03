@@ -1550,6 +1550,42 @@ def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
     assert len(matching_selects) == 2
 
 
+def test_draft_campaign_with_real_leads_still_shows_them(tmp_path):
+    """The actual root cause of the reported issue: a Draft campaign
+    (every duplicate starts as Draft, by design) was treated as "has no
+    data, don't even query the Sheet" — correct for a genuinely
+    untouched brand-new campaign, wrong for a duplicate that's had
+    leads imported into it while still sitting in Draft (not yet
+    launched for sending). Draft only means 'not launched'; it must
+    never mean 'skip fetching data'."""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text("status: draft\n")
+    fake_ws = _campaigns_page_fake_ws()
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("config.CAMPAIGNS_DIR", str(tmp_path / "config")):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    info_texts = " ".join(i.value for i in at.info)
+    assert "Draft" in info_texts  # still shows the Draft notice
+    # The actual bug's direct symptom: an incorrectly-empty leads list
+    # triggers this exact "No leads yet" message even though the fixture
+    # Sheet genuinely has leads in it — this is the meaningful check, not
+    # the "Showing X of Y" caption, which never even renders when leads
+    # is empty (an early return skips straight past it).
+    assert "No leads yet" not in info_texts
+    markdown_texts = " ".join(m.value for m in at.markdown)
+    assert "Kelson_Creators_Licensing" in markdown_texts  # the page title rendered, past the draft branch
+
+
 def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
     """The tool built for exactly the reported issue: leads confirmed
     in the real Sheet not showing up in the app after repeated
