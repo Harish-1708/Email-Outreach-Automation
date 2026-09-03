@@ -609,6 +609,7 @@ def _render_data_tab(campaign_cfg, leads):
 
     st.divider()
     st.subheader("Leads")
+    st.caption("Approval is informational only — every lead with a valid email is eligible to send.")
     if not leads:
         st.info("No leads yet — add some above.")
         return
@@ -777,8 +778,13 @@ def _render_sequences_tab(campaign_cfg, leads):
             for stage in stages:
                 prefix = stage["template_prefix"]
                 st.markdown(f"**{stage['name']}**")
-                subject = st.text_input("Subject", key=f"newvariant_subject_{prefix}")
-                body = st.text_area("Body", key=f"newvariant_body_{prefix}", height=120)
+                # Keyed by variant letter too, not just stage — without
+                # this, Streamlit reuses the SAME widget across separate
+                # "Add Variant" attempts (adding B, then later C), and
+                # whatever was typed for the earlier variant silently
+                # carries over into the next one instead of starting blank.
+                subject = st.text_input("Subject", key=f"newvariant_subject_{prefix}_{next_letter}")
+                body = st.text_area("Body", key=f"newvariant_body_{prefix}_{next_letter}", height=120)
                 contents_by_stage[prefix] = {"subject": subject, "body": body}
 
             if st.button(f"Add Variant {next_letter}", type="primary"):
