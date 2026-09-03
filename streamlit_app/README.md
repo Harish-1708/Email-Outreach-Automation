@@ -160,6 +160,13 @@ Remove buttons on the Email Accounts page instead:
   lag was in effect at the exact moment; it now refuses outright with a
   clear error if the source ever comes back empty, and reports exactly
   how many files it copied so you can confirm the count yourself.
+- **Delete Stage and Delete Variant re-verify the campaign's live
+  structure against GitHub's API immediately before deleting anything**,
+  for the same reason as above — a Delete performed shortly after some
+  other change (a duplication, another edit) could otherwise act on a
+  stale local view of which stages/variants actually exist. If the live
+  structure doesn't match what the page believes, the action is refused
+  with a clear message instead of proceeding on an outdated assumption.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
