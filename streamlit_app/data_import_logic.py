@@ -14,6 +14,24 @@ from typing import Dict, List, Optional, Tuple
 
 KNOWN_FIELDS = ["FirstName", "LastName", "Email", "Company"]
 
+NEW_CUSTOM_FIELD_OPTION = "\u2795 New custom field..."
+
+
+def validate_custom_field_name(name: str, reserved_names: List[str]) -> Optional[str]:
+    """A brand-new custom field name (typed when mapping a CSV column
+    that doesn't match anything existing) can't be blank, and can't
+    collide with one of the system's own tracked columns — that WOULD
+    silently corrupt the system's own tracking data the moment this
+    import writes to the Sheet, since a write only ever goes by column
+    NAME, with no notion of "this one's reserved"."""
+    name = (name or "").strip()
+    if not name:
+        return "Enter a name for the new custom field, or choose Skip instead."
+    reserved_lower = {r.lower() for r in reserved_names}
+    if name.lower() in reserved_lower:
+        return f"'{name}' is already used internally by this system — pick a different name."
+    return None
+
 
 def parse_csv_bytes(raw_bytes: bytes) -> Tuple[List[str], List[Dict[str, str]]]:
     """Returns (column_names, rows). utf-8-sig handles a BOM from Excel
