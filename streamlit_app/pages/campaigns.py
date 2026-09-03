@@ -31,7 +31,7 @@ from data_import_logic import (  # noqa: E402
     NEW_CUSTOM_FIELD_OPTION, validate_custom_field_name,
 )
 from sequences_logic import (  # noqa: E402
-    load_variant_content, next_available_variant_letter,
+    next_available_variant_letter,
     build_variant_edit_file, build_new_variant_files_for_all_stages, validate_new_variant_contents,
     has_content_changed, can_delete_stage, build_stage_deletion_paths, can_delete_variant,
     build_variant_deletion_paths,
@@ -612,6 +612,19 @@ def _fetch_live_stages_and_variants(client, campaign_name):
     return outreach.parse_stages_and_variants_from_filenames(filenames, {})
 
 
+def _fetch_live_template_content(client, campaign_name, stage_prefix, variant):
+    """Reads one template file's current subject+body fresh from
+    GitHub's own API — same "never trust the local checkout" reasoning
+    as _fetch_live_stages_and_variants, extended to template CONTENT,
+    not just which stages/variants exist. Without this, opening a
+    template to edit it shortly after saving a previous change (or
+    after anyone else's recent save) could show a stale version — and
+    saving from there would silently overwrite the real, newer content
+    with that stale copy."""
+    content_bytes = client.get_file_content(f"templates/{campaign_name}/{stage_prefix}_{variant}.txt")
+    return outreach.parse_template_content(content_bytes.decode("utf-8"))
+
+
 def _render_sequences_tab(campaign_cfg, leads):
     campaign_name = campaign_cfg["_campaign_name"]
 
@@ -638,7 +651,7 @@ def _render_sequences_tab(campaign_cfg, leads):
         st.markdown(f"**{stage['name']}**")
         for variant in existing_variants:
             try:
-                original = load_variant_content(campaign_name, prefix, variant, TEMPLATES_ROOT)
+                original = _fetch_live_template_content(client, campaign_name, prefix, variant)
             except Exception as exc:  # noqa: BLE001
                 st.warning(f"{prefix}_{variant}: couldn't load — {exc}")
                 continue
