@@ -1,1 +1,4 @@
 status: paused
+asana:
+  enabled: true
+  project_name: Creator Outreach
