@@ -8,7 +8,7 @@ from data_import_logic import (
     parse_csv_bytes, build_default_mapping, apply_mapping, validate_mapping,
     count_valid_rows, build_import_payload, import_payload_path,
     build_removal_payload, removal_payload_path, payload_to_bytes,
-    filter_leads, search_leads, validate_custom_field_name,
+    filter_leads, search_leads, validate_custom_field_name, find_duplicate_columns,
     FILTER_ALL, FILTER_PENDING_APPROVAL, FILTER_IN_PROGRESS, FILTER_REPLIED,
     FILTER_BOUNCED, FILTER_REMOVED,
 )
@@ -243,3 +243,38 @@ def test_validate_custom_field_name_rejects_reserved_name_case_insensitively():
 
 def test_validate_custom_field_name_allows_name_after_stripping_whitespace():
     assert validate_custom_field_name("  Client  ", reserved_names=["Email"]) is None
+
+
+# ---------- find_duplicate_columns ----------
+
+def test_find_duplicate_columns_detects_the_actual_reported_case():
+    columns = ["Lead", "Name", "Email", "Ad Ready", "Last Contact Date", "Last Contact Date"]
+    assert find_duplicate_columns(columns) == ["Last Contact Date"]
+
+
+def test_find_duplicate_columns_none_when_all_unique():
+    assert find_duplicate_columns(["Email", "FirstName", "Client"]) == []
+
+
+def test_find_duplicate_columns_multiple_duplicates_sorted():
+    columns = ["Email", "Client", "Client", "Product", "Product"]
+    assert find_duplicate_columns(columns) == ["Client", "Product"]
+
+
+def test_find_duplicate_columns_three_or_more_occurrences_still_reported_once():
+    columns = ["Email", "Client", "Client", "Client"]
+    assert find_duplicate_columns(columns) == ["Client"]
+
+
+def test_find_duplicate_columns_empty_list():
+    assert find_duplicate_columns([]) == []
+
+
+def test_parse_csv_bytes_confirms_duplicate_header_data_loss():
+    """Documents the actual behavior driving why find_duplicate_columns
+    matters — Python's own csv.DictReader silently keeps only the LAST
+    duplicate-named column's value, before this module ever sees it."""
+    raw = b"Email,Last Contact Date,Last Contact Date\nsam@abc.com,2026-08-01,2026-08-02\n"
+    columns, rows = parse_csv_bytes(raw)
+    assert columns.count("Last Contact Date") == 2  # the header itself still shows both
+    assert rows[0]["Last Contact Date"] == "2026-08-02"  # but only the LAST value survived
