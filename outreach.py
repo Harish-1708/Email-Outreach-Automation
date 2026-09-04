@@ -2900,6 +2900,68 @@ def cmd_send(args):
         print(f"  ERROR {r['email']}: [{r['error_type']}] {r['error']}")
 
 
+def cmd_auto_send_all(args):
+    """The scheduled trigger's entry point for automated sending — loops
+    over EVERY discovered campaign, and for each one that's actually
+    Running (status == "active"; Draft/Paused/Deleted are skipped
+    outright, never even attempted), sends every stage in turn. Each
+    stage's own send_batch call already enforces the sending window,
+    the daily limit, and every per-lead eligibility rule (correct wait
+    days passed, not already sent, etc.) — calling every stage on every
+    scheduled run is safe and idempotent: a stage with nothing due
+    right now is simply a no-op for that call, not an error.
+
+    One campaign's failure, or one stage being outside the sending
+    window, is reported but never blocks any other campaign or stage
+    in the same run — this is what lets a schedule window actually mean
+    something (leads that come due while the window is open get sent
+    automatically, without a human clicking anything), rather than
+    being a check nothing ever exercises."""
+    accounts = load_email_accounts()
+    any_running = False
+    any_errors = False
+
+    for campaign_name in discover_campaign_names():
+        try:
+            campaign_cfg = get_campaign(campaign_name)
+        except Exception as exc:  # noqa: BLE001 - a broken campaign config shouldn't sink the whole run
+            print(f"{campaign_name}: couldn't load config ({exc}) — skipped.")
+            any_errors = True
+            continue
+
+        if (campaign_cfg.get("status") or "active") != "active":
+            continue
+        any_running = True
+
+        try:
+            sheets = _connect_sheets(campaign_cfg)
+        except Exception as exc:  # noqa: BLE001 - one campaign's connection failure shouldn't block others
+            print(f"{campaign_name}: couldn't connect to its Sheet ({exc}).")
+            any_errors = True
+            continue
+
+        for stage in campaign_cfg["stages"]:
+            stage_name = stage["name"]
+            try:
+                results = send_batch(campaign_cfg, sheets, accounts, stage_name,
+                                      batch_size=campaign_cfg["sending"]["daily_limit"])
+                if results:
+                    sent = sum(1 for r in results if r.get("status") == "sent")
+                    print(f"{campaign_name} / {stage_name}: sent {sent} of {len(results)} attempted.")
+            except (CampaignPausedError, OutsideSendingWindowError) as exc:
+                # Expected, routine — not every stage of every campaign is
+                # due to send on every run. Not an error.
+                print(f"{campaign_name} / {stage_name}: skipped ({exc}).")
+            except Exception as exc:  # noqa: BLE001 - one stage's failure shouldn't block the rest
+                print(f"{campaign_name} / {stage_name}: FAILED ({exc}).")
+                any_errors = True
+
+    if not any_running:
+        print("No campaign is currently Running — nothing to do.")
+    if any_errors:
+        sys.exit(1)
+
+
 def cmd_backfill_thread_subject(args):
     """One-time migration command — see backfill_thread_subjects' docstring
     for exactly what this does and its accuracy caveat. Defaults to
@@ -3706,6 +3768,10 @@ def main():
     p_sync_asana_all = sub.add_parser("sync-asana-all",
                                        help="Sync every campaign with asana.enabled set to true")
     p_sync_asana_all.set_defaults(func=cmd_sync_asana_all)
+
+    p_auto_send_all = sub.add_parser("auto-send-all",
+                                      help="Send every stage due right now, for every Running campaign")
+    p_auto_send_all.set_defaults(func=cmd_auto_send_all)
 
     p_health = sub.add_parser("check-account-health",
                                help="Check every configured account's IMAP connectivity and write results "
