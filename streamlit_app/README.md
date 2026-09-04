@@ -152,6 +152,23 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **A campaign's sending window is now actually automated, not just a
+  check nothing ever exercised.** A new `auto_send.yml` workflow runs
+  every 30 minutes and calls `outreach.py auto-send-all`, which loops
+  over every campaign, skips anything not Running (Draft/Paused/Deleted
+  are never touched), and attempts every stage in turn for the rest.
+  `send_batch`'s own existing checks (the sending window, the daily
+  limit, every per-lead eligibility rule) decide whether anything
+  actually goes out — most stages on most runs correctly do nothing,
+  which isn't a failure, just nothing being due yet. No per-campaign
+  opt-in is needed: any Running campaign with a configured Schedule
+  (window/days/timezone) is picked up automatically; a Running campaign
+  with no schedule set behaves as "always allowed," exactly as before
+  this existed. The manual "Send" button in Settings still works
+  exactly as before, for an on-demand send outside of waiting for the
+  next scheduled pass.
+
+
 - **Duplicating a campaign reads the source fresh from GitHub's API**,
   deliberately not from Streamlit's own local checkout of the repo —
   that checkout can lag behind a very recent commit for a short window
@@ -228,6 +245,13 @@ Remove buttons on the Email Accounts page instead:
   is a long run of digits) comes back as a Python `int`. Every
   already-synced lead hit exactly this on the next sync run before it
   was fixed.
+- **A stale AsanaTaskGID (Asana returns a 404 for it) self-heals** — a
+  fresh task gets created and the dead GID is overwritten with the new
+  one, rather than that lead failing every sync forever. A 403 is
+  deliberately handled differently and stays a hard, visible error:
+  it could mean the task still exists but access to it was lost, and
+  creating a second one in that case would be a real duplicate sitting
+  in Asana that the current token just can't see.
 
 - **Asana sync needs `ASANA_ACCESS_TOKEN` as a GitHub secret** — a
   Personal Access Token from whichever Asana account should own the
