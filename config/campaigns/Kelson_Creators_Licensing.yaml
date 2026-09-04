@@ -1,4 +1,4 @@
-status: paused
+status: active
 schedule:
   timezone: America/Los_Angeles
   window_start: 09:00
