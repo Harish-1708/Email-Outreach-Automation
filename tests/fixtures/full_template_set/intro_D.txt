@@ -1,0 +1,7 @@
+Subject: Test intro subject variant D
+
+Hi {{FirstName}},
+
+This is a stable, dedicated test fixture template for stage intro, variant D — never tied to any real, live campaign, so it can never be accidentally modified or deleted by the app's own Delete Stage / Delete Variant features.
+
+Company: {{Company}}

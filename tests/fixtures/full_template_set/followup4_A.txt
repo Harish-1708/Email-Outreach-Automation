@@ -1,0 +1,7 @@
+Subject: 
+
+Hi {{FirstName}},
+
+This is a stable, dedicated test fixture template for stage followup4, variant A — never tied to any real, live campaign.
+
+Company: {{Company}}
