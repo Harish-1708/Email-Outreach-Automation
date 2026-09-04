@@ -1,7 +1,7 @@
 status: active
 schedule:
   timezone: America/Chicago
-  window_start: 09:00
+  window_start: '10:00'
   window_end: '17:00'
   send_days:
   - fri
