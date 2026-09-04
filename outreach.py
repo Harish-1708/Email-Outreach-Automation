@@ -55,7 +55,7 @@ MASTER_COLUMNS = [
     "Email",                 # MANDATORY — the only required field per lead
     "Company",                # Optional — blank renders as "your team"
     "Campaign",
-    "Approval",               # Informational only — no longer gates sending. Pending | Yes | No | Paused
+    "Approval",               # Pending | Yes | No | Paused (blank behaves as Pending)
     "SenderAccount",          # Optional — which account to send from. Locked in
                                 # after first send so later stages match.
     "RequestedAction",        # Free-text, NOT read by the system.
@@ -86,10 +86,6 @@ MASTER_COLUMNS = [
                                 # line blank to continue this same thread
                                 # ("Re: <ThreadSubject>") instead of starting a
                                 # new one — see render_email / Section 5.
-    "AsanaTaskGID",            # Set automatically the first time a lead is synced
-                                # to Asana — checked before every future sync so a
-                                # lead never gets a second task created for it.
-                                # Never edit this by hand.
 ]
 # NOTE: this is the REQUIRED prefix of the Master header row. You may add
 # extra columns of your own AFTER these (e.g. "Industry", "JobTitle") and
@@ -331,24 +327,36 @@ ALL_VARIANT_LETTERS = ["A", "B", "C", "D"]
 
 def parse_stages_and_variants_from_filenames(filenames: List[str], stage_wait_days: Dict[str, int],
                                               source_description: str = "") -> Tuple[List[Dict], List[str]]:
-    """The actual validation logic, decoupled from HOW the filenames were
-    obtained — local disk, a GitHub API directory listing, anything.
-    discover_stages_and_variants below is the local-filesystem
-    convenience wrapper most callers use; this exists so a caller that
-    already has an authoritative filename list can validate against
-    THAT directly — e.g. one just fetched fresh from GitHub's API to
-    sidestep Streamlit's own local checkout potentially lagging behind
-    a very recent commit, which is exactly the gap that let a
-    duplicated campaign — and separately, a destructive Delete Stage /
-    Delete Variant action performed shortly after one — see a stale,
-    inconsistent view of which files actually exist.
+    """Auto-detects a campaign's stage sequence and variant set purely from
+    which template FILENAMES exist — no filesystem access, no YAML
+    declaration required. Minimum is 1 stage + 1 variant (just
+    intro_A.txt); maximum is 5 stages x A-D.
 
-    source_description: an optional string appended to error messages
-    for context (e.g. " in templates/Foo"), matching what
-    discover_stages_and_variants has always produced."""
+    Pulled out of discover_stages_and_variants as a pure function so any
+    caller with a filename list — a local directory listing, or a live
+    GitHub API response — gets the exact same validation. A caller that
+    reads from a git checkout that can lag behind a very recent commit
+    (e.g. a Streamlit Cloud redeploy in progress) must never be the ONLY
+    way to run this check; that staleness is what silently corrupted a
+    real campaign in one deployment of this codebase (a stale read let a
+    Delete Stage action commit based on an inconsistent view of which
+    variants existed). Called with names fetched fresh from GitHub's API,
+    this same validation catches that inconsistency instead of missing it.
+
+    Two things keep this safe rather than silently permissive:
+    - Stages must be CONTIGUOUS from Intro — a gap (e.g. intro + followup2
+      but no followup1 files) is a configuration error, not "skip a stage".
+    - Every included stage must offer the EXACT SAME variant letters as
+      Intro. A campaign with fewer variants entirely (e.g. just A) is
+      fine; a LATER stage quietly missing ONE variant that an earlier
+      stage has is almost always an accidental missing file, not an
+      intentional design, so it's rejected with a clear message instead
+      of silently shrinking just that stage.
+    """
     filename_set = set(filenames)
     stages: List[Dict] = []
     canonical_variants: Optional[List[str]] = None
+    label = source_description or "the given file list"
 
     for prefix in CANONICAL_STAGE_ORDER:
         found_variants = [v for v in ALL_VARIANT_LETTERS if f"{prefix}_{v}.txt" in filename_set]
@@ -366,7 +374,7 @@ def parse_stages_and_variants_from_filenames(filenames: List[str], stage_wait_da
             if extra:
                 problems.append(f"has extra variant(s) {extra} not present in '{stages[0]['name']}'")
             raise ConfigError(
-                f"Inconsistent variants for stage '{prefix}'{source_description}: {'; '.join(problems)}. "
+                f"Inconsistent variants for stage '{prefix}' in {label}: {'; '.join(problems)}. "
                 "Every stage must offer the same variant letters — or specify 'stages' and 'variants' "
                 "explicitly together in this campaign's override file if that's genuinely intentional."
             )
@@ -378,7 +386,7 @@ def parse_stages_and_variants_from_filenames(filenames: List[str], stage_wait_da
 
     if not stages:
         raise ConfigError(
-            f"No template files found{source_description}. Expected at least 'intro_A.txt' "
+            f"No template files found in {label}. Expected at least 'intro_A.txt' "
             "(or another variant letter)."
         )
 
@@ -386,29 +394,16 @@ def parse_stages_and_variants_from_filenames(filenames: List[str], stage_wait_da
 
 
 def discover_stages_and_variants(templates_dir: str, stage_wait_days: Dict[str, int]) -> Tuple[List[Dict], List[str]]:
-    """Auto-detects a campaign's stage sequence and variant set purely from
-    which template files exist — no YAML declaration required. Minimum is
-    1 stage + 1 variant (just intro_A.txt); maximum is 5 stages x A-D.
-
-    Two things keep this safe rather than silently permissive:
-    - Stages must be CONTIGUOUS from Intro — a gap (e.g. intro + followup2
-      but no followup1 files) is a configuration error, not "skip a stage".
-    - Every included stage must offer the EXACT SAME variant letters as
-      Intro. A campaign with fewer variants entirely (e.g. just A) is
-      fine; a LATER stage quietly missing ONE variant that an earlier
-      stage has is almost always an accidental missing file, not an
-      intentional design, so it's rejected with a clear message instead
-      of silently shrinking just that stage.
-
-    Reads the local filesystem — see parse_stages_and_variants_from_filenames
-    for validating against an already-fetched filename list instead (e.g.
-    from GitHub's API directly, when the local checkout's own freshness
-    can't be trusted for a destructive or data-integrity-critical action).
-    """
+    """Thin filesystem wrapper around parse_stages_and_variants_from_filenames.
+    Prefer calling that directly with a live-fetched filename list (e.g.
+    from GitHub's API) wherever staleness matters — see its own
+    docstring for why. This wrapper remains for callers that only ever
+    run against a definitely-current local checkout (a GitHub Actions
+    workflow's own checkout step, never a long-lived Streamlit process)."""
     if not os.path.isdir(templates_dir):
         raise ConfigError(f"Templates directory not found: {templates_dir}")
     filenames = os.listdir(templates_dir)
-    return parse_stages_and_variants_from_filenames(filenames, stage_wait_days, f" in {templates_dir}")
+    return parse_stages_and_variants_from_filenames(filenames, stage_wait_days, source_description=templates_dir)
 
 
 def get_campaign(campaign_name: str, settings_path: str = "config/settings.yaml",
@@ -713,6 +708,41 @@ class SheetsConnector:
         if updates:
             self.master_ws.batch_update(updates)
 
+    def ensure_master_header_includes(self, column_names: List[str]) -> None:
+        """Widens the header row to include any of column_names not
+        already present — existing columns and their positions are never
+        touched, new ones are always appended at the end. Any caller that
+        appends a row with arbitrary extra fields (a CSV import with
+        custom columns) needs this called ONCE, with every field name
+        across the WHOLE batch, before the first append — silently
+        dropping an unknown field is the wrong default when the entire
+        point of a mapping UI is to let new field names appear at runtime.
+
+        Also grows the sheet's underlying grid width first if needed — a
+        Sheet's grid size is fixed at however many columns it had when
+        the tab was first created; writing to a column beyond that raises
+        a hard API error, not a silent failure. Widening the header row
+        and having room for a wider header row are two separate facts;
+        this never assumes the second follows from the first.
+        """
+        header = self.master_ws.row_values(1)
+        missing = [c for c in column_names if c not in header]
+        if not missing:
+            return
+
+        needed_col_count = len(header) + len(missing)
+        if self.master_ws.col_count < needed_col_count:
+            self.master_ws.resize(cols=needed_col_count + 10)
+
+        updates = []
+        for i, col_name in enumerate(missing):
+            col_index = len(header) + i + 1
+            updates.append({
+                "range": self._gspread.utils.rowcol_to_a1(1, col_index),
+                "values": [[col_name]],
+            })
+        self.master_ws.batch_update(updates)
+
     def append_lead(self, fields: Dict[str, str]) -> None:
         """Appends ONE new row. Unlike update_lead_fields, this is NOT
         restricted to MASTER_COLUMNS — it builds the row against whatever
@@ -720,43 +750,10 @@ class SheetsConnector:
         columns (Title, Website, LinkedIn, ...) get filled in correctly
         too. Any field not present in `fields` is left blank in that
         column, not an error — a CSV import commonly won't map every
-        column. IMPORTANT: a field name that ISN'T already in the header
-        is silently dropped here, not an error — see
-        ensure_master_header_includes, which import_leads calls first
-        specifically so a brand-new custom field name actually gets a
-        real column instead of being lost this way."""
+        column."""
         header = self.master_ws.row_values(1)
         row = [str(fields.get(col, "")) for col in header]
         self.master_ws.append_row(row, value_input_option="RAW")
-
-    def ensure_master_header_includes(self, column_names: List[str]) -> None:
-        """Widens the Master Sheet's header to include any of the given
-        column names it doesn't already have — appended at the end,
-        every existing column and its position left untouched. Called
-        by import_leads before appending any rows, so a brand-new
-        custom field name (one this campaign's Sheet has never seen
-        before) actually gets a real column instead of being silently
-        dropped by append_lead, which can only ever fill in columns the
-        header already has.
-
-        Also widens the sheet's own GRID first if needed, not just the
-        header ROW's content — a Sheet tab has a fixed column count set
-        whenever it was first created (this one had been sitting at 38
-        for a long time), and writing a cell beyond that is rejected
-        outright by a real 400 error, regardless of how correct the
-        header content itself is. Resizes with some headroom beyond
-        what's immediately needed, so a future single new custom field
-        doesn't require another resize right away."""
-        current_header = self.master_ws.row_values(1)
-        missing = [c for c in column_names if c and c not in current_header]
-        if not missing:
-            return
-        needed_col_count = len(current_header) + len(missing)
-        if needed_col_count > self.master_ws.col_count:
-            self.master_ws.resize(cols=needed_col_count + 10)
-        start_col = len(current_header) + 1
-        for i, col_name in enumerate(missing):
-            self.master_ws.update_cell(1, start_col + i, col_name)
 
     def update_lead_statuses(self, row_numbers_to_status: Dict[int, str]) -> None:
         """Bulk status update (e.g. soft-remove) — one batch_update call
@@ -893,22 +890,18 @@ class TemplateError(Exception):
 
 
 def parse_template_content(content: str, source_description: str = "") -> Dict[str, str]:
-    """The actual parsing logic, decoupled from HOW the raw text was
-    obtained — local disk, GitHub's API, anything. Template format:
-    first line = 'Subject: ...', blank line, then the body. See
-    load_template for the local-filesystem convenience wrapper most
-    callers use; this exists so a caller that already has freshly-
-    fetched content (e.g. from GitHub's API directly, to sidestep
-    Streamlit's local checkout potentially lagging behind a very recent
-    edit) can validate and parse it without going through disk at all.
+    """Parses a template's raw text into {subject, body} — no filesystem
+    access. Pulled out of load_template for the same reason
+    parse_stages_and_variants_from_filenames was pulled out of
+    discover_stages_and_variants: any caller that fetches content live
+    (from GitHub's API) gets the exact same validation as a local-disk
+    read, without needing its own copy of this parsing logic.
 
-    source_description: an optional string appended after "Template"
-    in the error message for context (e.g. " templates/Foo/intro_A.txt"
-    — note the leading space), matching what load_template has always
-    produced."""
+    Template format: first line = 'Subject: ...', blank line, then body."""
+    label = source_description or "template"
     if not content.startswith("Subject:"):
         raise TemplateError(
-            f"Template{source_description} must start with a 'Subject: ...' line, followed by a "
+            f"{label} must start with a 'Subject: ...' line, followed by a "
             "blank line and then the email body."
         )
     lines = content.split("\n")
@@ -918,15 +911,15 @@ def parse_template_content(content: str, source_description: str = "") -> Dict[s
 
 
 def load_template(templates_dir: str, template_prefix: str, variant: str) -> Dict[str, str]:
-    """Reads a template file from local disk. See parse_template_content
-    for validating already-fetched content directly instead — the
-    exact same rules, decoupled from where the text came from."""
+    """Thin filesystem wrapper around parse_template_content. Prefer
+    calling that directly with live-fetched content wherever staleness
+    matters — see its own docstring for why."""
     path = os.path.join(templates_dir, f"{template_prefix}_{variant}.txt")
     if not os.path.exists(path):
         raise TemplateError(f"Template file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
-    return parse_template_content(content, f" {path}")
+    return parse_template_content(content, source_description=f"Template {path}")
 
 
 def render_text(text: str, lead: Dict[str, str], missing_out: Optional[List[str]] = None) -> str:
@@ -1886,16 +1879,16 @@ def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Di
     next_id = (max(existing_ids) + 1) if existing_ids else 1
     existing_emails = {(l.get("Email") or "").strip().lower() for l in existing if (l.get("Email") or "").strip()}
 
-    # Widen the header ONCE, before appending anything — otherwise a
-    # brand-new custom field name (never seen before on this campaign's
-    # Sheet) gets silently dropped by append_lead, which only fills in
-    # columns the header already has. Every incoming field name across
-    # every lead is considered, not just the first row's, in case
-    # different rows map different custom columns.
+    # Widen the header ONCE, up front, covering every field name across
+    # the WHOLE batch — not just the first row's fields, since different
+    # rows in one CSV can populate different custom columns. Must happen
+    # before any append_lead call, which only ever fills in columns that
+    # already exist.
     all_field_names = set()
     for lead in new_leads:
         all_field_names.update(lead.keys())
-    sheets.ensure_master_header_includes(sorted(all_field_names))
+    if all_field_names:
+        sheets.ensure_master_header_includes(sorted(all_field_names))
 
     imported = 0
     skipped_duplicate = 0
@@ -2973,6 +2966,175 @@ def cmd_remove_leads(args):
         print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
 
 
+def cmd_mark_responses_read(args):
+    """Reads {"response_ids": [...]} from --file and sets IsRead=Yes for
+    each one that still exists in this campaign's Response Sheet — a
+    ResponseID no longer present (e.g. the sheet was manually edited) is
+    silently skipped, not an error; the caller's goal ("these should show
+    read") is still satisfied for everything that DID match."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    requested_ids = payload.get("response_ids", [])
+    if not requested_ids:
+        print("No response_ids in payload file — nothing to do.")
+        return
+
+    all_responses = sheets.get_all_responses()
+    requested_set = set(requested_ids)
+    id_to_row = {
+        r.get("ResponseID"): r["_row"] for r in all_responses if r.get("ResponseID") in requested_set
+    }
+    marked_count = sheets.mark_responses_read(id_to_row)
+    print(f"Marked {marked_count} of {len(requested_ids)} response(s) as read.")
+    missing = requested_set - set(id_to_row.keys())
+    if missing:
+        print(f"Not found (already gone from the sheet, or never existed): {sorted(missing)}")
+
+
+def cmd_send_reply(args):
+    """Reads a fully-resolved reply payload from --file and sends it —
+    this command never looks anything up itself (which response, which
+    thread); Streamlit's Responses tab is expected to have already
+    resolved to/subject/in_reply_to/references from the specific inbound
+    message being replied to before ever committing this payload. See
+    send_manual_reply's docstring for exactly why that split exists.
+
+    Expected payload shape:
+        {"sender_account": "sales1", "to": "lead@abc.com",
+         "subject": "Re: ...", "body": "...", "in_reply_to": "<...>",
+         "references": "<...> <...>", "cc": [...], "bcc": [...],
+         "lead_id": "5",
+         "attachments": [{"filename": "photo.png", "content_base64": "..."}]}
+    cc/bcc/lead_id/attachments are optional. Attachment content travels
+    as base64 in the JSON payload (the payload file itself is already the
+    "big binary data over a size-limited channel" workaround — see
+    campaigns.py's Responses tab for how it's built).
+    """
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
+    with open(args.file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    lead_id = payload.get("lead_id", "")
+    to_email = payload.get("to", "")
+    attachments = None
+    if payload.get("attachments"):
+        attachments = [
+            {"filename": att["filename"], "content": base64.b64decode(att["content_base64"])}
+            for att in payload["attachments"]
+        ]
+
+    try:
+        sent = send_manual_reply(
+            accounts, payload["sender_account"], to_email, payload["subject"], payload["body"],
+            in_reply_to=payload.get("in_reply_to"), references=payload.get("references"),
+            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None, attachments=attachments,
+        )
+    except Exception as exc:  # noqa: BLE001 - classify and log exactly like every other send path
+        error_type = classify_send_exception(exc)
+        now_str = datetime.now().strftime(DATETIME_FMT)
+        try:
+            sheets.append_send_log({
+                "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+                "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+                "SenderAccount": payload.get("sender_account", ""), "Status": "error",
+                "MessageID": "", "Error": str(exc)[:500],
+            })
+        except Exception:  # noqa: BLE001 - the error log entry below is the durable record either way
+            pass
+        log_error(sheets, args.campaign, error_type, str(exc), lead_id=lead_id, email_addr=to_email,
+                  stage="manual_reply", batch_id="manual-reply")
+        print(f"FAILED: {exc}")
+        raise SystemExit(1)
+
+    now_str = datetime.now().strftime(DATETIME_FMT)
+    sheets.append_send_log({
+        "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
+        "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
+        "SenderAccount": payload["sender_account"], "Status": "sent",
+        "MessageID": sent["message_id"], "Error": "",
+    })
+    print(f"Sent. Message-ID: {sent['message_id']}")
+
+
+def cmd_check_account_health(args):
+    """Logs into every configured account via IMAP (a cheap connectivity
+    check, not a real mailbox scan) and writes the result to the shared
+    'Email Accounts Health' Sheet tab — never the password itself, only
+    connection status and a short failure reason. Reads shared_sheet_id
+    from settings.yaml directly since this isn't tied to any one
+    campaign's own Sheet configuration."""
+    accounts = load_email_accounts()
+    settings = load_settings()
+    results = check_account_health(accounts)
+    write_account_health(settings["shared_sheet_id"], results)
+    for r in results:
+        detail_suffix = f" — {r['Detail']}" if r["Detail"] else ""
+        print(f"{r['AccountName']} ({r['Address']}): {r['Status']}{detail_suffix}")
+
+
+def cmd_check_replies(args):
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    accounts = load_email_accounts()
+    lookback_hours = campaign_cfg.get("reply_monitor", {}).get("lookback_hours", 24)
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")  # optional — blank Intent fields if unset
+
+    actions = check_replies(sheets, accounts, lookback_hours, campaign_name=args.campaign,
+                             anthropic_api_key=anthropic_api_key)
+    if not actions:
+        print("No new inbound messages matched to a lead.")
+        return
+
+    print(f"Processed {len(actions)} inbound message(s):\n")
+    for a in actions:
+        print(f"  {a['email']:<35} {a['classification']:<18} ({a['match_method']:<6}, {a['account']}) -> {a['action']}")
+
+
+def cmd_dashboard(args):
+    if not args.all and not args.campaign:
+        print("Specify --campaign NAME or --all", file=sys.stderr)
+        sys.exit(1)
+
+    if args.all:
+        settings = load_settings()
+        shared_sheet_id = settings.get("shared_sheet_id", "")
+        campaign_names = discover_campaign_names()
+        if not campaign_names:
+            print("No campaigns found — no subfolders under templates/.")
+            return
+        all_rows = []
+        for name in campaign_names:
+            campaign_cfg = get_campaign(name)
+            sheets = _connect_sheets(campaign_cfg)
+            leads = sheets.get_all_leads()
+            responses = sheets.get_all_responses()
+            send_log = sheets.get_all_send_log()
+            error_log = sheets.get_all_error_log()
+            rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
+            write_dashboard(sheets.dashboard_ws, rows)
+            all_rows.append(compute_all_campaigns_row(name, leads, responses, send_log, campaign_cfg["stages"]))
+            print(f"Updated dashboard for '{name}'")
+        if shared_sheet_id and all_rows:
+            ws = get_all_campaigns_dashboard_ws(shared_sheet_id)
+            write_all_campaigns_dashboard(ws, all_rows)
+            print("Updated combined 'All Campaigns Dashboard'")
+    else:
+        campaign_cfg = get_campaign(args.campaign)
+        sheets = _connect_sheets(campaign_cfg)
+        leads = sheets.get_all_leads()
+        responses = sheets.get_all_responses()
+        send_log = sheets.get_all_send_log()
+        error_log = sheets.get_all_error_log()
+        rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
+        write_dashboard(sheets.dashboard_ws, rows)
+        print(f"Updated dashboard for '{args.campaign}'")
+
+
+# =============================================================================
 ASANA_API_BASE = "https://app.asana.com/api/1.0"
 ASANA_MAX_RETRIES = 3
 ASANA_RETRY_BASE_DELAY_SECONDS = 2
@@ -3447,174 +3609,6 @@ def cmd_sync_asana_all(args):
         sys.exit(1)
 
 
-def cmd_mark_responses_read(args):
-    """Reads {"response_ids": [...]} from --file and sets IsRead=Yes for
-    each one that still exists in this campaign's Response Sheet — a
-    ResponseID no longer present (e.g. the sheet was manually edited) is
-    silently skipped, not an error; the caller's goal ("these should show
-    read") is still satisfied for everything that DID match."""
-    campaign_cfg = get_campaign(args.campaign)
-    sheets = _connect_sheets(campaign_cfg)
-    with open(args.file, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    requested_ids = payload.get("response_ids", [])
-    if not requested_ids:
-        print("No response_ids in payload file — nothing to do.")
-        return
-
-    all_responses = sheets.get_all_responses()
-    requested_set = set(requested_ids)
-    id_to_row = {
-        r.get("ResponseID"): r["_row"] for r in all_responses if r.get("ResponseID") in requested_set
-    }
-    marked_count = sheets.mark_responses_read(id_to_row)
-    print(f"Marked {marked_count} of {len(requested_ids)} response(s) as read.")
-    missing = requested_set - set(id_to_row.keys())
-    if missing:
-        print(f"Not found (already gone from the sheet, or never existed): {sorted(missing)}")
-
-
-def cmd_send_reply(args):
-    """Reads a fully-resolved reply payload from --file and sends it —
-    this command never looks anything up itself (which response, which
-    thread); Streamlit's Responses tab is expected to have already
-    resolved to/subject/in_reply_to/references from the specific inbound
-    message being replied to before ever committing this payload. See
-    send_manual_reply's docstring for exactly why that split exists.
-
-    Expected payload shape:
-        {"sender_account": "sales1", "to": "lead@abc.com",
-         "subject": "Re: ...", "body": "...", "in_reply_to": "<...>",
-         "references": "<...> <...>", "cc": [...], "bcc": [...],
-         "lead_id": "5",
-         "attachments": [{"filename": "photo.png", "content_base64": "..."}]}
-    cc/bcc/lead_id/attachments are optional. Attachment content travels
-    as base64 in the JSON payload (the payload file itself is already the
-    "big binary data over a size-limited channel" workaround — see
-    campaigns.py's Responses tab for how it's built).
-    """
-    campaign_cfg = get_campaign(args.campaign)
-    sheets = _connect_sheets(campaign_cfg)
-    accounts = load_email_accounts()
-    with open(args.file, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    lead_id = payload.get("lead_id", "")
-    to_email = payload.get("to", "")
-    attachments = None
-    if payload.get("attachments"):
-        attachments = [
-            {"filename": att["filename"], "content": base64.b64decode(att["content_base64"])}
-            for att in payload["attachments"]
-        ]
-
-    try:
-        sent = send_manual_reply(
-            accounts, payload["sender_account"], to_email, payload["subject"], payload["body"],
-            in_reply_to=payload.get("in_reply_to"), references=payload.get("references"),
-            cc=payload.get("cc") or None, bcc=payload.get("bcc") or None, attachments=attachments,
-        )
-    except Exception as exc:  # noqa: BLE001 - classify and log exactly like every other send path
-        error_type = classify_send_exception(exc)
-        now_str = datetime.now().strftime(DATETIME_FMT)
-        try:
-            sheets.append_send_log({
-                "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
-                "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
-                "SenderAccount": payload.get("sender_account", ""), "Status": "error",
-                "MessageID": "", "Error": str(exc)[:500],
-            })
-        except Exception:  # noqa: BLE001 - the error log entry below is the durable record either way
-            pass
-        log_error(sheets, args.campaign, error_type, str(exc), lead_id=lead_id, email_addr=to_email,
-                  stage="manual_reply", batch_id="manual-reply")
-        print(f"FAILED: {exc}")
-        raise SystemExit(1)
-
-    now_str = datetime.now().strftime(DATETIME_FMT)
-    sheets.append_send_log({
-        "BatchID": "manual-reply", "Timestamp": now_str, "LeadID": lead_id, "Email": to_email,
-        "Campaign": args.campaign, "Stage": "manual_reply", "Variant": "",
-        "SenderAccount": payload["sender_account"], "Status": "sent",
-        "MessageID": sent["message_id"], "Error": "",
-    })
-    print(f"Sent. Message-ID: {sent['message_id']}")
-
-
-def cmd_check_account_health(args):
-    """Logs into every configured account via IMAP (a cheap connectivity
-    check, not a real mailbox scan) and writes the result to the shared
-    'Email Accounts Health' Sheet tab — never the password itself, only
-    connection status and a short failure reason. Reads shared_sheet_id
-    from settings.yaml directly since this isn't tied to any one
-    campaign's own Sheet configuration."""
-    accounts = load_email_accounts()
-    settings = load_settings()
-    results = check_account_health(accounts)
-    write_account_health(settings["shared_sheet_id"], results)
-    for r in results:
-        detail_suffix = f" — {r['Detail']}" if r["Detail"] else ""
-        print(f"{r['AccountName']} ({r['Address']}): {r['Status']}{detail_suffix}")
-
-
-def cmd_check_replies(args):
-    campaign_cfg = get_campaign(args.campaign)
-    sheets = _connect_sheets(campaign_cfg)
-    accounts = load_email_accounts()
-    lookback_hours = campaign_cfg.get("reply_monitor", {}).get("lookback_hours", 24)
-    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")  # optional — blank Intent fields if unset
-
-    actions = check_replies(sheets, accounts, lookback_hours, campaign_name=args.campaign,
-                             anthropic_api_key=anthropic_api_key)
-    if not actions:
-        print("No new inbound messages matched to a lead.")
-        return
-
-    print(f"Processed {len(actions)} inbound message(s):\n")
-    for a in actions:
-        print(f"  {a['email']:<35} {a['classification']:<18} ({a['match_method']:<6}, {a['account']}) -> {a['action']}")
-
-
-def cmd_dashboard(args):
-    if not args.all and not args.campaign:
-        print("Specify --campaign NAME or --all", file=sys.stderr)
-        sys.exit(1)
-
-    if args.all:
-        settings = load_settings()
-        shared_sheet_id = settings.get("shared_sheet_id", "")
-        campaign_names = discover_campaign_names()
-        if not campaign_names:
-            print("No campaigns found — no subfolders under templates/.")
-            return
-        all_rows = []
-        for name in campaign_names:
-            campaign_cfg = get_campaign(name)
-            sheets = _connect_sheets(campaign_cfg)
-            leads = sheets.get_all_leads()
-            responses = sheets.get_all_responses()
-            send_log = sheets.get_all_send_log()
-            error_log = sheets.get_all_error_log()
-            rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
-            write_dashboard(sheets.dashboard_ws, rows)
-            all_rows.append(compute_all_campaigns_row(name, leads, responses, send_log, campaign_cfg["stages"]))
-            print(f"Updated dashboard for '{name}'")
-        if shared_sheet_id and all_rows:
-            ws = get_all_campaigns_dashboard_ws(shared_sheet_id)
-            write_all_campaigns_dashboard(ws, all_rows)
-            print("Updated combined 'All Campaigns Dashboard'")
-    else:
-        campaign_cfg = get_campaign(args.campaign)
-        sheets = _connect_sheets(campaign_cfg)
-        leads = sheets.get_all_leads()
-        responses = sheets.get_all_responses()
-        send_log = sheets.get_all_send_log()
-        error_log = sheets.get_all_error_log()
-        rows = compute_campaign_dashboard(campaign_cfg, leads, responses, send_log, error_log)
-        write_dashboard(sheets.dashboard_ws, rows)
-        print(f"Updated dashboard for '{args.campaign}'")
-
-
 # =============================================================================
 # SECTION 15: Argument parsing / entry point
 # =============================================================================
@@ -3676,6 +3670,15 @@ def main():
     p_import.add_argument("--file", required=True, help='Path to a JSON file: {"leads": [{...}, ...]}')
     p_import.set_defaults(func=cmd_import_leads)
 
+    p_sync_asana = sub.add_parser("sync-asana", help="Sync one campaign's leads to its Asana project")
+    p_sync_asana.add_argument("--campaign", required=True)
+    p_sync_asana.set_defaults(func=cmd_sync_asana)
+
+    p_sync_asana_all = sub.add_parser("sync-asana-all",
+                                       help="Sync every campaign with asana.enabled: true — one "
+                                            "campaign's failure never blocks the rest")
+    p_sync_asana_all.set_defaults(func=cmd_sync_asana_all)
+
     p_remove = sub.add_parser("remove-leads",
                                help="Soft-remove leads (sets Status=Removed, never a hard delete) "
                                     "from a JSON payload file")
@@ -3698,14 +3701,6 @@ def main():
     p_mark_read.add_argument("--campaign", required=True)
     p_mark_read.add_argument("--file", required=True, help='Path to a JSON file: {"response_ids": ["r1", "r2"]}')
     p_mark_read.set_defaults(func=cmd_mark_responses_read)
-
-    p_sync_asana = sub.add_parser("sync-asana", help="Create/update Asana tasks for this campaign's leads")
-    p_sync_asana.add_argument("--campaign", required=True)
-    p_sync_asana.set_defaults(func=cmd_sync_asana)
-
-    p_sync_asana_all = sub.add_parser("sync-asana-all",
-                                       help="Sync every campaign with asana.enabled set to true")
-    p_sync_asana_all.set_defaults(func=cmd_sync_asana_all)
 
     p_health = sub.add_parser("check-account-health",
                                help="Check every configured account's IMAP connectivity and write results "
