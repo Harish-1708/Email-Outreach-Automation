@@ -5,3 +5,8 @@ schedule:
   window_end: '17:00'
   send_days:
   - fri
+sending:
+  daily_limit: 100
+  sender_rotation: false
+  rotation_accounts:
+  - sales1
