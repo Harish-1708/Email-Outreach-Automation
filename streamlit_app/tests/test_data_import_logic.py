@@ -113,7 +113,12 @@ def test_count_valid_rows_only_counts_rows_with_email():
 
 def test_build_import_payload_shape():
     payload = build_import_payload([{"Email": "a@abc.com"}])
-    assert payload == {"leads": [{"Email": "a@abc.com"}]}
+    assert payload == {"leads": [{"Email": "a@abc.com"}], "allow_duplicate_emails": False}
+
+
+def test_build_import_payload_allow_duplicate_emails_flag():
+    payload = build_import_payload([{"Email": "a@abc.com"}], allow_duplicate_emails=True)
+    assert payload["allow_duplicate_emails"] is True
 
 
 def test_import_payload_path_format():
