@@ -1340,7 +1340,49 @@ def test_data_tab_import_commits_payload_and_triggers_workflow():
     assert captured["path"].startswith("imports/Kelson_Creators_Licensing/")
     import json
     payload = json.loads(captured["content"].decode("utf-8"))
-    assert payload == {"leads": [{"FirstName": "Sam", "Email": "sam@abc.com"}]}
+    assert payload == {"leads": [{"FirstName": "Sam", "Email": "sam@abc.com"}], "allow_duplicate_emails": False}
+
+
+def test_data_tab_import_allow_duplicate_emails_checkbox_flows_into_payload():
+    """The actual feature — contacting the same creator again for a
+    different video. Checking the box must make it into the committed
+    payload exactly as checked, not silently stay False."""
+    fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
+    captured = {}
+
+    def fake_create_file(self, path, content_bytes, message, branch="main"):
+        captured["content"] = content_bytes
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.create_file", fake_create_file), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\n", "text/csv")
+        at.run(timeout=15)
+
+        checkbox = next(cb for cb in at.checkbox if cb.key == "import_allow_duplicate_emails")
+        checkbox.set_value(True)
+        at.run(timeout=15)
+
+        import_button = next(b for b in at.button if b.label == "Import Leads")
+        import_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert list(at.error) == []
+    import json
+    payload = json.loads(captured["content"].decode("utf-8"))
+    assert payload["allow_duplicate_emails"] is True
 
 
 def test_data_tab_shows_error_when_no_column_mapped_to_email():
@@ -1680,6 +1722,102 @@ def test_data_tab_lead_table_and_remove_flow():
     import json
     payload = json.loads(captured["content"].decode("utf-8"))
     assert payload == {"lead_ids": ["1"]}
+
+
+def test_data_tab_manage_lead_dispatches_override_workflow_with_correct_inputs():
+    fake_ws = {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
+              "Company": "Acme", "Approval": "Yes", "Status": ""}]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    captured = {}
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        captured["workflow"] = workflow_file
+        captured["inputs"] = inputs
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        lead_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_select")
+        matching_option = next(opt for opt in lead_select.options if "1 —" in opt)
+        lead_select.set_value(matching_option)
+        at.run(timeout=15)
+
+        status_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_status")
+        status_select.set_value("Stop sending to this lead")
+        asana_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_asana_stage")
+        asana_select.set_value("Rights Secured")
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.key == "manage_lead_save")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == [], f"Save raised: {list(at.exception)}"
+    assert list(at.error) == []
+    assert captured["workflow"] == "set_lead_override.yml"
+    assert captured["inputs"] == {
+        "campaign": "Kelson_Creators_Licensing",
+        "email": "sam@abc.com",
+        "status": "Stop sending to this lead",
+        "asana_stage": "Rights Secured",
+    }
+
+
+def test_data_tab_manage_lead_no_changes_selected_shows_warning_not_a_dispatch():
+    fake_ws = {
+        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+            [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
+              "Company": "Acme", "Approval": "Yes", "Status": ""}]
+        ),
+        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+    }
+    fake_spreadsheet = FakeSpreadsheet(fake_ws)
+    dispatched = []
+
+    def fake_dispatch(self, workflow_file, inputs, ref="main"):
+        dispatched.append(1)
+        return {"id": 1, "html_url": "https://github.com/x"}
+
+    with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
+         patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
+         patch("github_client.GitHubClient.dispatch_workflow", fake_dispatch):
+        at = AppTest.from_file(os.path.join(PAGES_DIR, "campaigns.py"))
+        at.secrets.update(_dashboard_secrets())
+        for k, v in _authed_session().items():
+            at.session_state[k] = v
+        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.run(timeout=15)
+
+        lead_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_select")
+        matching_option = next(opt for opt in lead_select.options if "1 —" in opt)
+        lead_select.set_value(matching_option)
+        at.run(timeout=15)
+
+        save_button = next(b for b in at.button if b.key == "manage_lead_save")
+        save_button.click()
+        at.run(timeout=15)
+
+    assert list(at.exception) == []
+    assert dispatched == []
+    warning_texts = " ".join(w.value for w in at.warning)
+    assert "Nothing selected" in warning_texts
 
 
 def _mock_github_writes():
