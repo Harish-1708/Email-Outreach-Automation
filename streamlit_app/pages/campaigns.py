@@ -13,6 +13,7 @@ from page_state import mark_active_page  # noqa: E402
 from config import (  # noqa: E402
     WORKFLOW_IMPORT_LEADS, WORKFLOW_REMOVE_LEADS, WORKFLOW_DASHBOARD, WORKFLOW_SEND_REPLY,
     WORKFLOW_SEND, WORKFLOW_CHECK_REPLIES, WORKFLOW_BACKFILL_THREAD_SUBJECT, WORKFLOW_SYNC_ASANA,
+    WORKFLOW_SET_LEAD_OVERRIDE,
     TEMPLATES_ROOT, CAMPAIGNS_DIR, EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH,
 )
 from email_account_slots_logic import read_local_slot_mapping  # noqa: E402
@@ -585,6 +586,12 @@ def _render_data_tab(campaign_cfg, leads):
                          "(others are skipped — Email is required). Duplicates against existing leads "
                          "are also skipped automatically, checked at import time.")
                 st.caption("Imported leads start as **Pending** — approve them below before they're eligible to send.")
+                allow_duplicate_emails = st.checkbox(
+                    "Allow re-importing an email that already exists (e.g. contacting the same creator "
+                    "again for a different video — each import becomes its own row and, once synced, "
+                    "its own separate Asana task; the automated sender still only ever emails the first "
+                    "row for a given address, so this never risks a duplicate send)",
+                    key="import_allow_duplicate_emails")
 
                 for field_name_error in custom_field_name_errors:
                     st.error(field_name_error)
@@ -595,7 +602,7 @@ def _render_data_tab(campaign_cfg, leads):
                         "Import Leads", type="primary", key="confirm_import"):
                     try:
                         client = _get_github_client()
-                        payload = build_import_payload(mapped_rows)
+                        payload = build_import_payload(mapped_rows, allow_duplicate_emails=allow_duplicate_emails)
                         path = import_payload_path(campaign_name)
                         client.create_file(path, payload_to_bytes(payload),
                                             message=f"Import {valid_count} lead(s) for {campaign_name} "
@@ -656,6 +663,51 @@ def _render_data_tab(campaign_cfg, leads):
                     st.success(f"Removal triggered for {len(lead_ids)} lead(s).")
                 except GitHubActionsError as exc:
                     st.error(f"Removal failed: {exc}")
+
+        with st.expander("🔧 Manage a lead"):
+            st.caption(
+                "Stop sending to just this one lead without removing it (it stays visible, only "
+                "excluded from future sends), or push its Asana pipeline stage straight to Rights "
+                "Secured / Declined for a lead handled outside the automated pipeline entirely — "
+                "e.g. one you finalized manually. Both apply on the next sync, manual or scheduled."
+            )
+            lead_options = {f"{l.get('LeadID', '')} — {l.get('FirstName', '')} {l.get('LastName', '')} "
+                             f"<{l.get('Email', '')}>": l.get("Email", "") for l in filtered}
+            selected_lead_label = st.selectbox("Lead", ["-- Select --"] + list(lead_options.keys()),
+                                                key="manage_lead_select")
+
+            if selected_lead_label != "-- Select --":
+                selected_email = lead_options[selected_lead_label]
+                current_lead = next((l for l in filtered if l.get("Email") == selected_email), {})
+                st.caption(f"Current status: **{current_lead.get('Status') or '(none)'}** · "
+                           f"Current Asana stage override: "
+                           f"**{current_lead.get('ManualAsanaStage') or '(none — automatic)'}**")
+
+                status_choice = st.selectbox(
+                    "Sending status", ["(no change)", "Stop sending to this lead",
+                                        "Clear override (resume normal sending)"],
+                    key="manage_lead_status")
+                asana_stage_choice = st.selectbox(
+                    "Asana stage override", ["(no change)", "Clear override (resume automatic tracking)",
+                                              outreach.ASANA_STAGE_SOURCED, outreach.ASANA_STAGE_OUTREACH_SENT,
+                                              outreach.ASANA_STAGE_FOLLOWUP, outreach.ASANA_STAGE_NEGOTIATING,
+                                              outreach.ASANA_STAGE_RIGHTS_SECURED,
+                                              outreach.ASANA_STAGE_DECLINED_DEAD],
+                    key="manage_lead_asana_stage")
+
+                if st.button("Save", key="manage_lead_save"):
+                    if status_choice == "(no change)" and asana_stage_choice == "(no change)":
+                        st.warning("Nothing selected to change.")
+                    else:
+                        try:
+                            client = _get_github_client()
+                            inputs = {"campaign": campaign_name, "email": selected_email,
+                                      "status": status_choice, "asana_stage": asana_stage_choice}
+                            client.dispatch_workflow(WORKFLOW_SET_LEAD_OVERRIDE, inputs)
+                            st.success(f"Update triggered for {selected_email}. May take a minute to "
+                                       "actually reflect here while the app redeploys.")
+                        except GitHubActionsError as exc:
+                            st.error(f"Failed to trigger update: {exc}")
 
 
 def _fetch_live_stages_and_variants(client, campaign_name):
