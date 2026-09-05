@@ -90,6 +90,16 @@ MASTER_COLUMNS = [
                                 # to Asana — checked before every future sync so a
                                 # lead never gets a second task created for it.
                                 # Never edit this by hand.
+    "ManualAsanaStage",        # Optional human override for this ONE lead's Asana
+                                # pipeline stage — e.g. "Rights Secured" or
+                                # "Declined / Dead". When set, a sync uses this
+                                # value instead of auto-deriving the stage from
+                                # send/reply history, and — unlike the "never move
+                                # a task already sitting in Rights Secured/Declined"
+                                # protection, which only looks at Asana's current
+                                # state — this can also apply on a brand-new task's
+                                # very first creation. Leave blank for normal,
+                                # fully-automatic stage tracking.
 ]
 # NOTE: this is the REQUIRED prefix of the Master header row. You may add
 # extra columns of your own AFTER these (e.g. "Industry", "JobTitle") and
@@ -171,6 +181,11 @@ APPROVAL_YES = "Yes"
 STATUS_STOPPED_REPLIED = "Stopped - Replied"
 STATUS_STOPPED_BOUNCED = "Stopped - Bounced"
 STATUS_STOPPED_REJECTED = "Stopped - Rejected"
+STATUS_STOPPED_MANUAL = "Stopped - Manual"  # a human stopped this ONE lead
+                            # on purpose — never sent automatically, distinct
+                            # from Removed: this lead stays fully visible in
+                            # the Data tab, it's just no longer eligible to
+                            # be sent to.
 STATUS_PAUSED = "Paused"
 STATUS_COMPLETED = "Completed"
 STATUS_REMOVED = "Removed"  # soft-remove from the Data tab — never a hard delete,
@@ -180,6 +195,7 @@ TERMINAL_STATUSES = {
     STATUS_STOPPED_REPLIED,
     STATUS_STOPPED_BOUNCED,
     STATUS_STOPPED_REJECTED,
+    STATUS_STOPPED_MANUAL,
     STATUS_PAUSED,
     STATUS_COMPLETED,
     STATUS_REMOVED,
@@ -1868,13 +1884,29 @@ def backfill_thread_subjects(campaign_cfg: Dict, leads: List[Dict]) -> List[Dict
     return results
 
 
-def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Dict[str, str]]) -> Dict[str, int]:
+def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Dict[str, str]],
+                  allow_duplicate_emails: bool = False) -> Dict[str, int]:
     """Appends new_leads as new Master Sheet rows. Skips any row with no
-    Email (mandatory everywhere else in this system) and any row whose
-    Email already exists among current leads (case-insensitive) — the
-    same "first row wins" assumption find_duplicate_email_leads already
-    enforces elsewhere, just applied at import time instead of left for
-    that check to flag later.
+    Email (mandatory everywhere else in this system) and, by default,
+    any row whose Email already exists among current leads
+    (case-insensitive) — the same "first row wins" assumption
+    find_duplicate_email_leads already enforces elsewhere, just applied
+    at import time instead of left for that check to flag later.
+
+    allow_duplicate_emails=True deliberately turns that second check
+    off — for a real, recurring case: contacting the same creator again
+    for a genuinely different video (its own Video File / Refunnel Link
+    / etc.), tracked as its own separate Asana task, without the
+    automated sender ever emailing that person a second time. This is
+    safe to allow because sending itself already has its own,
+    independent protection: find_duplicate_email_leads / get_eligible_
+    leads only ever consider the FIRST (lowest row number) lead for a
+    given email eligible to actually be emailed — every later row
+    sharing that email is automatically excluded from sending, always,
+    regardless of this flag. Asana sync has no such restriction at
+    all — it operates strictly per ROW (via each row's own
+    AsanaTaskGID), so a second row for the same email correctly gets
+    its own separate task.
 
     Every imported lead's Approval is left BLANK (Pending) unless the
     caller explicitly set it in that row's dict — a bulk import should
@@ -1905,7 +1937,7 @@ def import_leads(sheets: SheetsConnector, campaign_name: str, new_leads: List[Di
         if not email:
             skipped_no_email += 1
             continue
-        if email.lower() in existing_emails:
+        if not allow_duplicate_emails and email.lower() in existing_emails:
             skipped_duplicate += 1
             continue
         row = dict(lead)
@@ -2997,11 +3029,14 @@ def cmd_backfill_thread_subject(args):
 
 
 def cmd_import_leads(args):
-    """Reads {"leads": [{...}, ...]} from --file and appends them to the
-    Master Sheet. This is the ONLY thing that ever writes to the Master
-    Sheet from a bulk-import path — invoked by import_leads.yml after
-    Streamlit commits the mapped payload file, never called with
-    Streamlit-supplied data any other way."""
+    """Reads {"leads": [{...}, ...], "allow_duplicate_emails": bool} from
+    --file and appends them to the Master Sheet. This is the ONLY thing
+    that ever writes to the Master Sheet from a bulk-import path —
+    invoked by import_leads.yml after Streamlit commits the mapped
+    payload file, never called with Streamlit-supplied data any other
+    way. "allow_duplicate_emails" defaults to False if absent from the
+    payload — see import_leads' own docstring for exactly what turning
+    it on does and doesn't affect."""
     campaign_cfg = get_campaign(args.campaign)
     sheets = _connect_sheets(campaign_cfg)
     with open(args.file, "r", encoding="utf-8") as f:
@@ -3010,7 +3045,8 @@ def cmd_import_leads(args):
     if not new_leads:
         print("No leads in payload file — nothing to do.")
         return
-    summary = import_leads(sheets, args.campaign, new_leads)
+    summary = import_leads(sheets, args.campaign, new_leads,
+                            allow_duplicate_emails=bool(payload.get("allow_duplicate_emails", False)))
     print(f"Imported {summary['imported']} lead(s).")
     if summary["skipped_duplicate"]:
         print(f"Skipped {summary['skipped_duplicate']} duplicate email(s) (already in the Master Sheet).")
@@ -3033,6 +3069,54 @@ def cmd_remove_leads(args):
     print(f"Removed {summary['removed']} lead(s) (Status set to '{STATUS_REMOVED}').")
     if summary["not_found"]:
         print(f"{summary['not_found']} LeadID(s) in the payload weren't found in the Master Sheet.")
+
+
+def cmd_set_lead_override(args):
+    """Sets a manual, per-lead override — sending status ("stop this
+    ONE lead without removing it") and/or Asana pipeline stage
+    ("Rights Secured" / "Declined / Dead" for a lead handled outside
+    the automated pipeline entirely) — found by email, not LeadID,
+    since that's what a human actually has on hand when looking at a
+    creator in the Data tab.
+
+    An empty string for either --status or --asana-stage explicitly
+    CLEARS that override (resumes normal automated sending; returns to
+    fully-automatic Asana stage tracking) — distinct from not passing
+    the flag at all, which leaves that field untouched."""
+    campaign_cfg = get_campaign(args.campaign)
+    sheets = _connect_sheets(campaign_cfg)
+    leads = sheets.get_all_leads()
+    email_lower = args.email.strip().lower()
+    matching = [l for l in leads if (l.get("Email") or "").strip().lower() == email_lower]
+    if not matching:
+        print(f"No lead found with email '{args.email}' in campaign '{args.campaign}'.")
+        sys.exit(1)
+    if len(matching) > 1:
+        print(f"NOTE: {len(matching)} leads share this email — updating only the first "
+              f"(row {matching[0]['_row']}).")
+    lead = matching[0]
+
+    updates = {}
+    if args.status is not None:
+        if args.status not in ("", STATUS_STOPPED_MANUAL):
+            print(f"ERROR: --status must be '' (resume normal sending) or '{STATUS_STOPPED_MANUAL}' "
+                  f"(stop sending to this lead only), got {args.status!r}.", file=sys.stderr)
+            sys.exit(1)
+        updates["Status"] = args.status
+    if args.asana_stage is not None:
+        if args.asana_stage and args.asana_stage.lower() not in _ASANA_STAGE_NAMES_BY_LOWER:
+            valid = ", ".join(sorted(_ASANA_STAGE_NAMES_BY_LOWER.values()))
+            print(f"ERROR: --asana-stage must be '' (resume automatic stage tracking) or one of: "
+                  f"{valid}. Got {args.asana_stage!r}.", file=sys.stderr)
+            sys.exit(1)
+        updates["ManualAsanaStage"] = args.asana_stage
+
+    if not updates:
+        print("Nothing to update — pass --status and/or --asana-stage.")
+        return
+
+    sheets.update_lead_fields(lead["_row"], updates)
+    print(f"Updated {args.email}: {updates}")
 
 
 ASANA_API_BASE = "https://app.asana.com/api/1.0"
@@ -3080,13 +3164,36 @@ def _safe_lead_str(value) -> str:
     return str(value).strip()
 
 
+_ASANA_STAGE_NAMES_BY_LOWER = {
+    name.lower(): name for name in
+    (ASANA_STAGE_SOURCED, ASANA_STAGE_OUTREACH_SENT, ASANA_STAGE_FOLLOWUP,
+     ASANA_STAGE_NEGOTIATING, ASANA_STAGE_RIGHTS_SECURED, ASANA_STAGE_DECLINED_DEAD)
+}
+
+
 def compute_lead_asana_stage(lead: Dict) -> str:
     """Derives where a lead sits in the Asana creator-outreach pipeline
     from data the email system already tracks — never guesses Rights
-    Secured or Declined / Dead, since those are real human decisions,
-    not something inferable from send/reply timestamps. Checked most-
-    advanced-state-first, so a lead with both a follow-up sent AND a
-    reply logged correctly lands on Negotiating, not Follow-up."""
+    Secured or Declined / Dead on its own, since those are real human
+    decisions, not something inferable from send/reply timestamps.
+    Checked most-advanced-state-first, so a lead with both a follow-up
+    sent AND a reply logged correctly lands on Negotiating, not
+    Follow-up.
+
+    A "ManualAsanaStage" value on the lead (any of the six real stage
+    names, case-insensitive — e.g. set from the Data tab for a lead
+    handled outside the automated pipeline entirely) takes priority
+    over every rule below it. This is the one legitimate way to reach
+    Rights Secured or Declined / Dead from the Sheet side — including
+    for a task that doesn't exist in Asana yet, so a lead you've
+    already finalized manually can be created directly into the right
+    stage on its very first sync. An unrecognized value is ignored
+    (falls through to normal auto-derivation) rather than raising."""
+    manual_override = _safe_lead_str(lead.get("ManualAsanaStage"))
+    if manual_override:
+        matched_stage = _ASANA_STAGE_NAMES_BY_LOWER.get(manual_override.lower())
+        if matched_stage:
+            return matched_stage
     if (lead.get("ReplyStatus") or "").strip() == "Replied":
         return ASANA_STAGE_NEGOTIATING
     for index in range(1, 5):
@@ -3144,6 +3251,34 @@ def _match_asana_option(value: str, options: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _parse_date_to_iso(value_str: str) -> Optional[str]:
+    """Converts a date string in any of several common Sheet-typed
+    formats to Asana's required ISO 8601 "YYYY-MM-DD". A raw Sheet cell
+    holding a date is commonly displayed/exported in the spreadsheet's
+    own locale format (e.g. "09/03/26", US-style MM/DD/YY) — Asana's
+    API silently rejects (or misinterprets) anything that isn't ISO,
+    and the previous approach of just taking the first 10 characters
+    only worked for a value that already happened to be ISO-formatted.
+    Returns None (field skipped, not guessed at) if nothing matches."""
+    value_str = value_str.strip()
+    candidate_formats = [
+        "%Y-%m-%d",    # already ISO — the common case for a value this
+                        # system itself wrote, left as a fast path
+        "%m/%d/%Y",    # 09/03/2026 — US-style, 4-digit year
+        "%m/%d/%y",    # 09/03/26 — US-style, 2-digit year (the reported case)
+        "%d/%m/%Y",    # 03/09/2026 — day-first, 4-digit year
+        "%d/%m/%y",    # 03/09/26 — day-first, 2-digit year
+        "%B %d, %Y",   # September 3, 2026
+        "%b %d, %Y",   # Sep 3, 2026
+    ]
+    for fmt in candidate_formats:
+        try:
+            return datetime.strptime(value_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
 def _apply_value_to_asana_field(payload: Dict[str, object], defn: Dict, value_str: str) -> None:
     field_type = defn["type"]
     if field_type == "text":
@@ -3154,7 +3289,9 @@ def _apply_value_to_asana_field(payload: Dict[str, object], defn: Dict, value_st
         except ValueError:
             pass
     elif field_type == "date":
-        payload[defn["gid"]] = {"date": value_str[:10]}
+        iso_date = _parse_date_to_iso(value_str)
+        if iso_date:
+            payload[defn["gid"]] = {"date": iso_date}
     elif field_type == "enum":
         option_gid = _match_asana_option(value_str, defn["options"])
         if option_gid:
@@ -3744,6 +3881,20 @@ def main():
     p_remove.add_argument("--campaign", required=True)
     p_remove.add_argument("--file", required=True, help='Path to a JSON file: {"lead_ids": ["5", "8", ...]}')
     p_remove.set_defaults(func=cmd_remove_leads)
+
+    p_set_override = sub.add_parser("set-lead-override",
+                                     help="Set a manual sending-status and/or Asana-stage override for one "
+                                          "lead, found by email")
+    p_set_override.add_argument("--campaign", required=True)
+    p_set_override.add_argument("--email", required=True)
+    p_set_override.add_argument("--status", default=None,
+                                 help="'' to resume normal sending, or 'Stopped - Manual' to stop sending "
+                                      "to only this lead. Omit to leave sending status untouched.")
+    p_set_override.add_argument("--asana-stage", default=None,
+                                 help="'' to resume automatic Asana stage tracking, or one of Sourced / "
+                                      "Outreach Sent / Follow-up / Negotiating / Rights Secured / "
+                                      "Declined / Dead. Omit to leave the Asana stage untouched.")
+    p_set_override.set_defaults(func=cmd_set_lead_override)
 
     p_reply = sub.add_parser("send-reply",
                               help="Send a one-off manual reply from a fully-resolved JSON payload file "
