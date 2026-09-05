@@ -152,6 +152,18 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **Sheet header widening now checks by column name, not position.** An
+  earlier version required newly-added required columns to line up as
+  an exact ordered prefix — which broke the first time a real custom
+  column (added earlier via a CSV import) happened to sit exactly
+  where a later, genuinely new required column was expected. Since
+  every read/write in this system already works by column name, that
+  positional requirement was stricter than necessary; it's gone now,
+  replaced with "does every required column exist somewhere in the
+  header" — a tab that shares literally none of the expected columns
+  still fails loudly, since that almost certainly means it's the wrong
+  tab entirely, not just one that's picked up a few custom columns.
+
 - **Asana date fields now convert from common Sheet formats to Asana's
   required ISO 8601** — a value like `09/03/26` (US-style MM/DD/YY, a
   common spreadsheet display format) previously reached Asana
