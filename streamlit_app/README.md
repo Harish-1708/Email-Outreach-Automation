@@ -152,6 +152,37 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **Asana date fields now convert from common Sheet formats to Asana's
+  required ISO 8601** — a value like `09/03/26` (US-style MM/DD/YY, a
+  common spreadsheet display format) previously reached Asana
+  unconverted and was silently rejected or misread. Several formats are
+  recognized (`MM/DD/YY`, `MM/DD/YYYY`, day-first variants, month names,
+  and already-ISO values); anything unrecognized is skipped rather than
+  guessed at.
+- **A lead's Asana pipeline stage can be manually overridden** — set a
+  `ManualAsanaStage` value (`Sourced` / `Outreach Sent` / `Follow-up` /
+  `Negotiating` / `Rights Secured` / `Declined / Dead`, case-insensitive)
+  from the Data tab's "🔧 Manage a lead" section, and it takes priority
+  over auto-derivation on the very next sync — including for a task
+  that doesn't exist in Asana yet, so a lead handled entirely outside
+  the automated pipeline can be created directly into the right stage.
+  An unrecognized value is ignored, not rejected.
+- **A single lead can be stopped from automated sending without being
+  removed** — the same "🔧 Manage a lead" section can set Status to
+  `Stopped - Manual`, a real terminal status excluding just that one
+  lead from future sends while it stays fully visible everywhere else,
+  distinct from `Removed`. Clearing either override (status or Asana
+  stage) resumes normal automatic behavior.
+- **CSV import can deliberately allow re-importing an existing email** —
+  check "Allow re-importing an email that already exists" when
+  uploading, for the real case of contacting the same creator again for
+  a genuinely different video. Each import becomes its own row and,
+  once synced, its own separate Asana task. This never risks a
+  duplicate email being sent automatically — a separate, pre-existing
+  protection inside the core eligibility logic always considers only
+  the first (lowest row number) lead for a given address eligible to
+  actually be emailed, regardless of this setting.
+
 - **A campaign's sending window is now actually automated, not just a
   check nothing ever exercised.** A new `auto_send.yml` workflow runs
   every 30 minutes and calls `outreach.py auto-send-all`, which loops
