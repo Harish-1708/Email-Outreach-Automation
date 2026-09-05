@@ -1,0 +1,84 @@
+name: Set Lead Override
+
+# Manual only — this is always a deliberate human decision (stop sending
+# to one specific lead without removing them, or push a lead straight to
+# Rights Secured / Declined in Asana for one handled outside the
+# automated pipeline), never something that should run on a schedule.
+#
+# Both dropdowns default to "(no change)" and use explicit choices rather
+# than free text — a workflow_dispatch text input has no way to
+# distinguish "left blank on purpose" from "user typed nothing", so a
+# free-text field can't safely represent "clear this override" versus
+# "don't touch this field" as two different things. A choice list can.
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "Campaign name (must have a matching templates/<name>/ folder)"
+        required: true
+      email:
+        description: "The lead's email address"
+        required: true
+      status:
+        description: "Sending status for this one lead"
+        required: true
+        type: choice
+        default: "(no change)"
+        options:
+          - "(no change)"
+          - "Stop sending to this lead"
+          - "Clear override (resume normal sending)"
+      asana_stage:
+        description: "Asana pipeline stage override for this one lead"
+        required: true
+        type: choice
+        default: "(no change)"
+        options:
+          - "(no change)"
+          - "Clear override (resume automatic tracking)"
+          - "Sourced"
+          - "Outreach Sent"
+          - "Follow-up"
+          - "Negotiating"
+          - "Rights Secured"
+          - "Declined / Dead"
+
+jobs:
+  set-lead-override:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Set lead override
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          STATUS_CHOICE: ${{ github.event.inputs.status }}
+          ASANA_STAGE_CHOICE: ${{ github.event.inputs.asana_stage }}
+        run: |
+          set -o pipefail
+          ARGS=(--campaign "${{ github.event.inputs.campaign }}" --email "${{ github.event.inputs.email }}")
+
+          if [ "$STATUS_CHOICE" == "Stop sending to this lead" ]; then
+            ARGS+=(--status "Stopped - Manual")
+          elif [ "$STATUS_CHOICE" == "Clear override (resume normal sending)" ]; then
+            ARGS+=(--status "")
+          fi
+          # "(no change)" -> --status omitted entirely, matching cmd_set_lead_override's
+          # own "None means don't touch this field" convention.
+
+          if [ "$ASANA_STAGE_CHOICE" == "Clear override (resume automatic tracking)" ]; then
+            ARGS+=(--asana-stage "")
+          elif [ "$ASANA_STAGE_CHOICE" != "(no change)" ]; then
+            ARGS+=(--asana-stage "$ASANA_STAGE_CHOICE")
+          fi
+
+          python outreach.py set-lead-override "${ARGS[@]}" | tee set_override_output.txt
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat set_override_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
