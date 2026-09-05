@@ -24,6 +24,7 @@ WORKFLOW_REMOVE_LEADS = "remove_leads.yml"
 WORKFLOW_SEND_REPLY = "send_reply.yml"
 WORKFLOW_MARK_RESPONSES_READ = "mark_responses_read.yml"
 WORKFLOW_SYNC_ASANA = "sync_asana.yml"
+WORKFLOW_SET_LEAD_OVERRIDE = "set_lead_override.yml"
 WORKFLOW_CHECK_ACCOUNT_HEALTH = "check_account_health.yml"
 
 EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH = os.path.join(REPO_ROOT, "config", "email_account_slots.yaml")
