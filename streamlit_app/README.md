@@ -188,10 +188,23 @@ Remove buttons on the Email Accounts page instead:
   `Creator`, `Creator Email`, `Product`, `Sub Category`, `Usage
   Rights`, `Refunnel Link`, `Video File`, `Created At`, `Summary`,
   `Product Score`, `Rights Duration`, `Ad Ready`, `Notes`, `Contact
-  Status`,
-  `Last Contacted Date` — matching is by `Creator Email` then
+  Status`, `Last Contacted Date` — matching is by `Creator Email` then
   `Creator`, and only `Contact Status` / `Last Contacted Date` are
   ever written.
+- **The same creator can appear on more than one Creator Tracker row**
+  (contacted separately for different videos) without being reported
+  as unresolvable. When an email or name match finds more than one
+  candidate row, `Video File` / `Refunnel Link` — whichever the lead
+  itself has — is checked against each candidate row's own value for
+  that same column; exactly one match narrows it down to the right
+  row. Zero matches, or more than one, stays genuinely ambiguous and
+  is still reported for review rather than guessed at. A related bug
+  fixed alongside this: an earlier version let a later row silently
+  overwrite an earlier one sharing the same email in the internal
+  lookup, meaning an email collision was never even detected in the
+  first place — only name collisions were ever reported as ambiguous.
+  Both email and name matching now detect and handle collisions the
+  same way.
 
 - **Sheet header widening now checks by column name, not position.** An
   earlier version required newly-added required columns to line up as
