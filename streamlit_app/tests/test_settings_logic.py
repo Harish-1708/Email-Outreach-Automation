@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from settings_logic import (
     load_raw_override, validate_settings, build_updated_override,
     override_to_yaml_bytes, override_file_path, build_asana_settings_override,
+    build_tracker_sync_settings_override,
 )
 
 
@@ -165,3 +166,28 @@ def test_build_asana_settings_override_never_mutates_input():
 def test_build_asana_settings_override_disabled():
     updated = build_asana_settings_override({}, enabled=False, project_name="")
     assert updated["asana"]["enabled"] is False
+
+
+# ---------- build_tracker_sync_settings_override ----------
+
+def test_build_tracker_sync_settings_override_sets_enabled():
+    updated = build_tracker_sync_settings_override({}, enabled=True)
+    assert updated["tracker_sync"] == {"enabled": True}
+
+
+def test_build_tracker_sync_settings_override_preserves_other_keys():
+    raw = {"asana": {"enabled": True, "project_name": "X"}, "status": "active"}
+    updated = build_tracker_sync_settings_override(raw, enabled=True)
+    assert updated["asana"] == {"enabled": True, "project_name": "X"}
+    assert updated["status"] == "active"
+
+
+def test_build_tracker_sync_settings_override_never_mutates_input():
+    raw = {"status": "active"}
+    build_tracker_sync_settings_override(raw, enabled=True)
+    assert raw == {"status": "active"}
+
+
+def test_build_tracker_sync_settings_override_disabled():
+    updated = build_tracker_sync_settings_override({}, enabled=False)
+    assert updated["tracker_sync"]["enabled"] is False
