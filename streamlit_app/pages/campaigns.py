@@ -45,7 +45,7 @@ from campaign_builder import (  # noqa: E402
 )
 from settings_logic import (  # noqa: E402
     load_raw_override, validate_settings, build_updated_override, override_to_yaml_bytes, override_file_path,
-    build_asana_settings_override,
+    build_asana_settings_override, build_tracker_sync_settings_override,
 )
 from schedule_logic import (  # noqa: E402
     validate_schedule, build_updated_schedule_override, get_current_schedule,
@@ -1415,6 +1415,46 @@ def _render_asana_sync_section_in_settings(campaign_cfg):
                     client = _get_github_client()
                     client.dispatch_workflow(WORKFLOW_SYNC_ASANA, {"campaign": campaign_name})
                     st.success(f"Asana sync triggered for '{campaign_name}'. Check the Actions tab for progress.")
+                except GitHubActionsError as exc:
+                    st.error(f"Failed to trigger sync: {exc}")
+        else:
+            st.caption("Enable and save first to sync.")
+
+        st.divider()
+        tracker_settings = campaign_cfg.get("tracker_sync") or {}
+        st.caption(
+            "**Creator Tracker sheet** — a separate, shared spreadsheet (its ID and worksheet name are "
+            "set once as GitHub secrets, not configured per campaign) that keeps its own 'Contact "
+            "Status' and 'Last Contacted Date' columns in sync — nothing else in that sheet is ever "
+            "touched. Matches by Creator (the @handle) first, falling back to full name — a match "
+            "against more than one row in that sheet is reported for review rather than guessed at. "
+            "Rights Secured and Declined / Dead freeze the whole row here too, same as Asana."
+        )
+        tracker_enabled = st.checkbox("Also sync Creator Tracker sheet for this campaign",
+                                       value=bool(tracker_settings.get("enabled")),
+                                       key="tracker_sync_enabled")
+        if st.button("💾 Save Creator Tracker Settings", key="tracker_sync_save"):
+            try:
+                raw_override = load_raw_override(campaign_name, CAMPAIGNS_DIR)
+                updated = build_tracker_sync_settings_override(raw_override, tracker_enabled)
+                client = _get_github_client()
+                client.create_file(
+                    override_file_path(campaign_name), override_to_yaml_bytes(updated),
+                    message=f"Update Creator Tracker sync settings for {campaign_name} (via Streamlit, "
+                            f"by {current_user()})",
+                )
+                st.success("Creator Tracker settings saved. May take a minute to reflect here while "
+                           "the app redeploys.")
+            except GitHubActionsError as exc:
+                st.error(f"Failed to save: {exc}")
+
+        if tracker_settings.get("enabled"):
+            if st.button("🔄 Sync Creator Tracker Sheet Now", key="tracker_sync_now"):
+                try:
+                    client = _get_github_client()
+                    client.dispatch_workflow(WORKFLOW_SYNC_ASANA, {"campaign": campaign_name})
+                    st.success(f"Sync triggered for '{campaign_name}' (Asana + Creator Tracker, "
+                               "whichever are enabled). Check the Actions tab for progress.")
                 except GitHubActionsError as exc:
                     st.error(f"Failed to trigger sync: {exc}")
         else:
