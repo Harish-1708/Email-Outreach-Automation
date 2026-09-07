@@ -152,6 +152,37 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **A second, independent sync target now exists: the Creator Tracker
+  sheet** — a separate, shared spreadsheet (its ID and worksheet name
+  are GitHub secrets — `CREATOR_TRACKER_SHEET_ID` and
+  `CREATOR_TRACKER_WORKSHEET_NAME` — not per-campaign settings, since
+  it's the same sheet across every campaign) that keeps its own
+  `Contact Status` and `Last Contacted Date` columns in sync with each
+  lead's pipeline stage and most recent send. Enabled per campaign
+  right under the Asana Sync section in Settings. Matches each lead by
+  Creator (the @handle) first, falling back to full name — a match
+  against more than one of that sheet's rows is reported for manual
+  review, never guessed at, since silently picking one could update
+  the wrong creator in a sheet spanning thousands of rows across every
+  other campaign too. Never creates a row, and never touches any
+  column other than those two — every other column (`Brand`,
+  `Platform`, `Product`, `Video File`, etc.) belongs to a separate
+  daily process and is never written to from here. Rights Secured and
+  Declined / Dead freeze the entire row from this sync's perspective
+  (neither column is touched further), sharing the exact same
+  `ManualAsanaStage` override Asana sync uses, so one human decision is
+  reflected consistently in both places rather than two separate
+  overrides that could disagree. Asana sync and Creator Tracker sync
+  run fully independently of each other — a campaign can enable just
+  one without needing the other's credentials at all. Confirmed
+  columns on the real sheet: `id`, `Brand`, `Platform`, `Creator`,
+  `Creator Email`, `Product`, `Sub Category`, `Usage Rights`,
+  `Refunnel Link`, `Video File`, `Created At`, `Summary`, `Product
+  Score`, `Rights Duration`, `Ad Ready`, `Notes`, `Contact Status`,
+  `Last Contacted Date` — matching is by `Creator Email` then
+  `Creator`, and only `Contact Status` / `Last Contacted Date` are
+  ever written.
+
 - **Sheet header widening now checks by column name, not position.** An
   earlier version required newly-added required columns to line up as
   an exact ordered prefix — which broke the first time a real custom
