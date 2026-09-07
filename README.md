@@ -225,6 +225,16 @@ Remove buttons on the Email Accounts page instead:
   recognized (`MM/DD/YY`, `MM/DD/YYYY`, day-first variants, month names,
   and already-ISO values); anything unrecognized is skipped rather than
   guessed at.
+- **Asana's "Last Contact Date" custom field now also reflects real
+  send activity, not just a manually-typed Sheet value.** It takes
+  whichever is more recent: the Sheet's own "Last Contact Date" column
+  (still fully respected — a human-entered date newer than the last
+  automated send is never overwritten) or the lead's own `LastActionAt`
+  (updated automatically every time an email actually goes out).
+  Before this, sending a real follow-up today never moved this field
+  forward on its own — it stayed frozen at whatever was last typed in
+  manually, however stale that became, even while the task's own stage
+  correctly advanced from Outreach Sent to Follow-up in the same sync.
 - **A lead's Asana pipeline stage can be manually overridden** — set a
   `ManualAsanaStage` value (`Sourced` / `Outreach Sent` / `Follow-up` /
   `Negotiating` / `Rights Secured` / `Declined / Dead`, case-insensitive)
