@@ -73,6 +73,18 @@ def build_asana_settings_override(raw_override: Dict, enabled: bool, project_nam
     return updated
 
 
+def build_tracker_sync_settings_override(raw_override: Dict, enabled: bool) -> Dict:
+    """Returns a NEW dict — never mutates raw_override. Only the
+    'tracker_sync' key is touched. No project-name-style field here —
+    the Creator Tracker sheet's own spreadsheet ID and worksheet name
+    are shared secrets, not per-campaign settings; only whether THIS
+    campaign's leads should sync to it at all is a per-campaign
+    choice."""
+    updated = dict(raw_override)
+    updated["tracker_sync"] = {"enabled": enabled}
+    return updated
+
+
 def override_to_yaml_bytes(override: Dict) -> bytes:
     return yaml.safe_dump(override, sort_keys=False, default_flow_style=False).encode("utf-8")
 
