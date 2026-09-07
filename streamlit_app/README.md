@@ -158,27 +158,37 @@ Remove buttons on the Email Accounts page instead:
   `CREATOR_TRACKER_WORKSHEET_NAME` — not per-campaign settings, since
   it's the same sheet across every campaign) that keeps its own
   `Contact Status` and `Last Contacted Date` columns in sync with each
-  lead's pipeline stage and most recent send. Enabled per campaign
-  right under the Asana Sync section in Settings. Matches each lead by
-  Creator (the @handle) first, falling back to full name — a match
-  against more than one of that sheet's rows is reported for manual
-  review, never guessed at, since silently picking one could update
-  the wrong creator in a sheet spanning thousands of rows across every
-  other campaign too. Never creates a row, and never touches any
-  column other than those two — every other column (`Brand`,
-  `Platform`, `Product`, `Video File`, etc.) belongs to a separate
-  daily process and is never written to from here. Rights Secured and
-  Declined / Dead freeze the entire row from this sync's perspective
-  (neither column is touched further), sharing the exact same
-  `ManualAsanaStage` override Asana sync uses, so one human decision is
-  reflected consistently in both places rather than two separate
-  overrides that could disagree. Asana sync and Creator Tracker sync
-  run fully independently of each other — a campaign can enable just
-  one without needing the other's credentials at all. Confirmed
-  columns on the real sheet: `id`, `Brand`, `Platform`, `Creator`,
-  `Creator Email`, `Product`, `Sub Category`, `Usage Rights`,
-  `Refunnel Link`, `Video File`, `Created At`, `Summary`, `Product
-  Score`, `Rights Duration`, `Ad Ready`, `Notes`, `Contact Status`,
+  lead's pipeline stage and most recent send. Configured in its own,
+  fully separate "📊 Creator Tracker Sync" expander in Settings — NOT
+  nested under Asana Sync, since a campaign can enable either without
+  the other. `CREATOR_TRACKER_WORKSHEET_NAME` accepts either the tab's
+  own name (shown at the bottom of Google Sheets) OR its numeric gid
+  (the number after `gid=` in that specific tab's URL) — a gid is
+  more robust, since it never changes even if the tab gets renamed.
+  Either way, this is the TAB's identifier, never the spreadsheet
+  document's own title (a different, easily-confused thing — e.g. the
+  document might be titled "Content Tracker" while the specific tab
+  to sync is named something else, like a brand name). Matches each
+  lead by Creator (the @handle) first, falling back to full name — a
+  match against more than one of that sheet's rows is reported for
+  manual review, never guessed at, since silently picking one could
+  update the wrong creator in a sheet spanning thousands of rows
+  across every other campaign too. Never creates a row, and never
+  touches any column other than those two — every other column
+  (`Brand`, `Platform`, `Product`, `Video File`, etc.) belongs to a
+  separate daily process and is never written to from here. Rights
+  Secured and Declined / Dead freeze the entire row from this sync's
+  perspective (neither column is touched further), sharing the exact
+  same `ManualAsanaStage` override Asana sync uses, so one human
+  decision is reflected consistently in both places rather than two
+  separate overrides that could disagree. Asana sync and Creator
+  Tracker sync run fully independently of each other — a campaign can
+  enable just one without needing the other's credentials at all.
+  Confirmed columns on the real sheet: `id`, `Brand`, `Platform`,
+  `Creator`, `Creator Email`, `Product`, `Sub Category`, `Usage
+  Rights`, `Refunnel Link`, `Video File`, `Created At`, `Summary`,
+  `Product Score`, `Rights Duration`, `Ad Ready`, `Notes`, `Contact
+  Status`,
   `Last Contacted Date` — matching is by `Creator Email` then
   `Creator`, and only `Contact Status` / `Last Contacted Date` are
   ever written.
