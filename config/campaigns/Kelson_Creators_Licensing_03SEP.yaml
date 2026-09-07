@@ -13,3 +13,5 @@ sending:
   sender_rotation: false
   rotation_accounts:
   - sales1
+tracker_sync:
+  enabled: true
