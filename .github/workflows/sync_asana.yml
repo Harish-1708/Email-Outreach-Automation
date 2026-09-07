@@ -1,12 +1,18 @@
-name: Sync Asana
+name: Sync Asana + Creator Tracker
 
 # Two ways to trigger, matching the two things this needs to do:
 #  - workflow_dispatch with a campaign input: the Settings tab's "Sync
-#    to Asana" button, for one specific campaign, on demand.
-#  - schedule: loops over EVERY campaign that has asana.enabled set to
-#    true (see outreach.py's cmd_sync_asana_all) — not a single
-#    hardcoded default campaign, since more than one campaign will have
-#    this turned on over time.
+#    to Asana Now" / "Sync Creator Tracker Sheet Now" buttons, for one
+#    specific campaign, on demand.
+#  - schedule: loops over EVERY campaign that has asana.enabled and/or
+#    tracker_sync.enabled set to true (see outreach.py's
+#    cmd_sync_asana_all) — not a single hardcoded default campaign,
+#    since more than one campaign will have either turned on over time.
+#
+# Asana sync and Creator Tracker sync run independently of each other
+# for every campaign — a campaign can have just one enabled without
+# needing the other's credentials configured at all (see
+# outreach.py's cmd_sync_asana / cmd_sync_asana_all).
 on:
   workflow_dispatch:
     inputs:
@@ -14,15 +20,18 @@ on:
         description: "Campaign name — leave blank to sync every enabled campaign instead"
         required: false
   schedule:
-    # Once a day. Asana sync isn't as time-sensitive as checking for
+    # Once a day. Neither sync is as time-sensitive as checking for
     # replies — adjust the interval here if that stops being true.
     - cron: "0 13 * * *"
 
 # Same reasoning as check_replies.yml's concurrency block: two overlapping
 # syncs (a scheduled run and a manual click close together) could both
-# decide the same lead needs a NEW task at the same time, before either
-# has written the resulting AsanaTaskGID back — that's exactly the
-# duplicate-creation race this queues away instead of risking.
+# decide the same lead needs a NEW Asana task at the same time, before
+# either has written the resulting AsanaTaskGID back — that's exactly the
+# duplicate-creation race this queues away instead of risking. The same
+# overlap risk doesn't really apply to Creator Tracker sync (it never
+# creates anything, only updates an existing cell), but queuing both
+# together is simpler than splitting this into two separate workflows.
 concurrency:
   group: sync-asana
   cancel-in-progress: false
@@ -39,10 +48,12 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Sync Asana
+      - name: Sync Asana + Creator Tracker
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          CREATOR_TRACKER_SHEET_ID: ${{ secrets.CREATOR_TRACKER_SHEET_ID }}
+          CREATOR_TRACKER_WORKSHEET_NAME: ${{ secrets.CREATOR_TRACKER_WORKSHEET_NAME }}
         run: |
           set -o pipefail
           if [ -n "${{ github.event.inputs.campaign }}" ]; then
