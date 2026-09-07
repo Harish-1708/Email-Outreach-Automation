@@ -1058,6 +1058,7 @@ def _render_settings_tab(campaign_cfg, leads):
 
     _render_maintenance_section_in_settings(campaign_cfg)
     _render_asana_sync_section_in_settings(campaign_cfg)
+    _render_tracker_sync_section_in_settings(campaign_cfg)
     _render_send_section_in_settings(campaign_cfg, leads)
     _render_delete_campaign_section(campaign_cfg)
 
@@ -1420,17 +1421,28 @@ def _render_asana_sync_section_in_settings(campaign_cfg):
         else:
             st.caption("Enable and save first to sync.")
 
-        st.divider()
-        tracker_settings = campaign_cfg.get("tracker_sync") or {}
+
+def _render_tracker_sync_section_in_settings(campaign_cfg):
+    """Enable/configure syncing this campaign's leads to the Creator
+    Tracker sheet, and trigger an on-demand sync — a fully separate
+    section from Asana Sync, with its own expander, its own enable
+    toggle, and its own trigger, since a campaign may want either
+    without the other. The actual sync happens in the same
+    sync_asana.yml / outreach.py entry point (which runs Asana sync and
+    Creator Tracker sync independently of each other), matching every
+    other "does real work elsewhere" action in this app."""
+    campaign_name = campaign_cfg["_campaign_name"]
+    tracker_settings = campaign_cfg.get("tracker_sync") or {}
+    with st.expander("📊 Creator Tracker Sync", expanded=bool(tracker_settings.get("enabled"))):
         st.caption(
-            "**Creator Tracker sheet** — a separate, shared spreadsheet (its ID and worksheet name are "
-            "set once as GitHub secrets, not configured per campaign) that keeps its own 'Contact "
-            "Status' and 'Last Contacted Date' columns in sync — nothing else in that sheet is ever "
-            "touched. Matches by Creator (the @handle) first, falling back to full name — a match "
-            "against more than one row in that sheet is reported for review rather than guessed at. "
-            "Rights Secured and Declined / Dead freeze the whole row here too, same as Asana."
+            "A separate, shared spreadsheet (its ID and worksheet name are set once as GitHub "
+            "secrets, not configured per campaign) that keeps its own 'Contact Status' and 'Last "
+            "Contacted Date' columns in sync — nothing else in that sheet is ever touched. Matches "
+            "by Creator (the @handle) first, falling back to full name — a match against more than "
+            "one row in that sheet is reported for review rather than guessed at. Rights Secured and "
+            "Declined / Dead freeze the whole row here too, same as Asana."
         )
-        tracker_enabled = st.checkbox("Also sync Creator Tracker sheet for this campaign",
+        tracker_enabled = st.checkbox("Enable Creator Tracker sync for this campaign",
                                        value=bool(tracker_settings.get("enabled")),
                                        key="tracker_sync_enabled")
         if st.button("💾 Save Creator Tracker Settings", key="tracker_sync_save"):
@@ -1453,8 +1465,8 @@ def _render_asana_sync_section_in_settings(campaign_cfg):
                 try:
                     client = _get_github_client()
                     client.dispatch_workflow(WORKFLOW_SYNC_ASANA, {"campaign": campaign_name})
-                    st.success(f"Sync triggered for '{campaign_name}' (Asana + Creator Tracker, "
-                               "whichever are enabled). Check the Actions tab for progress.")
+                    st.success(f"Creator Tracker sync triggered for '{campaign_name}'. Check the "
+                               "Actions tab for progress.")
                 except GitHubActionsError as exc:
                     st.error(f"Failed to trigger sync: {exc}")
         else:
