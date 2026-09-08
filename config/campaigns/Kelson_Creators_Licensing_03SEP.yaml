@@ -8,6 +8,8 @@ schedule:
   window_end: '17:00'
   send_days:
   - mon
+  - tue
+  - wed
 sending:
   daily_limit: 100
   sender_rotation: false
