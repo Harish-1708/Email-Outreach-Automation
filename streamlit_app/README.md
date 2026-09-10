@@ -152,6 +152,48 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **A genuine reply on a NEW email thread (a different subject the
+  automated reply-checker can't match back to the original outbound
+  thread) can now be marked manually.** `set-lead-override` gained
+  `--reply-status` (`''` or `Replied`) and `--last-inbound-classification`
+  (`''` or one of the five real classifications). Setting ReplyStatus
+  to Replied also sets ReplyAt to now; setting a non-blank
+  classification also sets LastInboundAt to now — matching exactly
+  what the normal, automatic reply-detection flow does when it sets
+  these together, so a manually-marked reply looks the same as a
+  normally-detected one everywhere else in the system that reads them.
+  This is the actual fix for a real gap: without it, a lead correctly
+  moved to Negotiating by hand (because the reply itself was only
+  ever thread-matched via Message-ID references, and a different-
+  thread reply never touches ReplyStatus) could have that decision
+  silently reverted by the very next Asana sync, since Negotiating is
+  computed from ReplyStatus rather than being a protected manual-only
+  stage the way Rights Secured / Declined are.
+- **`sync_asana.yml` now runs every 30 minutes**, matching
+  `auto_send.yml`'s cadence, rather than once a day.
+
+- **New and existing Asana tasks can get a default assignee.** Set
+  `ASANA_DEFAULT_ASSIGNEE_EMAIL` as a GitHub secret and every newly
+  created task gets it at creation; every existing task that's
+  currently unassigned gets it backfilled on its next sync. A task
+  someone's deliberately assigned to a different person is never
+  overwritten — only a genuinely blank assignee gets filled in.
+- **A decision made directly in Asana (dragging a task to Rights
+  Secured / Declined, or setting its Rights Expiration field) now
+  reaches the Creator Tracker sheet without also requiring the same
+  decision to be typed into `ManualAsanaStage` on the campaign's own
+  Sheet.** Only applies when a lead's `ManualAsanaStage` is blank — an
+  explicit Sheet-side decision always takes precedence over whatever a
+  task's live section in Asana happens to say, so a change on the
+  Sheet is never silently overridden by stale Asana state. Rights
+  Expiration populates a new "Rights Duration" column on the Tracker
+  sheet the same way Last Contacted Date is populated elsewhere —
+  never overwritten with something older or blank. This only works
+  when Asana sync is also enabled and configured for that campaign,
+  since there's no Asana state to read otherwise; Creator Tracker sync
+  still runs normally without it, just without this particular
+  reverse-sync behavior.
+
 - **A second, independent sync target now exists: the Creator Tracker
   sheet** — a separate, shared spreadsheet (its ID and worksheet name
   are GitHub secrets — `CREATOR_TRACKER_SHEET_ID` and
@@ -225,6 +267,16 @@ Remove buttons on the Email Accounts page instead:
   recognized (`MM/DD/YY`, `MM/DD/YYYY`, day-first variants, month names,
   and already-ISO values); anything unrecognized is skipped rather than
   guessed at.
+- **Asana's "Last Contact Date" custom field now also reflects real
+  send activity, not just a manually-typed Sheet value.** It takes
+  whichever is more recent: the Sheet's own "Last Contact Date" column
+  (still fully respected — a human-entered date newer than the last
+  automated send is never overwritten) or the lead's own `LastActionAt`
+  (updated automatically every time an email actually goes out).
+  Before this, sending a real follow-up today never moved this field
+  forward on its own — it stayed frozen at whatever was last typed in
+  manually, however stale that became, even while the task's own stage
+  correctly advanced from Outreach Sent to Follow-up in the same sync.
 - **A lead's Asana pipeline stage can be manually overridden** — set a
   `ManualAsanaStage` value (`Sourced` / `Outreach Sent` / `Follow-up` /
   `Negotiating` / `Rights Secured` / `Declined / Dead`, case-insensitive)
