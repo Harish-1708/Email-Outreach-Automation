@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: "Campaign name (must have a matching templates/<name>/ folder)"
-        required: true
-        default: "Kelson_Creators_Licensing"
+        description: "Campaign name — leave blank to check every campaign instead (this is what the scheduled run below always does)"
+        required: false
+        default: ""
   schedule:
     # Every 10 minutes. Adjust to taste — tighter = faster stop-on-reply
     # and a snappier-feeling Responses inbox, looser = fewer Actions
@@ -58,9 +58,23 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -o pipefail
-          python outreach.py check-replies \
-            --campaign "${{ github.event.inputs.campaign || 'Kelson_Creators_Licensing' }}" \
-            | tee replies_output.txt
+          # The actual bug this fixes: for a schedule-triggered run,
+          # github.event.inputs is ALWAYS empty — there's no such thing
+          # as an "input" outside of workflow_dispatch. The previous
+          # version's `|| 'Kelson_Creators_Licensing'` fallback meant
+          # EVERY scheduled run silently checked only that one hardcoded
+          # campaign, no matter how many campaigns actually exist or
+          # which one is the current active one — only a manual run
+          # (which lets a human type a real campaign name) ever worked
+          # correctly for anything else. Now: a manual run with a
+          # campaign name checks just that one; a scheduled run (or a
+          # manual run left blank) checks every campaign, regardless of
+          # status, via check-replies-all.
+          if [ -n "${{ github.event.inputs.campaign }}" ]; then
+            python outreach.py check-replies --campaign "${{ github.event.inputs.campaign }}" | tee replies_output.txt
+          else
+            python outreach.py check-replies-all | tee replies_output.txt
+          fi
       - name: Add to job summary
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -72,4 +86,8 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          python outreach.py dashboard --campaign "${{ github.event.inputs.campaign || 'Kelson_Creators_Licensing' }}"
+          # Same fix applied here — this previously had the identical
+          # hardcoded-fallback bug. Always refreshes every campaign's
+          # dashboard now, regardless of which one(s) were just checked
+          # for replies above — simple, cheap, and never stale.
+          python outreach.py dashboard --all
