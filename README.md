@@ -152,6 +152,89 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **A failed Asana section move on an UPDATE is now a real, visible
+  error, not a silent no-op.** If the live Asana project has no
+  section whose name exactly matches the computed target stage (e.g.
+  a `ManualAsanaStage` override of `Negotiating`, but the project's
+  actual section is named something slightly different), the sync
+  previously just skipped the move entirely with zero indication —
+  it still counted as a successful "updated" lead. Now it raises
+  clearly, naming the target stage it couldn't find and listing every
+  section the project actually has, so this is immediately
+  diagnosable from the sync's own error output instead of looking
+  like "the sync ran, but nothing changed" with no further clue why.
+
+- **New command `check-replies-all`** — the scheduled trigger's actual
+  entry point going forward, fixing a real reported production bug: a
+  scheduled `check-replies` run hardcoded to a single campaign name
+  meant every OTHER campaign (including whichever one is actually
+  current, if it was created after that name was hardcoded) never had
+  its replies checked automatically at all — only a manual run, which
+  lets a human specify any campaign by name, worked. Runs for every
+  discovered campaign regardless of status (Running, Paused, Draft,
+  Completed) — a paused or finished campaign can still receive a
+  genuine reply needing its lead's sequence correctly stopped. One
+  campaign's failure never blocks any other campaign's check.
+- **`dashboard --all` already existed** and is the fix for the same
+  class of bug on the dashboard side — the scheduled workflow should
+  call `python outreach.py dashboard --all` instead of hardcoding
+  `--campaign "<name>"`.
+
+- **An IMAP account that fails to connect during check-replies is now
+  visible in the workflow's own job summary, not just buried in
+  stderr.** Previously, an account-level IMAP failure was caught,
+  logged to the campaign's error log, and printed as a WARNING — but
+  only to stderr, which `check_replies.yml`'s `tee` doesn't capture
+  into the job summary. The run still reported success with "No new
+  inbound messages matched to a lead", which looks identical to a run
+  that genuinely found nothing — there was no way to tell the two
+  apart from the summary alone. `check_replies()` gained an optional
+  `account_errors` list parameter; `cmd_check_replies` now prints a
+  clear warning to stdout whenever any account couldn't be checked,
+  naming which one and why.
+
+- **A genuine reply on a NEW email thread (a different subject the
+  automated reply-checker can't match back to the original outbound
+  thread) can now be marked manually.** `set-lead-override` gained
+  `--reply-status` (`''` or `Replied`) and `--last-inbound-classification`
+  (`''` or one of the five real classifications). Setting ReplyStatus
+  to Replied also sets ReplyAt to now; setting a non-blank
+  classification also sets LastInboundAt to now — matching exactly
+  what the normal, automatic reply-detection flow does when it sets
+  these together, so a manually-marked reply looks the same as a
+  normally-detected one everywhere else in the system that reads them.
+  This is the actual fix for a real gap: without it, a lead correctly
+  moved to Negotiating by hand (because the reply itself was only
+  ever thread-matched via Message-ID references, and a different-
+  thread reply never touches ReplyStatus) could have that decision
+  silently reverted by the very next Asana sync, since Negotiating is
+  computed from ReplyStatus rather than being a protected manual-only
+  stage the way Rights Secured / Declined are.
+- **`sync_asana.yml` now runs every 30 minutes**, matching
+  `auto_send.yml`'s cadence, rather than once a day.
+
+- **New and existing Asana tasks can get a default assignee.** Set
+  `ASANA_DEFAULT_ASSIGNEE_EMAIL` as a GitHub secret and every newly
+  created task gets it at creation; every existing task that's
+  currently unassigned gets it backfilled on its next sync. A task
+  someone's deliberately assigned to a different person is never
+  overwritten — only a genuinely blank assignee gets filled in.
+- **A decision made directly in Asana (dragging a task to Rights
+  Secured / Declined, or setting its Rights Expiration field) now
+  reaches the Creator Tracker sheet without also requiring the same
+  decision to be typed into `ManualAsanaStage` on the campaign's own
+  Sheet.** Only applies when a lead's `ManualAsanaStage` is blank — an
+  explicit Sheet-side decision always takes precedence over whatever a
+  task's live section in Asana happens to say, so a change on the
+  Sheet is never silently overridden by stale Asana state. Rights
+  Expiration populates a new "Rights Duration" column on the Tracker
+  sheet the same way Last Contacted Date is populated elsewhere —
+  never overwritten with something older or blank. This only works
+  when Asana sync is also enabled and configured for that campaign,
+  since there's no Asana state to read otherwise; Creator Tracker sync
+  still runs normally without it, just without this particular
+  reverse-sync behavior.
+
 - **A second, independent sync target now exists: the Creator Tracker
   sheet** — a separate, shared spreadsheet (its ID and worksheet name
   are GitHub secrets — `CREATOR_TRACKER_SHEET_ID` and
