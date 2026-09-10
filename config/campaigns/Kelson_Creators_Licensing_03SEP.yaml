@@ -12,7 +12,7 @@ schedule:
   - wed
   - thu
 sending:
-  daily_limit: 100
+  daily_limit: 10
   sender_rotation: false
   rotation_accounts:
   - sales1
