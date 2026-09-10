@@ -20,9 +20,11 @@ on:
         description: "Campaign name — leave blank to sync every enabled campaign instead"
         required: false
   schedule:
-    # Once a day. Neither sync is as time-sensitive as checking for
-    # replies — adjust the interval here if that stops being true.
-    - cron: "0 13 * * *"
+    # Every 30 minutes, by request — the same cadence as auto_send.yml.
+    # GitHub Actions cron has its own scheduling delay (typically a few
+    # minutes under load), so treat this as "within roughly 30-40
+    # minutes", not to-the-minute precision.
+    - cron: "*/30 * * * *"
 
 # Same reasoning as check_replies.yml's concurrency block: two overlapping
 # syncs (a scheduled run and a manual click close together) could both
