@@ -1,12 +1,14 @@
 name: Set Lead Override
 
 # Manual only — this is always a deliberate human decision (stop sending
-# to one specific lead without removing them, or push a lead straight to
+# to one specific lead without removing them, push a lead straight to
 # Rights Secured / Declined in Asana for one handled outside the
-# automated pipeline), never something that should run on a schedule.
+# automated pipeline, or manually mark a reply that landed on a new
+# email thread the automated reply-checker couldn't match back to this
+# lead), never something that should run on a schedule.
 #
-# Both dropdowns default to "(no change)" and use explicit choices rather
-# than free text — a workflow_dispatch text input has no way to
+# All four dropdowns default to "(no change)" and use explicit choices
+# rather than free text — a workflow_dispatch text input has no way to
 # distinguish "left blank on purpose" from "user typed nothing", so a
 # free-text field can't safely represent "clear this override" versus
 # "don't touch this field" as two different things. A choice list can.
@@ -42,6 +44,28 @@ on:
           - "Negotiating"
           - "Rights Secured"
           - "Declined / Dead"
+      reply_status:
+        description: "Manually mark a genuine reply this lead sent on a NEW email thread the automated reply-checker couldn't match back (also sets ReplyAt to now)"
+        required: true
+        type: choice
+        default: "(no change)"
+        options:
+          - "(no change)"
+          - "Mark as Replied"
+          - "Clear override"
+      last_inbound_classification:
+        description: "Manually set this lead's last inbound classification (also sets LastInboundAt to now when set to a real classification)"
+        required: true
+        type: choice
+        default: "(no change)"
+        options:
+          - "(no change)"
+          - "Clear override"
+          - "Genuine Reply"
+          - "Auto-Reply"
+          - "Out of Office"
+          - "Bounce (Hard)"
+          - "Bounce (Soft)"
 
 jobs:
   set-lead-override:
@@ -57,6 +81,8 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           STATUS_CHOICE: ${{ github.event.inputs.status }}
           ASANA_STAGE_CHOICE: ${{ github.event.inputs.asana_stage }}
+          REPLY_STATUS_CHOICE: ${{ github.event.inputs.reply_status }}
+          CLASSIFICATION_CHOICE: ${{ github.event.inputs.last_inbound_classification }}
         run: |
           set -o pipefail
           ARGS=(--campaign "${{ github.event.inputs.campaign }}" --email "${{ github.event.inputs.email }}")
@@ -66,13 +92,23 @@ jobs:
           elif [ "$STATUS_CHOICE" == "Clear override (resume normal sending)" ]; then
             ARGS+=(--status "")
           fi
-          # "(no change)" -> --status omitted entirely, matching cmd_set_lead_override's
-          # own "None means don't touch this field" convention.
 
           if [ "$ASANA_STAGE_CHOICE" == "Clear override (resume automatic tracking)" ]; then
             ARGS+=(--asana-stage "")
           elif [ "$ASANA_STAGE_CHOICE" != "(no change)" ]; then
             ARGS+=(--asana-stage "$ASANA_STAGE_CHOICE")
+          fi
+
+          if [ "$REPLY_STATUS_CHOICE" == "Mark as Replied" ]; then
+            ARGS+=(--reply-status "Replied")
+          elif [ "$REPLY_STATUS_CHOICE" == "Clear override" ]; then
+            ARGS+=(--reply-status "")
+          fi
+
+          if [ "$CLASSIFICATION_CHOICE" == "Clear override" ]; then
+            ARGS+=(--last-inbound-classification "")
+          elif [ "$CLASSIFICATION_CHOICE" != "(no change)" ]; then
+            ARGS+=(--last-inbound-classification "$CLASSIFICATION_CHOICE")
           fi
 
           python outreach.py set-lead-override "${ARGS[@]}" | tee set_override_output.txt
