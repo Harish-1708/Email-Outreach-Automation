@@ -24,7 +24,7 @@ on:
     # GitHub Actions cron has its own scheduling delay (typically a few
     # minutes under load), so treat this as "within roughly 30-40
     # minutes", not to-the-minute precision.
-    - cron: "*/30 * * * *"
+    - cron: "15,45 * * * *"
 
 # Same reasoning as check_replies.yml's concurrency block: two overlapping
 # syncs (a scheduled run and a manual click close together) could both
