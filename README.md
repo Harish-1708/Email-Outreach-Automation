@@ -152,6 +152,58 @@ Remove buttons on the Email Accounts page instead:
 
 ## Known limitations (by design, not bugs)
 
+- **A Google Sheets 429 quota error now gets a realistic chance to
+  actually recover**, instead of failing outright. The existing
+  retry logic already treated 429 as retryable, but used the same
+  short, generic exponential backoff as a transient 5xx (2s, 4s, 8s —
+  ~14 seconds total). Google's Sheets API quota (e.g. "Read requests
+  per minute per user") resets on a per-**minute** window, so that
+  14-second budget could easily exhaust before the very same 60-second
+  window that caused the 429 had even finished — the retry logic was
+  never actually capable of waiting one out. A 429 specifically now
+  gets its own, much longer schedule (15s, 30s, 60s — up to ~105
+  seconds), independent of the generic retry count.
+- **This doesn't fix the underlying cause, only the symptom.** Multiple
+  scheduled workflows (`auto_send.yml`, `sync_asana.yml`,
+  `check_replies.yml`) each loop over every campaign and share one
+  Google service account — if their cron schedules overlap, the
+  combined read volume across all of them can exceed Google's quota
+  regardless of how well any single one retries. In particular,
+  `auto_send.yml` and `sync_asana.yml` likely both run on `*/30 * * * *`
+  (firing at :00 and :30 simultaneously) — staggering `sync_asana.yml`
+  to `15,45 * * * *` avoids that overlap entirely; `check_replies.yml`
+  at `*/10 * * * *` will still occasionally land on the same minute as
+  the other two, but it's a lighter, read-focused workflow than a full
+  Asana+Tracker sync pass. Retrying is a safety net against occasional
+  overlap, not license to run everything at the exact same time.
+- **A single sync pass no longer re-reads the same Master Sheet 2-3
+  times over.** `sync_campaign_to_asana`, `sync_campaign_to_tracker_sheet`,
+  and `collect_asana_manual_state_for_leads` each independently called
+  `sheets.get_all_leads()` — meaning a campaign with both Asana sync
+  and Tracker sync enabled read the exact same, unchanged data up to 3
+  times in a single run, for no reason. All three now accept an
+  optional `leads` parameter; `cmd_sync_asana` and `cmd_sync_asana_all`
+  fetch once per campaign and reuse the same list across all three,
+  cutting a real, confirmed contributor to the same per-minute Sheets
+  API read quota this whole section is about. Omitting `leads` (every
+  existing caller besides these two commands) reads fresh exactly as
+  before — nothing else changes.
+
+- **An explicit `ManualAsanaStage` override can now actually move a
+  task out of Rights Secured or Declined / Dead.** Previously, the
+  "never move a task out of a manual-only stage automatically"
+  protection applied unconditionally — including when the override
+  itself was the thing asking for the move. A lead correctly set to
+  `ManualAsanaStage=Negotiating` from the Data tab, whose task
+  happened to already be sitting in Rights Secured, stayed silently
+  stuck there forever: every sync reported "updated" with nothing
+  visibly changing, and there was no way to move it without editing
+  the task directly in Asana. The protection is unchanged for its
+  original purpose — an automatic, send/reply-derived recomputation
+  (no explicit override at all) still can never move a task out of
+  either stage on its own. Confirmed directly against a real Asana
+  project and task before and after this fix.
+
 - **A failed Asana section move on an UPDATE is now a real, visible
   error, not a silent no-op.** If the live Asana project has no
   section whose name exactly matches the computed target stage (e.g.
