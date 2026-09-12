@@ -4,6 +4,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+
+from conftest import FIXTURE_CAMPAIGN, FIXTURE_TEMPLATES
 from campaign_builder import (
     validate_campaign_name, validate_variant_content, build_template_file_content,
     build_campaign_files, get_next_stage_for_campaign, commit_message_for_campaign,
@@ -127,8 +129,8 @@ def test_build_campaign_files_uses_given_stage_prefix():
 # ---------- get_next_stage_for_campaign — against the REAL sample campaign ----------
 
 def test_get_next_stage_for_fully_built_campaign_returns_none():
-    # Kelson_Creators_Licensing already has all 5 stages in the repo fixture.
-    result = get_next_stage_for_campaign("Kelson_Creators_Licensing", TEMPLATES_ROOT)
+    # The fixture campaign has all 5 stages built.
+    result = get_next_stage_for_campaign(FIXTURE_CAMPAIGN, FIXTURE_TEMPLATES)
     assert result is None
 
 
