@@ -18,6 +18,8 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from conftest import FIXTURE_CAMPAIGN
+
 PAGES_DIR = os.path.join(os.path.dirname(__file__), "..", "pages")
 
 
@@ -107,16 +109,16 @@ def _authed_session():
     return {"auth_user": "alice"}
 
 
-def test_dashboard_page_renders_without_exceptions():
+def test_dashboard_page_renders_without_exceptions(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"Email": "a@abc.com", "Approval": "Yes", "IntroSentAt": "2026-08-01 09:00:00"}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet(
             [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
         ),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
 
@@ -140,7 +142,7 @@ def test_dashboard_page_renders_without_exceptions():
     assert "1" in metric_values  # Total Leads == 1 from the fake Master Sheet row above
 
 
-def test_new_campaign_dialog_disabled_until_confirmation_checked():
+def test_new_campaign_dialog_disabled_until_confirmation_checked(fixture_repo):
     """The confirm checkbox is the ONLY remaining safety net now that
     there's no GitHub trip — this must actually gate the button, not just
     be decorative."""
@@ -169,7 +171,7 @@ def test_new_campaign_dialog_disabled_until_confirmation_checked():
         assert create_button.disabled is False
 
 
-def test_new_campaign_dialog_creates_campaign_and_stays_on_hub():
+def test_new_campaign_dialog_creates_campaign_and_stays_on_hub(fixture_repo):
     """Deliberately does NOT auto-navigate into the new campaign — right
     after committing, Streamlit Cloud's local checkout is very likely
     still stale until it redeploys, so jumping straight to the detail
@@ -217,7 +219,7 @@ def test_new_campaign_dialog_creates_campaign_and_stays_on_hub():
     assert "Campaigns" in titles  # still the hub, not a campaign detail page
 
 
-def test_new_campaign_dialog_only_asks_for_name_no_template_fields():
+def test_new_campaign_dialog_only_asks_for_name_no_template_fields(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -240,7 +242,7 @@ def test_new_campaign_dialog_only_asks_for_name_no_template_fields():
     assert len(at.text_area) == 0
 
 
-def test_new_campaign_dialog_does_not_reopen_after_navigating_away_and_back():
+def test_new_campaign_dialog_does_not_reopen_after_navigating_away_and_back(fixture_repo):
     """The actual reported bug: opening the dialog, then visiting a
     different page, then returning to Campaigns without ever clicking
     Create or Cancel, was silently reopening the dialog again — because
@@ -274,7 +276,7 @@ def test_new_campaign_dialog_does_not_reopen_after_navigating_away_and_back():
     assert not any("Campaign name" in ti.label for ti in at.text_input if ti.label)
 
 
-def test_new_campaign_dialog_stays_open_across_its_own_widget_interactions():
+def test_new_campaign_dialog_stays_open_across_its_own_widget_interactions(fixture_repo):
     """The flip side of the above — interacting with a widget INSIDE the
     dialog (not navigating away) must NOT close it. This is what the
     session_state approach was originally introduced to fix; confirming
@@ -302,7 +304,7 @@ def test_new_campaign_dialog_stays_open_across_its_own_widget_interactions():
     assert any("Campaign name" in ti.label for ti in at.text_input if ti.label)
 
 
-def test_new_campaign_dialog_cancel_button_closes_it():
+def test_new_campaign_dialog_cancel_button_closes_it(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -325,7 +327,7 @@ def test_new_campaign_dialog_cancel_button_closes_it():
     assert at.session_state["show_new_campaign_dialog"] is False
 
 
-def test_new_campaign_dialog_rejects_duplicate_name():
+def test_new_campaign_dialog_rejects_duplicate_name(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -343,7 +345,7 @@ def test_new_campaign_dialog_rejects_duplicate_name():
         at.run(timeout=15)
 
         text_inputs = {ti.label: ti for ti in at.text_input}
-        text_inputs["Campaign name (letters, numbers, underscores only)"].set_value("Kelson_Creators_Licensing")
+        text_inputs["Campaign name (letters, numbers, underscores only)"].set_value(FIXTURE_CAMPAIGN)
         at.checkbox[0].set_value(True)
         at.run(timeout=15)
 
@@ -357,14 +359,14 @@ def test_new_campaign_dialog_rejects_duplicate_name():
     assert "already exists" in error_texts
 
 
-def test_overview_page_renders_without_exceptions():
+def test_overview_page_renders_without_exceptions(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"Email": "a@abc.com", "Approval": "Yes", "IntroSentAt": "2026-08-01 09:00:00"},
              {"Email": "b@abc.com", "Approval": "Yes", "IntroSentAt": ""}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet(
             [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
         ),
     }
@@ -385,9 +387,9 @@ def test_overview_page_renders_without_exceptions():
     assert "1" in metric_values  # Total Pending: 1 lead sent, 1 not yet contacted
 
 
-def test_email_accounts_page_renders_without_exceptions():
+def test_email_accounts_page_renders_without_exceptions(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet(
             [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
         ),
     }
@@ -412,7 +414,7 @@ def test_email_accounts_page_renders_without_exceptions():
     assert "sales2" in account_col
 
 
-def test_email_accounts_page_shows_info_when_no_accounts_configured_at_all():
+def test_email_accounts_page_shows_info_when_no_accounts_configured_at_all(fixture_repo_without_accounts):
     """No longer a warning — now that Add Account exists, having zero
     accounts is just a starting state, not something wrong."""
     at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
@@ -427,9 +429,9 @@ def test_email_accounts_page_shows_info_when_no_accounts_configured_at_all():
     assert any(b.label == "➕ Add Account" for b in at.button)
 
 
-def test_email_accounts_page_shows_connection_status_when_health_data_exists():
+def test_email_accounts_page_shows_connection_status_when_health_data_exists(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
         "Email Accounts Health": FakeWorksheet([
             {"AccountName": "sales1", "Address": "sales1@example.com", "Status": "Connected",
              "Detail": "", "CheckedAt": "2026-08-29 12:00:00"},
@@ -459,10 +461,10 @@ def test_email_accounts_page_shows_connection_status_when_health_data_exists():
     assert "AUTHENTICATIONFAILED" in detail_col  # the disconnection reason shown, plainly
 
 
-def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
+def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet(fixture_repo):
     """A brand new deployment, before check_account_health.yml has ever
     run — must show 'Unknown', not an error, and explain why."""
-    fake_ws = {"Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([])}  # no health tab at all
+    fake_ws = {f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([])}  # no health tab at all
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
     secrets = _dashboard_secrets()
     secrets["email_accounts_directory"] = {"sales1": "sales1@example.com"}
@@ -484,9 +486,9 @@ def test_email_accounts_page_shows_unknown_status_when_no_health_tab_yet():
     assert "runs automatically every 2 hours" in caption_texts
 
 
-def test_email_accounts_page_refresh_button_busts_caches_and_refetches():
+def test_email_accounts_page_refresh_button_busts_caches_and_refetches(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
         "Email Accounts Health": FakeWorksheet([
             {"AccountName": "sales1", "Address": "sales1@x.com", "Status": "Connected",
              "Detail": "", "CheckedAt": "2026-08-29 12:00:00"},
@@ -531,7 +533,7 @@ def _mock_secret_writes():
     return captured, fake_set_secret, fake_delete_secret
 
 
-def test_add_account_dialog_disabled_until_confirmed(tmp_path):
+def test_add_account_dialog_disabled_until_confirmed(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
@@ -555,7 +557,7 @@ def test_add_account_dialog_disabled_until_confirmed(tmp_path):
         assert submit_button.disabled is False
 
 
-def test_add_account_happy_path_writes_secret_and_mapping_and_triggers_health_check(tmp_path):
+def test_add_account_happy_path_writes_secret_and_mapping_and_triggers_health_check(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -608,7 +610,7 @@ def test_add_account_happy_path_writes_secret_and_mapping_and_triggers_health_ch
     assert written_mapping == {"sales1": {"slot": 1, "address": "sales1@gmail.com"}}
 
 
-def test_add_account_custom_provider_fields_reach_the_secret(tmp_path):
+def test_add_account_custom_provider_fields_reach_the_secret(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -654,7 +656,7 @@ def test_add_account_custom_provider_fields_reach_the_secret(tmp_path):
     assert payload["imap_port"] == 993
 
 
-def test_bulk_add_accounts_csv_adds_every_valid_row(tmp_path):
+def test_bulk_add_accounts_csv_adds_every_valid_row(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -704,7 +706,7 @@ def test_bulk_add_accounts_csv_adds_every_valid_row(tmp_path):
     assert set(written_mapping.keys()) == {"sales1", "sales2", "sales3"}
 
 
-def test_bulk_add_accounts_csv_reports_invalid_rows_without_blocking_valid_ones(tmp_path):
+def test_bulk_add_accounts_csv_reports_invalid_rows_without_blocking_valid_ones(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -737,7 +739,7 @@ def test_bulk_add_accounts_csv_reports_invalid_rows_without_blocking_valid_ones(
     assert "1 account(s) ready" in success_texts
 
 
-def test_add_account_rejects_blank_fields_without_writing_anything(tmp_path):
+def test_add_account_rejects_blank_fields_without_writing_anything(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
 
@@ -767,7 +769,7 @@ def test_add_account_rejects_blank_fields_without_writing_anything(tmp_path):
     assert "Account name is required" in error_texts
 
 
-def test_add_account_dialog_does_not_reopen_after_navigating_away(tmp_path):
+def test_add_account_dialog_does_not_reopen_after_navigating_away(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "email_accounts.py"))
@@ -794,7 +796,7 @@ def _write_slot_mapping_fixture(tmp_path, mapping_yaml):
     (config_dir / "email_account_slots.yaml").write_text(mapping_yaml)
 
 
-def test_manage_section_shows_only_accounts_tracked_in_slot_mapping(tmp_path):
+def test_manage_section_shows_only_accounts_tracked_in_slot_mapping(tmp_path, fixture_repo):
     _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
 
     with patch("config.EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH", str(tmp_path / "config" / "email_account_slots.yaml")), \
@@ -814,7 +816,7 @@ def test_manage_section_shows_only_accounts_tracked_in_slot_mapping(tmp_path):
     assert "legacy_only" not in manage_selector.options  # not manageable via this app
 
 
-def test_manage_section_edit_address_commits_updated_mapping_no_secret_write(tmp_path):
+def test_manage_section_edit_address_commits_updated_mapping_no_secret_write(tmp_path, fixture_repo):
     _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: old@gmail.com\n")
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -849,7 +851,7 @@ def test_manage_section_edit_address_commits_updated_mapping_no_secret_write(tmp
     assert written_mapping["sales1"]["slot"] == 1  # slot never changes on an edit
 
 
-def test_manage_section_edit_with_new_password_writes_secret(tmp_path):
+def test_manage_section_edit_with_new_password_writes_secret(tmp_path, fixture_repo):
     _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
 
@@ -878,7 +880,7 @@ def test_manage_section_edit_with_new_password_writes_secret(tmp_path):
     assert payload["app_password"] == "newpassword1234"
 
 
-def test_manage_section_remove_requires_confirmation_checkbox(tmp_path):
+def test_manage_section_remove_requires_confirmation_checkbox(tmp_path, fixture_repo):
     _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
 
@@ -896,7 +898,7 @@ def test_manage_section_remove_requires_confirmation_checkbox(tmp_path):
         assert remove_button.disabled is True  # confirm checkbox not checked yet
 
 
-def test_manage_section_remove_deletes_secret_and_updates_mapping(tmp_path):
+def test_manage_section_remove_deletes_secret_and_updates_mapping(tmp_path, fixture_repo):
     _write_slot_mapping_fixture(tmp_path, "sales1:\n  slot: 1\n  address: sales1@gmail.com\n")
     captured, fake_set_secret, fake_delete_secret = _mock_secret_writes()
     commits_captured, fake_create_file = _mock_github_writes()
@@ -932,20 +934,20 @@ def test_manage_section_remove_deletes_secret_and_updates_mapping(tmp_path):
 
 def _campaigns_page_fake_ws():
     return {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"Email": "a@abc.com", "Approval": "Yes", "IntroSentAt": "2026-08-01 09:00:00",
               "IntroVariant": "A", "SenderAccount": "sales1",
               "FollowUp1SentAt": "", "FollowUp1Variant": "", "Status": ""}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet(
             [{"Status": "sent", "SenderAccount": "sales1", "Timestamp": "2026-08-01 09:00:00"}]
         ),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
 
 
-def test_campaigns_hub_page_renders_without_exceptions():
+def test_campaigns_hub_page_renders_without_exceptions(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -961,10 +963,10 @@ def test_campaigns_hub_page_renders_without_exceptions():
     titles = [t.value for t in at.title]
     assert "Campaigns" in titles
     markdown_text = " ".join(m.value for m in at.markdown)
-    assert "Kelson_Creators_Licensing" in markdown_text
+    assert FIXTURE_CAMPAIGN in markdown_text
 
 
-def test_campaigns_hub_refresh_button_clears_caches_without_error():
+def test_campaigns_hub_refresh_button_clears_caches_without_error(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -982,10 +984,10 @@ def test_campaigns_hub_refresh_button_clears_caches_without_error():
     assert list(at.exception) == [], f"Refresh raised: {list(at.exception)}"
     assert list(at.error) == []
     markdown_text = " ".join(m.value for m in at.markdown)
-    assert "Kelson_Creators_Licensing" in markdown_text  # data still shows after the cache clear + rerun
+    assert FIXTURE_CAMPAIGN in markdown_text  # data still shows after the cache clear + rerun
 
 
-def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
+def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status(fixture_repo):
     source_files = {
         "intro_A.txt": b"Subject: Hi\n\nHello {{FirstName}}.",
         "followup1_A.txt": b"Subject: \n\nFollowing up.",
@@ -994,7 +996,7 @@ def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
     commits_captured, fake_create_file = _mock_github_writes()
 
     def fake_list_directory_files(self, path, ref="main"):
-        assert path == "templates/Kelson_Creators_Licensing"
+        assert path == f"templates/{FIXTURE_CAMPAIGN}"
         return list(source_files.keys())
 
     def fake_get_file_content(self, path, ref="main"):
@@ -1018,12 +1020,12 @@ def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
             at.session_state[k] = v
         at.run(timeout=15)
 
-        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button = next(b for b in at.button if b.key == f"duplicate_{FIXTURE_CAMPAIGN}")
         duplicate_button.click()
         at.run(timeout=15)
 
         name_input = next(ti for ti in at.text_input if ti.key == "duplicate_campaign_new_name")
-        name_input.set_value("Kelson_Creators_Licensing_V2")
+        name_input.set_value(f"{FIXTURE_CAMPAIGN}_V2")
         confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "duplicate_campaign_confirm")
         confirm_checkbox.set_value(True)
         at.run(timeout=15)
@@ -1037,17 +1039,17 @@ def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
 
     committed_paths = {c["path"] for c in commits_captured["commits"]}
     assert committed_paths == {
-        "templates/Kelson_Creators_Licensing_V2/intro_A.txt",
-        "templates/Kelson_Creators_Licensing_V2/followup1_A.txt",
-        "config/campaigns/Kelson_Creators_Licensing_V2.yaml",
+        f"templates/{FIXTURE_CAMPAIGN}_V2/intro_A.txt",
+        f"templates/{FIXTURE_CAMPAIGN}_V2/followup1_A.txt",
+        f"config/campaigns/{FIXTURE_CAMPAIGN}_V2.yaml",
     }
     intro_commit = next(c for c in commits_captured["commits"]
-                         if c["path"] == "templates/Kelson_Creators_Licensing_V2/intro_A.txt")
+                         if c["path"] == f"templates/{FIXTURE_CAMPAIGN}_V2/intro_A.txt")
     assert intro_commit["content"] == b"Subject: Hi\n\nHello {{FirstName}}."
 
     import yaml as _yaml
     config_commit = next(c for c in commits_captured["commits"]
-                          if c["path"] == "config/campaigns/Kelson_Creators_Licensing_V2.yaml")
+                          if c["path"] == f"config/campaigns/{FIXTURE_CAMPAIGN}_V2.yaml")
     written_config = _yaml.safe_load(config_commit["content"].decode("utf-8"))
     assert written_config["status"] == "draft"  # never inherits the source's Active status
     assert written_config["sending"] == {"daily_limit": 50}
@@ -1056,7 +1058,7 @@ def test_duplicate_campaign_copies_templates_under_new_name_with_draft_status():
     assert "2 template file(s)" in success_texts  # the concrete count you can sanity-check against
 
 
-def test_duplicate_campaign_refuses_when_source_has_no_templates():
+def test_duplicate_campaign_refuses_when_source_has_no_templates(fixture_repo):
     """The actual production bug this fixes — a source read that comes
     back with zero files must show an error, never a false 'success'
     with an empty duplicate silently created."""
@@ -1074,12 +1076,12 @@ def test_duplicate_campaign_refuses_when_source_has_no_templates():
             at.session_state[k] = v
         at.run(timeout=15)
 
-        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button = next(b for b in at.button if b.key == f"duplicate_{FIXTURE_CAMPAIGN}")
         duplicate_button.click()
         at.run(timeout=15)
 
         name_input = next(ti for ti in at.text_input if ti.key == "duplicate_campaign_new_name")
-        name_input.set_value("Kelson_Creators_Licensing_V2")
+        name_input.set_value(f"{FIXTURE_CAMPAIGN}_V2")
         confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "duplicate_campaign_confirm")
         confirm_checkbox.set_value(True)
         at.run(timeout=15)
@@ -1094,9 +1096,9 @@ def test_duplicate_campaign_refuses_when_source_has_no_templates():
     assert commits_captured.get("commits", []) == []  # nothing committed — no empty duplicate created
 
 
-def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path):
-    (tmp_path / "templates" / "Kelson_Creators_Licensing").mkdir(parents=True)
-    (tmp_path / "templates" / "Kelson_Creators_Licensing" / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
+def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path, fixture_repo):
+    (tmp_path / "templates" / FIXTURE_CAMPAIGN).mkdir(parents=True)
+    (tmp_path / "templates" / FIXTURE_CAMPAIGN / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
     (tmp_path / "templates" / "OtherCampaign").mkdir(parents=True)
     (tmp_path / "templates" / "OtherCampaign" / "intro_A.txt").write_text("Subject: Hi\n\nHello.")
     (tmp_path / "config" / "campaigns").mkdir(parents=True)
@@ -1114,7 +1116,7 @@ def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path):
             at.session_state[k] = v
         at.run(timeout=15)
 
-        duplicate_button = next(b for b in at.button if b.key == "duplicate_Kelson_Creators_Licensing")
+        duplicate_button = next(b for b in at.button if b.key == f"duplicate_{FIXTURE_CAMPAIGN}")
         duplicate_button.click()
         at.run(timeout=15)
 
@@ -1134,7 +1136,7 @@ def test_duplicate_campaign_rejects_a_name_that_already_exists(tmp_path):
     assert commits_captured.get("commits", []) == []  # nothing committed when the name is rejected
 
 
-def test_campaigns_detail_view_renders_analytics_without_exceptions():
+def test_campaigns_detail_view_renders_analytics_without_exceptions(fixture_repo):
     """Directly sets selected_campaign in session_state, bypassing the
     click — proves the detail view + Analytics tab (Phase B, real data,
     not a stub) work end to end against realistic Sheet data."""
@@ -1146,13 +1148,13 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == [], f"Campaign detail raised: {list(at.exception)}"
     assert list(at.error) == [], f"Campaign detail showed an error: {[e.value for e in at.error]}"
     titles = [t.value for t in at.title]
-    assert "Kelson_Creators_Licensing" in titles
+    assert FIXTURE_CAMPAIGN in titles
     # 6 outer tabs (Analytics/Data/Sequences/Schedule/Settings/Responses) —
     # Preview removed (redundant with Sequences' own template preview),
     # Send lives in Settings, Check Replies in Responses, Maintenance in
@@ -1163,7 +1165,7 @@ def test_campaigns_detail_view_renders_analytics_without_exceptions():
     assert "1" in metric_values  # Total Leads == 1
 
 
-def test_campaigns_detail_view_has_no_remaining_stub_tabs():
+def test_campaigns_detail_view_has_no_remaining_stub_tabs(fixture_repo):
     """All six tabs are real now (A through H complete) — this replaces
     the earlier per-phase 'is this tab honestly still a stub' check,
     which no longer applies once nothing is a stub."""
@@ -1175,7 +1177,7 @@ def test_campaigns_detail_view_has_no_remaining_stub_tabs():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -1183,7 +1185,7 @@ def test_campaigns_detail_view_has_no_remaining_stub_tabs():
     assert "isn't built yet" not in info_texts
 
 
-def test_campaigns_back_button_clears_selected_campaign():
+def test_campaigns_back_button_clears_selected_campaign(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -1192,7 +1194,7 @@ def test_campaigns_back_button_clears_selected_campaign():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         back_button = next(b for b in at.button if "Back to Campaigns" in b.label)
@@ -1205,7 +1207,7 @@ def test_campaigns_back_button_clears_selected_campaign():
     assert "Campaigns" in titles
 
 
-def test_campaign_detail_reruns_do_not_re_fetch_sheets_data():
+def test_campaign_detail_reruns_do_not_re_fetch_sheets_data(fixture_repo):
     """The actual regression: Streamlit reruns the WHOLE script on nearly
     every widget interaction. Before this was cached, each rerun on the
     campaign detail page re-issued 4 fresh Sheets reads — easily enough
@@ -1214,7 +1216,7 @@ def test_campaign_detail_reruns_do_not_re_fetch_sheets_data():
     This proves a second rerun reuses the cache instead of re-fetching."""
     fake_ws = _campaigns_page_fake_ws()
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
-    master_ws = fake_ws["Kelson_Creators_Licensing Master Sheet"]
+    master_ws = fake_ws[f"{FIXTURE_CAMPAIGN} Master Sheet"]
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
@@ -1222,7 +1224,7 @@ def test_campaign_detail_reruns_do_not_re_fetch_sheets_data():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         assert list(at.exception) == []
@@ -1243,10 +1245,10 @@ def test_campaign_detail_reruns_do_not_re_fetch_sheets_data():
     )
 
 
-def test_refresh_data_button_actually_busts_the_cache():
+def test_refresh_data_button_actually_busts_the_cache(fixture_repo):
     fake_ws = _campaigns_page_fake_ws()
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
-    master_ws = fake_ws["Kelson_Creators_Licensing Master Sheet"]
+    master_ws = fake_ws[f"{FIXTURE_CAMPAIGN} Master Sheet"]
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
@@ -1254,7 +1256,7 @@ def test_refresh_data_button_actually_busts_the_cache():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
         reads_after_first_run = master_ws.read_call_count
 
@@ -1268,18 +1270,18 @@ def test_refresh_data_button_actually_busts_the_cache():
 
 def _empty_master_fake_ws():
     return {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [], header=["LeadID", "FirstName", "LastName", "Email", "Company", "Campaign", "Approval",
                         "SenderAccount", "RequestedAction", "CurrentStage", "ScheduledAt", "IntroSentAt",
                         "IntroVariant", "Status", "LastActionAt"]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
 
 
-def test_data_tab_upload_shows_mapping_ui_with_correct_defaults():
+def test_data_tab_upload_shows_mapping_ui_with_correct_defaults(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -1288,7 +1290,7 @@ def test_data_tab_upload_shows_mapping_ui_with_correct_defaults():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\nAlex,alex@abc.com\n", "text/csv")
@@ -1303,7 +1305,7 @@ def test_data_tab_upload_shows_mapping_ui_with_correct_defaults():
     assert "2 of 2 row" in markdown_text
 
 
-def test_data_tab_import_commits_payload_and_triggers_workflow():
+def test_data_tab_import_commits_payload_and_triggers_workflow(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
     captured = {}
 
@@ -1324,7 +1326,7 @@ def test_data_tab_import_commits_payload_and_triggers_workflow():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\n", "text/csv")
@@ -1336,14 +1338,14 @@ def test_data_tab_import_commits_payload_and_triggers_workflow():
     assert list(at.exception) == [], f"Import click raised: {list(at.exception)}"
     assert list(at.error) == []
     assert captured["workflow"] == "import_leads.yml"
-    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
-    assert captured["path"].startswith("imports/Kelson_Creators_Licensing/")
+    assert captured["inputs"]["campaign"] == FIXTURE_CAMPAIGN
+    assert captured["path"].startswith(f"imports/{FIXTURE_CAMPAIGN}/")
     import json
     payload = json.loads(captured["content"].decode("utf-8"))
     assert payload == {"leads": [{"FirstName": "Sam", "Email": "sam@abc.com"}], "allow_duplicate_emails": False}
 
 
-def test_data_tab_import_allow_duplicate_emails_checkbox_flows_into_payload():
+def test_data_tab_import_allow_duplicate_emails_checkbox_flows_into_payload(fixture_repo):
     """The actual feature — contacting the same creator again for a
     different video. Checking the box must make it into the committed
     payload exactly as checked, not silently stay False."""
@@ -1364,7 +1366,7 @@ def test_data_tab_import_allow_duplicate_emails_checkbox_flows_into_payload():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"First Name,Email\nSam,sam@abc.com\n", "text/csv")
@@ -1385,7 +1387,7 @@ def test_data_tab_import_allow_duplicate_emails_checkbox_flows_into_payload():
     assert payload["allow_duplicate_emails"] is True
 
 
-def test_data_tab_shows_error_when_no_column_mapped_to_email():
+def test_data_tab_shows_error_when_no_column_mapped_to_email(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_empty_master_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -1394,7 +1396,7 @@ def test_data_tab_shows_error_when_no_column_mapped_to_email():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"First Name,Nickname\nSam,Sammy\n", "text/csv")
@@ -1409,7 +1411,7 @@ def test_data_tab_shows_error_when_no_column_mapped_to_email():
     assert "Email" in error_texts
 
 
-def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks():
+def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks(fixture_repo):
     """The actual UX fix — an unmatched CSV column must default straight
     to a new custom field using its own name, with no need to pick
     "New custom field" and retype the exact same name that's already
@@ -1431,7 +1433,7 @@ def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"Email,Client,Product\nsam@abc.com,DudeRobe,SheRobe\n", "text/csv")
@@ -1456,7 +1458,7 @@ def test_data_tab_unmatched_column_defaults_to_its_own_name_with_zero_clicks():
     assert payload["leads"][0]["Product"] == "SheRobe"
 
 
-def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
+def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload(fixture_repo):
     """The real gap this fixes: a column with no existing match (never
     imported before) previously had no way to become a custom field at
     all — only Skip or an already-existing column name were options."""
@@ -1477,7 +1479,7 @@ def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
@@ -1502,7 +1504,7 @@ def test_data_tab_new_custom_field_actually_makes_it_into_the_import_payload():
     assert payload["leads"][0]["Client"] == "DudeRobe"
 
 
-def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name():
+def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name(fixture_repo):
     """The safety property this exists for — naming a custom field the
     same as one of the system's own tracked columns (e.g. 'Status')
     would silently corrupt real tracking data on the next import."""
@@ -1514,7 +1516,7 @@ def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
@@ -1534,7 +1536,7 @@ def test_data_tab_new_custom_field_rejects_a_reserved_system_column_name():
     assert not any(b.label == "Import Leads" for b in at.button)  # Import stays hidden
 
 
-def test_data_tab_new_custom_field_blank_name_blocks_import():
+def test_data_tab_new_custom_field_blank_name_blocks_import(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -1543,7 +1545,7 @@ def test_data_tab_new_custom_field_blank_name_blocks_import():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload("leads.csv", b"Email,Brand\nsam@abc.com,DudeRobe\n", "text/csv")
@@ -1558,7 +1560,7 @@ def test_data_tab_new_custom_field_blank_name_blocks_import():
     assert "Enter a name" in error_texts
 
 
-def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
+def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning(fixture_repo):
     """The actual reported crash: a CSV with the same column header
     twice caused a StreamlitDuplicateElementKey error, since both
     dropdowns shared a key built purely from the column name. Must
@@ -1573,7 +1575,7 @@ def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         at.file_uploader[0].upload(
@@ -1592,7 +1594,7 @@ def test_data_tab_duplicate_column_name_never_crashes_and_shows_a_warning():
     assert len(matching_selects) == 2
 
 
-def test_draft_campaign_with_real_leads_still_shows_them(tmp_path):
+def test_draft_campaign_with_real_leads_still_shows_them(tmp_path, fixture_repo):
     """The actual root cause of the reported issue: a Draft campaign
     (every duplicate starts as Draft, by design) was treated as "has no
     data, don't even query the Sheet" — correct for a genuinely
@@ -1601,7 +1603,7 @@ def test_draft_campaign_with_real_leads_still_shows_them(tmp_path):
     launched for sending). Draft only means 'not launched'; it must
     never mean 'skip fetching data'."""
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text("status: draft\n")
+    (tmp_path / "config" / f"{FIXTURE_CAMPAIGN}.yaml").write_text("status: draft\n")
     fake_ws = _campaigns_page_fake_ws()
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
 
@@ -1612,7 +1614,7 @@ def test_draft_campaign_with_real_leads_still_shows_them(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -1625,10 +1627,10 @@ def test_draft_campaign_with_real_leads_still_shows_them(tmp_path):
     # is empty (an early return skips straight past it).
     assert "No leads yet" not in info_texts
     markdown_texts = " ".join(m.value for m in at.markdown)
-    assert "Kelson_Creators_Licensing" in markdown_texts  # the page title rendered, past the draft branch
+    assert FIXTURE_CAMPAIGN in markdown_texts  # the page title rendered, past the draft branch
 
 
-def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
+def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache(fixture_repo):
     """The tool built for exactly the reported issue: leads confirmed
     in the real Sheet not showing up in the app after repeated
     refreshing. This lets the actual tab name and a live (uncached)
@@ -1638,7 +1640,7 @@ def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
 
     # Simulate the real scenario: more leads exist live than the cached
     # value the page rendered with.
-    original_get_all_leads = fake_ws["Kelson_Creators_Licensing Master Sheet"].get_all_records
+    original_get_all_leads = fake_ws[f"{FIXTURE_CAMPAIGN} Master Sheet"].get_all_records
     call_count = {"n": 0}
 
     def flaky_get_all_records():
@@ -1648,7 +1650,7 @@ def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
             return records  # the page's own initial (cached) render
         return records + [{"Email": "new@abc.com", "Approval": "Pending"}]  # the live check
 
-    fake_ws["Kelson_Creators_Licensing Master Sheet"].get_all_records = flaky_get_all_records
+    fake_ws[f"{FIXTURE_CAMPAIGN} Master Sheet"].get_all_records = flaky_get_all_records
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()):
@@ -1656,11 +1658,11 @@ def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         markdown_text = " ".join(m.value for m in at.markdown)
-        assert "Kelson_Creators_Licensing Master Sheet" in markdown_text  # the exact tab name, visible
+        assert f"{FIXTURE_CAMPAIGN} Master Sheet" in markdown_text  # the exact tab name, visible
 
         live_check_button = next(b for b in at.button if b.key == "data_tab_live_diagnostic")
         live_check_button.click()
@@ -1671,17 +1673,17 @@ def test_data_tab_diagnostic_shows_tab_name_and_detects_stale_cache():
     assert "differ" in warning_texts.lower()  # correctly detects the mismatch
 
 
-def test_data_tab_lead_table_and_remove_flow():
+def test_data_tab_lead_table_and_remove_flow(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
               "Company": "Acme", "Approval": "Yes", "Status": ""},
              {"LeadID": "2", "FirstName": "Alex", "LastName": "Kim", "Email": "alex@abc.com",
               "Company": "Beta", "Approval": "Yes", "Status": ""}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
     captured = {}
@@ -1703,7 +1705,7 @@ def test_data_tab_lead_table_and_remove_flow():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         assert list(at.exception) == []
@@ -1724,15 +1726,15 @@ def test_data_tab_lead_table_and_remove_flow():
     assert payload == {"lead_ids": ["1"]}
 
 
-def test_data_tab_manage_lead_dispatches_override_workflow_with_correct_inputs():
+def test_data_tab_manage_lead_dispatches_override_workflow_with_correct_inputs(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
               "Company": "Acme", "Approval": "Yes", "Status": ""}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
     captured = {}
@@ -1749,7 +1751,7 @@ def test_data_tab_manage_lead_dispatches_override_workflow_with_correct_inputs()
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         lead_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_select")
@@ -1771,22 +1773,22 @@ def test_data_tab_manage_lead_dispatches_override_workflow_with_correct_inputs()
     assert list(at.error) == []
     assert captured["workflow"] == "set_lead_override.yml"
     assert captured["inputs"] == {
-        "campaign": "Kelson_Creators_Licensing",
+        "campaign": FIXTURE_CAMPAIGN,
         "email": "sam@abc.com",
         "status": "Stop sending to this lead",
         "asana_stage": "Rights Secured",
     }
 
 
-def test_data_tab_manage_lead_no_changes_selected_shows_warning_not_a_dispatch():
+def test_data_tab_manage_lead_no_changes_selected_shows_warning_not_a_dispatch(fixture_repo):
     fake_ws = {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"LeadID": "1", "FirstName": "Sam", "LastName": "Lee", "Email": "sam@abc.com",
               "Company": "Acme", "Approval": "Yes", "Status": ""}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
     dispatched = []
@@ -1802,7 +1804,7 @@ def test_data_tab_manage_lead_no_changes_selected_shows_warning_not_a_dispatch()
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         lead_select = next(sb for sb in at.selectbox if sb.key == "manage_lead_select")
@@ -1831,7 +1833,7 @@ def _mock_github_writes():
     return captured, fake_create_file
 
 
-def test_sequences_tab_template_content_reads_live_not_from_local_disk():
+def test_sequences_tab_template_content_reads_live_not_from_local_disk(fixture_repo):
     """The other half of the reported problem: not just stage/variant
     counts going stale, but the actual template TEXT showing an old
     version. A genuinely fresh page load (a new session — closing and
@@ -1863,7 +1865,7 @@ def test_sequences_tab_template_content_reads_live_not_from_local_disk():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -1871,7 +1873,7 @@ def test_sequences_tab_template_content_reads_live_not_from_local_disk():
     assert subject_input.value == "Freshly fetched from GitHub"
 
 
-def test_sequences_tab_shows_locked_variants_for_real_campaign():
+def test_sequences_tab_shows_locked_variants_for_real_campaign(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -1880,7 +1882,7 @@ def test_sequences_tab_shows_locked_variants_for_real_campaign():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == [], f"Sequences tab raised: {list(at.exception)}"
@@ -1893,7 +1895,7 @@ def test_sequences_tab_shows_locked_variants_for_real_campaign():
     assert all(ti.disabled for ti in subject_inputs)
 
 
-def test_sequences_tab_intro_subject_label_never_says_continues_thread():
+def test_sequences_tab_intro_subject_label_never_says_continues_thread(fixture_repo):
     """Regression: the blank-continues-the-thread hint was showing on
     EVERY stage's Subject field, including Intro — self-contradictory,
     since Intro can never actually use a blank subject (see
@@ -1906,7 +1908,7 @@ def test_sequences_tab_intro_subject_label_never_says_continues_thread():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -1918,7 +1920,7 @@ def test_sequences_tab_intro_subject_label_never_says_continues_thread():
     assert all("continues" in ti.label.lower() for ti in followup_subject_inputs)
 
 
-def test_sequences_tab_save_rejects_blank_subject_for_intro_edit():
+def test_sequences_tab_save_rejects_blank_subject_for_intro_edit(fixture_repo):
     """Editing Intro's subject down to blank must be caught here, before
     Save — not left to fail later, at send time, with a TemplateError."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -1931,7 +1933,7 @@ def test_sequences_tab_save_rejects_blank_subject_for_intro_edit():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         unlock_checkbox = next(cb for cb in at.checkbox if cb.key == "unlock_intro_A")
@@ -1948,7 +1950,7 @@ def test_sequences_tab_save_rejects_blank_subject_for_intro_edit():
     assert captured.get("commits") is None
 
 
-def test_sequences_tab_unlock_and_save_edits_one_variant():
+def test_sequences_tab_unlock_and_save_edits_one_variant(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -1959,7 +1961,7 @@ def test_sequences_tab_unlock_and_save_edits_one_variant():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         unlock_checkbox = next(cb for cb in at.checkbox if cb.key == "unlock_intro_A")
@@ -1978,11 +1980,11 @@ def test_sequences_tab_unlock_and_save_edits_one_variant():
     assert list(at.error) == []
     assert len(captured["commits"]) == 1
     commit = captured["commits"][0]
-    assert commit["path"] == "templates/Kelson_Creators_Licensing/intro_A.txt"
+    assert commit["path"] == f"templates/{FIXTURE_CAMPAIGN}/intro_A.txt"
     assert b"A brand new intro subject" in commit["content"]
 
 
-def test_sequences_tab_locked_variant_edit_is_not_saved():
+def test_sequences_tab_locked_variant_edit_is_not_saved(fixture_repo):
     """Typing into a field while still locked must never reach Save —
     the disabled widget shouldn't even accept the value, but this proves
     the end-to-end behavior regardless of how disabling is implemented."""
@@ -1996,7 +1998,7 @@ def test_sequences_tab_locked_variant_edit_is_not_saved():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2006,7 +2008,7 @@ def test_sequences_tab_locked_variant_edit_is_not_saved():
     assert save_buttons == []
 
 
-def test_sequences_tab_add_variant_maxed_out_for_real_campaign():
+def test_sequences_tab_add_variant_maxed_out_for_real_campaign(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2015,7 +2017,7 @@ def test_sequences_tab_add_variant_maxed_out_for_real_campaign():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2024,7 +2026,7 @@ def test_sequences_tab_add_variant_maxed_out_for_real_campaign():
     assert "already has all 5 stages" in info_texts
 
 
-def test_sequences_tab_successive_add_variant_never_carries_over_prior_content(tmp_path):
+def test_sequences_tab_successive_add_variant_never_carries_over_prior_content(tmp_path, fixture_repo):
     """The actual reported bug: adding Variant B with real content, then
     later opening 'Add Variant C', showed B's content pre-filled instead
     of starting blank — because the widgets were keyed only by stage,
@@ -2077,7 +2079,7 @@ def test_sequences_tab_successive_add_variant_never_carries_over_prior_content(t
     assert list(at.exception) == []
 
 
-def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
+def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path, fixture_repo):
     """Uses a synthetic partial campaign (2 stages, 1 variant) so "Add
     Variant B" is actually available to test, unlike the real fixture
     which is already fully built out."""
@@ -2119,7 +2121,7 @@ def test_sequences_tab_add_variant_validates_across_all_stages(tmp_path):
     assert "Subject is required" in error_texts or "Body is required" in error_texts
 
 
-def test_settings_tab_renders_current_values_from_config():
+def test_settings_tab_renders_current_values_from_config(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2130,7 +2132,7 @@ def test_settings_tab_renders_current_values_from_config():
         at.secrets.update(secrets)
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == [], f"Settings tab raised: {list(at.exception)}"
@@ -2141,7 +2143,7 @@ def test_settings_tab_renders_current_values_from_config():
     assert daily_limit_input.value == 100  # matches config/settings.yaml's real default
 
 
-def test_settings_tab_shows_info_when_no_accounts_directory_configured():
+def test_settings_tab_shows_info_when_no_accounts_directory_configured(fixture_repo_without_accounts):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2150,7 +2152,7 @@ def test_settings_tab_shows_info_when_no_accounts_directory_configured():
         at.secrets.update(_dashboard_secrets())  # no email_accounts_directory
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2158,7 +2160,7 @@ def test_settings_tab_shows_info_when_no_accounts_directory_configured():
     assert "No accounts configured yet" in info_texts
 
 
-def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path():
+def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -2172,7 +2174,7 @@ def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path():
         at.secrets.update(secrets)
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         daily_limit_input = next(ni for ni in at.number_input if "Daily limit" in ni.label)
@@ -2187,13 +2189,13 @@ def test_settings_tab_save_writes_yaml_with_new_values_and_correct_path():
     assert list(at.error) == []
     assert len(captured["commits"]) == 1
     commit = captured["commits"][0]
-    assert commit["path"] == "config/campaigns/Kelson_Creators_Licensing.yaml"
+    assert commit["path"] == f"config/campaigns/{FIXTURE_CAMPAIGN}.yaml"
     import yaml
     written = yaml.safe_load(commit["content"].decode("utf-8"))
     assert written["sending"]["daily_limit"] == 250
 
 
-def test_settings_tab_save_rejects_non_positive_daily_limit_without_committing():
+def test_settings_tab_save_rejects_non_positive_daily_limit_without_committing(fixture_repo):
     """The widget itself enforces min_value=1, so the only way to reach
     validate_settings' rejection path through the UI is the per-account
     limit toggle — tested directly and thoroughly in test_settings_logic.py
@@ -2211,7 +2213,7 @@ def test_settings_tab_save_rejects_non_positive_daily_limit_without_committing()
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         save_button = next(b for b in at.button if b.label == "💾 Save Settings")
@@ -2223,12 +2225,12 @@ def test_settings_tab_save_rejects_non_positive_daily_limit_without_committing()
     assert len(captured.get("commits", [])) == 1
 
 
-def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path):
+def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path, fixture_repo):
     """The real regression this guards: Save must only ever touch the
     'sending' key of the override file. Anything else already there
     (status from Pause/Resume, schedule once that phase exists) must
     survive a Settings save untouched."""
-    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+    (tmp_path / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "status: paused\nschedule:\n  timezone: America/Los_Angeles\nsending:\n  daily_limit: 50\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2242,7 +2244,7 @@ def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path)
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         daily_limit_input = next(ni for ni in at.number_input if "Daily limit" in ni.label)
@@ -2262,7 +2264,7 @@ def test_settings_tab_save_preserves_existing_status_and_schedule_keys(tmp_path)
     assert written["sending"]["daily_limit"] == 300  # actually updated
 
 
-def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_save():
+def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_save(fixture_repo):
     """Regression: clicking 'Select all accounts' visually appeared to
     work but didn't actually change what got saved — the button was
     reassigning a local Python variable, not the multiselect widget's own
@@ -2280,7 +2282,7 @@ def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_
         at.secrets.update(secrets)
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         select_all_button = next(b for b in at.button if b.label == "Select all accounts")
@@ -2300,7 +2302,7 @@ def test_settings_tab_select_all_accounts_actually_selects_and_persists_through_
     assert set(written["sending"]["rotation_accounts"]) == {"sales1", "sales2"}  # actually persisted
 
 
-def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too():
+def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too(fixture_repo):
     """The real bug this fixes: an account added via the Email Accounts
     page's Add Account button lives only in the slot-mapping file, never
     in the [email_accounts_directory] Streamlit secret — the sender
@@ -2324,7 +2326,7 @@ def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too():
             at.secrets.update(secrets)
             for k, v in _authed_session().items():
                 at.session_state[k] = v
-            at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+            at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
             at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2333,7 +2335,7 @@ def test_settings_tab_sender_picker_shows_accounts_from_slot_mapping_too():
     assert set(account_selector.options) == {"sales1", "sales2"}  # both sources present
 
 
-def test_delete_campaign_requires_typed_name_confirmation():
+def test_delete_campaign_requires_typed_name_confirmation(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2342,7 +2344,7 @@ def test_delete_campaign_requires_typed_name_confirmation():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2350,7 +2352,7 @@ def test_delete_campaign_requires_typed_name_confirmation():
     assert delete_button.disabled is True  # nothing typed yet
 
 
-def test_delete_campaign_enables_button_only_on_exact_name_match():
+def test_delete_campaign_enables_button_only_on_exact_name_match(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2359,7 +2361,7 @@ def test_delete_campaign_enables_button_only_on_exact_name_match():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
@@ -2368,14 +2370,14 @@ def test_delete_campaign_enables_button_only_on_exact_name_match():
         assert next(b for b in at.button if b.key == "delete_campaign_button").disabled is True
 
         confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
-        confirm_input.set_value("Kelson_Creators_Licensing")
+        confirm_input.set_value(FIXTURE_CAMPAIGN)
         at.run(timeout=15)
 
     assert list(at.exception) == []
     assert next(b for b in at.button if b.key == "delete_campaign_button").disabled is False
 
 
-def test_delete_campaign_deletes_every_template_file(tmp_path):
+def test_delete_campaign_deletes_every_template_file(tmp_path, fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
@@ -2389,11 +2391,11 @@ def test_delete_campaign_deletes_every_template_file(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         confirm_input = next(ti for ti in at.text_input if ti.key == "delete_campaign_confirm_text")
-        confirm_input.set_value("Kelson_Creators_Licensing")
+        confirm_input.set_value(FIXTURE_CAMPAIGN)
         at.run(timeout=15)
 
         delete_button = next(b for b in at.button if b.key == "delete_campaign_button")
@@ -2402,10 +2404,10 @@ def test_delete_campaign_deletes_every_template_file(tmp_path):
 
     assert list(at.exception) == []
     assert len(deleted_paths) >= 1
-    assert all(p.startswith("templates/Kelson_Creators_Licensing/") for p in deleted_paths)
+    assert all(p.startswith(f"templates/{FIXTURE_CAMPAIGN}/") for p in deleted_paths)
 
 
-def test_asana_sync_settings_save_and_dispatch(tmp_path):
+def test_asana_sync_settings_save_and_dispatch(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     commits_captured, fake_create_file = _mock_github_writes()
@@ -2424,7 +2426,7 @@ def test_asana_sync_settings_save_and_dispatch(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "asana_sync_enabled")
@@ -2445,7 +2447,7 @@ def test_asana_sync_settings_save_and_dispatch(tmp_path):
     assert written["asana"] == {"enabled": True, "project_name": "Creator Outreach"}
 
 
-def test_tracker_sync_settings_save_and_dispatch(tmp_path):
+def test_tracker_sync_settings_save_and_dispatch(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     commits_captured, fake_create_file = _mock_github_writes()
@@ -2464,7 +2466,7 @@ def test_tracker_sync_settings_save_and_dispatch(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         checkbox = next(cb for cb in at.checkbox if cb.key == "tracker_sync_enabled")
@@ -2483,9 +2485,9 @@ def test_tracker_sync_settings_save_and_dispatch(tmp_path):
     assert written["tracker_sync"] == {"enabled": True}
 
 
-def test_tracker_sync_now_button_only_shows_when_enabled(tmp_path):
+def test_tracker_sync_now_button_only_shows_when_enabled(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text(
+    (tmp_path / "config" / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "tracker_sync:\n  enabled: true\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2497,19 +2499,19 @@ def test_tracker_sync_now_button_only_shows_when_enabled(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
     assert any(b.key == "tracker_sync_now" for b in at.button)
 
 
-def test_tracker_sync_enabling_does_not_disturb_asana_settings(tmp_path):
+def test_tracker_sync_enabling_does_not_disturb_asana_settings(tmp_path, fixture_repo):
     """The two toggles must stay independent — saving the Creator
     Tracker checkbox should never accidentally clear or overwrite the
     Asana settings already saved for this campaign."""
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text(
+    (tmp_path / "config" / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "asana:\n  enabled: true\n  project_name: Creator Outreach\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2523,7 +2525,7 @@ def test_tracker_sync_enabling_does_not_disturb_asana_settings(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         checkbox = next(cb for cb in at.checkbox if cb.key == "tracker_sync_enabled")
@@ -2542,9 +2544,9 @@ def test_tracker_sync_enabling_does_not_disturb_asana_settings(tmp_path):
     assert written["asana"] == {"enabled": True, "project_name": "Creator Outreach"}  # untouched
 
 
-def test_asana_sync_now_button_only_shows_when_enabled(tmp_path):
+def test_asana_sync_now_button_only_shows_when_enabled(tmp_path, fixture_repo):
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "Kelson_Creators_Licensing.yaml").write_text(
+    (tmp_path / "config" / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "asana:\n  enabled: true\n  project_name: Creator Outreach\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2556,7 +2558,7 @@ def test_asana_sync_now_button_only_shows_when_enabled(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2579,7 +2581,7 @@ def test_asana_sync_now_button_only_shows_when_enabled(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         temp_remove_button = next(b for b in at.button if b.key == "temp_remove_campaign_button")
@@ -2598,11 +2600,11 @@ def test_asana_sync_now_button_only_shows_when_enabled(tmp_path):
     assert at.session_state["selected_campaign"] is None  # navigates back to the hub
 
 
-def test_restore_campaign_brings_back_exact_previous_status_not_draft(tmp_path):
+def test_restore_campaign_brings_back_exact_previous_status_not_draft(tmp_path, fixture_repo):
     """The actual bug being fixed: a campaign that was Paused (not just
     Draft) before Temporarily Remove must come back Paused when
     restored, not silently reset to Draft."""
-    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+    (tmp_path / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "status: deleted\nprevious_status: paused\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2619,7 +2621,7 @@ def test_restore_campaign_brings_back_exact_previous_status_not_draft(tmp_path):
         at.session_state["selected_campaign"] = None
         at.run(timeout=15)
 
-        restore_button = next(b for b in at.button if b.key == "restore_Kelson_Creators_Licensing")
+        restore_button = next(b for b in at.button if b.key == f"restore_{FIXTURE_CAMPAIGN}")
         restore_button.click()
         at.run(timeout=15)
 
@@ -2633,7 +2635,7 @@ def test_restore_campaign_brings_back_exact_previous_status_not_draft(tmp_path):
     assert "previous_status" not in written
 
 
-def test_delete_variant_allowed_when_multiple_variants_exist():
+def test_delete_variant_allowed_when_multiple_variants_exist(fixture_repo):
     """This fixture campaign has all 4 variants (A–D) on disk — deleting
     any one of them must be allowed, since more than one remains after."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2644,14 +2646,14 @@ def test_delete_variant_allowed_when_multiple_variants_exist():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
     assert any(b.key == "delete_variant_button" for b in at.button)
 
 
-def test_delete_variant_actually_deletes_every_stage_file(tmp_path):
+def test_delete_variant_actually_deletes_every_stage_file(tmp_path, fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
@@ -2669,7 +2671,7 @@ def test_delete_variant_actually_deletes_every_stage_file(tmp_path):
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         # Default selectbox value is the first variant, "A".
@@ -2688,7 +2690,7 @@ def test_delete_variant_actually_deletes_every_stage_file(tmp_path):
     assert all(p.endswith("_A.txt") for p in deleted_paths)
 
 
-def test_delete_stage_only_offered_for_the_last_stage():
+def test_delete_stage_only_offered_for_the_last_stage(fixture_repo):
     """This fixture campaign has 5 stages on disk (intro..followup4) —
     only followup4 should be deletable; the button must not exist for
     any earlier stage, since deleting a middle stage would orphan
@@ -2701,7 +2703,7 @@ def test_delete_stage_only_offered_for_the_last_stage():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2711,7 +2713,7 @@ def test_delete_stage_only_offered_for_the_last_stage():
     assert "followup4" in markdown_text  # offered stage is genuinely the last one
 
 
-def test_delete_stage_blocks_when_live_structure_is_already_inconsistent():
+def test_delete_stage_blocks_when_live_structure_is_already_inconsistent(fixture_repo):
     """The actual scenario reported in production: the campaign's real,
     live structure is already broken (a stage missing some variants —
     exactly the FollowUp3-missing-A/B incident) by the time anyone
@@ -2741,7 +2743,7 @@ def test_delete_stage_blocks_when_live_structure_is_already_inconsistent():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2750,7 +2752,7 @@ def test_delete_stage_blocks_when_live_structure_is_already_inconsistent():
     assert deleted_paths == []
 
 
-def test_sequences_tab_delete_stage_reflects_live_structure_immediately_after_a_change():
+def test_sequences_tab_delete_stage_reflects_live_structure_immediately_after_a_change(fixture_repo):
     """The actual complaint this fixes: after deleting FollowUp4, the
     Sequences tab must show FollowUp3 as the new last stage on the very
     next render — not keep showing FollowUp4 because of a stale local
@@ -2775,7 +2777,7 @@ def test_sequences_tab_delete_stage_reflects_live_structure_immediately_after_a_
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
         first_render_warnings = " ".join(w.value for w in at.warning).lower()
         assert "followup4" in first_render_warnings
@@ -2791,7 +2793,7 @@ def test_sequences_tab_delete_stage_reflects_live_structure_immediately_after_a_
     assert "followup3" in warning_texts.lower()
 
 
-def test_delete_stage_actually_deletes_all_variant_files_for_it():
+def test_delete_stage_actually_deletes_all_variant_files_for_it(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     deleted_paths = []
 
@@ -2809,7 +2811,7 @@ def test_delete_stage_actually_deletes_all_variant_files_for_it():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         confirm_checkbox = next(cb for cb in at.checkbox if cb.key == "confirm_delete_stage")
@@ -2826,7 +2828,7 @@ def test_delete_stage_actually_deletes_all_variant_files_for_it():
     assert all("followup4_" in p for p in deleted_paths)
 
 
-def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
+def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2835,7 +2837,7 @@ def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == [], f"Schedule tab raised: {list(at.exception)}"
@@ -2849,8 +2851,8 @@ def test_schedule_tab_renders_sensible_defaults_for_unconfigured_campaign():
     assert day_checkboxes["Sat"] is False
 
 
-def test_schedule_tab_save_writes_correct_yaml_and_preserves_other_keys(tmp_path):
-    (tmp_path / "Kelson_Creators_Licensing.yaml").write_text(
+def test_schedule_tab_save_writes_correct_yaml_and_preserves_other_keys(tmp_path, fixture_repo):
+    (tmp_path / f"{FIXTURE_CAMPAIGN}.yaml").write_text(
         "status: active\nsending:\n  daily_limit: 100\n"
     )
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -2864,7 +2866,7 @@ def test_schedule_tab_save_writes_correct_yaml_and_preserves_other_keys(tmp_path
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         tz_selector = next(sb for sb in at.selectbox if sb.label == "Time zone")
@@ -2889,7 +2891,7 @@ def test_schedule_tab_save_writes_correct_yaml_and_preserves_other_keys(tmp_path
     assert written["sending"]["daily_limit"] == 100  # preserved
 
 
-def test_schedule_tab_save_rejects_when_no_days_selected():
+def test_schedule_tab_save_rejects_when_no_days_selected(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -2900,7 +2902,7 @@ def test_schedule_tab_save_rejects_when_no_days_selected():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         # Uncheck every default-selected weekday.
@@ -2932,7 +2934,7 @@ def _fake_get_campaign_with_status(status: str):
     return fake_get_campaign
 
 
-def test_status_controls_running_campaign_shows_pause_button():
+def test_status_controls_running_campaign_shows_pause_button(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2941,7 +2943,7 @@ def test_status_controls_running_campaign_shows_pause_button():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -2952,7 +2954,7 @@ def test_status_controls_running_campaign_shows_pause_button():
     assert not any(b.label in ("🚀 Launch", "▶ Resume") for b in at.button)
 
 
-def test_status_controls_pause_button_commits_paused_status():
+def test_status_controls_pause_button_commits_paused_status(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -2963,7 +2965,7 @@ def test_status_controls_pause_button_commits_paused_status():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         pause_button = next(b for b in at.button if b.label == "⏸ Pause")
@@ -2977,7 +2979,7 @@ def test_status_controls_pause_button_commits_paused_status():
     assert written == {"status": "paused"}
 
 
-def test_status_controls_paused_campaign_shows_resume_button():
+def test_status_controls_paused_campaign_shows_resume_button(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -2996,7 +2998,7 @@ def test_status_controls_paused_campaign_shows_resume_button():
     assert any(b.label == "▶ Resume" for b in at.button)
 
 
-def test_status_controls_resume_button_commits_active_status():
+def test_status_controls_resume_button_commits_active_status(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
     captured, fake_create_file = _mock_github_writes()
 
@@ -3021,7 +3023,7 @@ def test_status_controls_resume_button_commits_active_status():
     assert written == {"status": "active"}
 
 
-def test_status_controls_draft_shows_launch_then_confirmation():
+def test_status_controls_draft_shows_launch_then_confirmation(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3046,7 +3048,7 @@ def test_status_controls_draft_shows_launch_then_confirmation():
     assert any(b.label == "Cancel" for b in at.button)
 
 
-def test_status_controls_confirm_launch_commits_active_status():
+def test_status_controls_confirm_launch_commits_active_status(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
     captured, fake_create_file = _mock_github_writes()
 
@@ -3075,7 +3077,7 @@ def test_status_controls_confirm_launch_commits_active_status():
     assert written == {"status": "active"}
 
 
-def test_status_controls_cancel_launch_does_not_commit():
+def test_status_controls_cancel_launch_does_not_commit(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
     captured, fake_create_file = _mock_github_writes()
 
@@ -3103,7 +3105,7 @@ def test_status_controls_cancel_launch_does_not_commit():
     assert not any(b.label == "Confirm Launch" for b in at.button)
 
 
-def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_away():
+def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_away(fixture_repo):
     """Same class of bug as the New Campaign dialog — a confirmation box
     driven by session_state must reset on genuine navigation, or it
     silently reappears on an unrelated later visit."""
@@ -3131,7 +3133,7 @@ def test_status_controls_launch_confirmation_does_not_reopen_after_navigating_aw
     assert not any(b.label == "Confirm Launch" for b in at.button)
 
 
-def test_send_tab_send_batch_requires_typed_send_confirmation():
+def test_send_tab_send_batch_requires_typed_send_confirmation(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured = {}
 
@@ -3147,7 +3149,7 @@ def test_send_tab_send_batch_requires_typed_send_confirmation():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         # Click Send Batch WITHOUT typing SEND first.
@@ -3161,7 +3163,7 @@ def test_send_tab_send_batch_requires_typed_send_confirmation():
     assert 'You must type "SEND"' in error_texts
 
 
-def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed():
+def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured = {}
 
@@ -3177,7 +3179,7 @@ def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         confirm_input = next(ti for ti in at.text_input if ti.key == "campaigns_send_confirm_text")
@@ -3191,11 +3193,11 @@ def test_send_tab_send_batch_dispatches_with_correct_inputs_when_confirmed():
     assert list(at.exception) == [], f"Send raised: {list(at.exception)}"
     assert list(at.error) == []
     assert captured["workflow"] == "send_batch.yml"
-    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    assert captured["inputs"]["campaign"] == FIXTURE_CAMPAIGN
     assert at.session_state["last_send_run_id"] == 42
 
 
-def test_send_section_hidden_when_campaign_is_draft():
+def test_send_section_hidden_when_campaign_is_draft(fixture_repo):
     """The real safety fix this locks in: Send must not even be offered
     for a Draft campaign — matching outreach.send_batch's own backend
     guard, which blocks Draft the same way it blocks Paused."""
@@ -3225,7 +3227,7 @@ def test_send_section_hidden_when_campaign_is_draft():
     assert "workflow" not in captured  # nothing was ever triggered
 
 
-def test_send_section_hidden_when_campaign_is_paused():
+def test_send_section_hidden_when_campaign_is_paused(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet({})
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3244,7 +3246,7 @@ def test_send_section_hidden_when_campaign_is_paused():
     assert "Resume it above" in info_texts
 
 
-def test_send_section_visible_when_campaign_is_running():
+def test_send_section_visible_when_campaign_is_running(fixture_repo):
     """The positive case — confirms the gate isn't accidentally hiding
     Send for the one status it should actually be available for."""
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
@@ -3255,14 +3257,14 @@ def test_send_section_visible_when_campaign_is_running():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
     assert any(b.key == "campaigns_send_batch_button" for b in at.button)
 
 
-def test_send_section_no_longer_shows_duplicate_limit_overrides():
+def test_send_section_no_longer_shows_duplicate_limit_overrides(fixture_repo):
     """The specific cleanup requested: daily_limit / per_account_daily_limit
     / sender_rotation overrides and the manual batch size input are gone
     from Send — those are already set once, above, in the same tab."""
@@ -3274,7 +3276,7 @@ def test_send_section_no_longer_shows_duplicate_limit_overrides():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -3286,7 +3288,7 @@ def test_send_section_no_longer_shows_duplicate_limit_overrides():
     assert any(b.key == "campaigns_send_ignore_wait_days" for b in at.checkbox)
 
 
-def test_send_tab_check_replies_dispatches_correct_workflow():
+def test_send_tab_check_replies_dispatches_correct_workflow(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured = {}
 
@@ -3302,7 +3304,7 @@ def test_send_tab_check_replies_dispatches_correct_workflow():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         check_button = next(b for b in at.button if b.key == "campaigns_check_replies_button")
@@ -3312,10 +3314,10 @@ def test_send_tab_check_replies_dispatches_correct_workflow():
     assert list(at.exception) == []
     assert list(at.error) == []
     assert captured["workflow"] == "check_replies.yml"
-    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    assert captured["inputs"]["campaign"] == FIXTURE_CAMPAIGN
 
 
-def test_send_tab_backfill_dispatches_correct_workflow_with_dry_run_default():
+def test_send_tab_backfill_dispatches_correct_workflow_with_dry_run_default(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_campaigns_page_fake_ws())
     captured = {}
 
@@ -3331,7 +3333,7 @@ def test_send_tab_backfill_dispatches_correct_workflow_with_dry_run_default():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         backfill_button = next(b for b in at.button if b.key == "campaigns_run_backfill")
@@ -3346,22 +3348,22 @@ def test_send_tab_backfill_dispatches_correct_workflow_with_dry_run_default():
 
 def _responses_tab_fake_ws():
     return {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet(
             [{"LeadID": "5", "Email": "lead@abc.com", "Approval": "Yes", "SenderAccount": "sales1",
               "ThreadReferences": "<our1@mail.gmail.com>", "Status": "Stopped - Replied"}]
         ),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet(
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet(
             [{"ResponseID": "r1", "LeadID": "5", "From": "lead@abc.com", "Subject": "Re: Hi there",
               "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
               "MessageID": "<inbound1@mail.gmail.com>", "ReceivedAt": "2026-08-28 18:07:00",
               "ActionTaken": "Stopped Sequence"}]
         ),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
 
 
-def test_responses_tab_shows_response_with_prefilled_reply_form():
+def test_responses_tab_shows_response_with_prefilled_reply_form(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3370,7 +3372,7 @@ def test_responses_tab_shows_response_with_prefilled_reply_form():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == [], f"Responses tab raised: {list(at.exception)}"
@@ -3382,7 +3384,7 @@ def test_responses_tab_shows_response_with_prefilled_reply_form():
     assert "lead@abc.com" in markdown_text
 
 
-def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow():
+def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -3399,7 +3401,7 @@ def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow(
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
@@ -3413,9 +3415,9 @@ def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow(
     assert list(at.exception) == [], f"Send reply raised: {list(at.exception)}"
     assert list(at.error) == []
     assert captured["workflow"] == "send_reply.yml"
-    assert captured["inputs"]["campaign"] == "Kelson_Creators_Licensing"
+    assert captured["inputs"]["campaign"] == FIXTURE_CAMPAIGN
     commit = captured["commits"][0]
-    assert commit["path"].startswith("replies/Kelson_Creators_Licensing/")
+    assert commit["path"].startswith(f"replies/{FIXTURE_CAMPAIGN}/")
 
     import json
     payload = json.loads(commit["content"].decode("utf-8"))
@@ -3426,7 +3428,7 @@ def test_responses_tab_send_reply_commits_correct_payload_and_triggers_workflow(
     assert payload["body"] == "Thanks for your interest! Here is more info."
 
 
-def test_responses_tab_send_reply_rejects_blank_body_without_committing():
+def test_responses_tab_send_reply_rejects_blank_body_without_committing(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -3437,7 +3439,7 @@ def test_responses_tab_send_reply_rejects_blank_body_without_committing():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         # Leave body blank entirely — click Send Reply as-is.
@@ -3451,7 +3453,7 @@ def test_responses_tab_send_reply_rejects_blank_body_without_committing():
     assert "Body is required" in error_texts
 
 
-def test_responses_tab_send_reply_with_cc_and_bcc():
+def test_responses_tab_send_reply_with_cc_and_bcc(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -3466,7 +3468,7 @@ def test_responses_tab_send_reply_with_cc_and_bcc():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         cc_input = next(ti for ti in at.text_input if ti.key and "reply_cc" in ti.key)
@@ -3489,9 +3491,9 @@ def test_responses_tab_send_reply_with_cc_and_bcc():
     assert payload["bcc"] == ["audit@abc.com"]
 
 
-def test_responses_tab_shows_info_when_no_responses_yet():
+def test_responses_tab_shows_info_when_no_responses_yet(fixture_repo):
     fake_ws = _responses_tab_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([])
+    fake_ws[f"{FIXTURE_CAMPAIGN} Response Sheet"] = FakeWorksheet([])
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3500,7 +3502,7 @@ def test_responses_tab_shows_info_when_no_responses_yet():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -3508,13 +3510,13 @@ def test_responses_tab_shows_info_when_no_responses_yet():
     assert "No responses yet" in info_texts
 
 
-def test_responses_tab_check_replies_button_shows_even_with_zero_responses():
+def test_responses_tab_check_replies_button_shows_even_with_zero_responses(fixture_repo):
     """The real fix worth locking in: Check Replies moved into the
     Responses tab, but the tab used to `return` early when there were no
     responses yet — exactly the moment you'd most want to trigger a
     check. The trigger must render BEFORE that early return."""
     fake_ws = _responses_tab_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([])
+    fake_ws[f"{FIXTURE_CAMPAIGN} Response Sheet"] = FakeWorksheet([])
     fake_spreadsheet = FakeSpreadsheet(fake_ws)
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3523,7 +3525,7 @@ def test_responses_tab_check_replies_button_shows_even_with_zero_responses():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -3532,15 +3534,15 @@ def test_responses_tab_check_replies_button_shows_even_with_zero_responses():
     assert "No responses yet" in info_texts  # both present together
 
 
-def test_responses_tab_labels_stopped_vs_logged_only_correctly():
+def test_responses_tab_labels_stopped_vs_logged_only_correctly(fixture_repo):
     """A predates-contact / unverified-match reply must be clearly
     labeled as NOT having stopped the sequence — this is the exact
     confusion this labeling exists to resolve (Classification alone reads
     ambiguously). Ported from the removed Controls page, since Responses
     is now the only place replies are shown."""
     fake_ws = _responses_tab_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
-        {"ResponseID": "<m2>", "LeadID": "5", "Campaign": "Kelson_Creators_Licensing",
+    fake_ws[f"{FIXTURE_CAMPAIGN} Response Sheet"] = FakeWorksheet([
+        {"ResponseID": "<m2>", "LeadID": "5", "Campaign": FIXTURE_CAMPAIGN,
          "ReceivedAt": "2026-08-20 10:00:00", "From": "Old <old@abc.com>", "Subject": "Re: Old thread",
          "Snippet": "Okay", "Classification": "Genuine Reply", "MatchMethod": "Email",
          "MessageID": "<m2>", "InReplyTo": "<unrelated>", "ActionTaken": "Logged Only (Predates Contact)"},
@@ -3553,7 +3555,7 @@ def test_responses_tab_labels_stopped_vs_logged_only_correctly():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
     assert list(at.exception) == []
@@ -3562,7 +3564,7 @@ def test_responses_tab_labels_stopped_vs_logged_only_correctly():
     assert "NOT stopped" in caption_texts
 
 
-def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
+def test_responses_tab_send_reply_with_attachment_round_trips_correctly(fixture_repo):
     """The real end-to-end proof: an uploaded file's bytes survive
     base64-encoding into the committed payload and decode back to the
     exact original content."""
@@ -3580,7 +3582,7 @@ def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         reply_uploader = next(fu for fu in at.file_uploader if fu.key and "reply_attachments" in fu.key)
@@ -3604,7 +3606,7 @@ def test_responses_tab_send_reply_with_attachment_round_trips_correctly():
     assert base64.b64decode(payload["attachments"][0]["content_base64"]) == b"fake-png-bytes"
 
 
-def test_responses_tab_send_reply_without_attachment_omits_attachments_key():
+def test_responses_tab_send_reply_without_attachment_omits_attachments_key(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_tab_fake_ws())
     captured, fake_create_file = _mock_github_writes()
 
@@ -3619,7 +3621,7 @@ def test_responses_tab_send_reply_without_attachment_omits_attachments_key():
         at.secrets.update(_dashboard_secrets())
         for k, v in _authed_session().items():
             at.session_state[k] = v
-        at.session_state["selected_campaign"] = "Kelson_Creators_Licensing"
+        at.session_state["selected_campaign"] = FIXTURE_CAMPAIGN
         at.run(timeout=15)
 
         body_input = next(ta for ta in at.text_area if ta.key and "reply_body" in ta.key)
@@ -3636,7 +3638,7 @@ def test_responses_tab_send_reply_without_attachment_omits_attachments_key():
     assert "attachments" not in payload
 
 
-def test_login_lockout_after_repeated_failures():
+def test_login_lockout_after_repeated_failures(fixture_repo):
     from auth import hash_password
 
     salt = "testsalt"
@@ -3662,7 +3664,7 @@ def test_login_lockout_after_repeated_failures():
     assert "Try again in" in at.error[0].value
 
 
-def test_pages_require_login_when_not_authenticated():
+def test_pages_require_login_when_not_authenticated(fixture_repo):
     """Every page must call login_gate() and stop — verified here by NOT
     setting auth_user and confirming the page doesn't render its main
     content (Dashboard title never appears)."""
@@ -3677,11 +3679,11 @@ def test_pages_require_login_when_not_authenticated():
 
 def _responses_hub_fake_ws():
     return {
-        "Kelson_Creators_Licensing Master Sheet": FakeWorksheet([
+        f"{FIXTURE_CAMPAIGN} Master Sheet": FakeWorksheet([
             {"LeadID": "1", "Email": "lead1@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
             {"LeadID": "2", "Email": "old@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
         ]),
-        "Kelson_Creators_Licensing Response Sheet": FakeWorksheet([
+        f"{FIXTURE_CAMPAIGN} Response Sheet": FakeWorksheet([
             {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
              "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
              "MessageID": "<m1@mail.gmail.com>", "ReceivedAt": "2026-08-29 10:00:00",
@@ -3691,12 +3693,12 @@ def _responses_hub_fake_ws():
              "MessageID": "<m2@mail.gmail.com>", "ReceivedAt": "2026-08-28 10:00:00",
              "ActionTaken": "Logged Only"},
         ]),
-        "Kelson_Creators_Licensing Custom Log Sheet": FakeWorksheet([]),
-        "Kelson_Creators_Licensing Error Log": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Custom Log Sheet": FakeWorksheet([]),
+        f"{FIXTURE_CAMPAIGN} Error Log": FakeWorksheet([]),
     }
 
 
-def test_responses_hub_page_renders_without_exceptions():
+def test_responses_hub_page_renders_without_exceptions(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3716,7 +3718,7 @@ def test_responses_hub_page_renders_without_exceptions():
     assert "old@abc.com" in markdown_text
 
 
-def test_responses_hub_merely_loading_the_page_never_marks_anything_read():
+def test_responses_hub_merely_loading_the_page_never_marks_anything_read(fixture_repo):
     """The actual bug found and fixed: st.expander's body runs on every
     script rerun regardless of whether it's open or closed — a naive
     "mark read inside the expander" would mark EVERY response read the
@@ -3741,7 +3743,7 @@ def test_responses_hub_merely_loading_the_page_never_marks_anything_read():
     assert markdown_text.count("🔵") == 2
 
 
-def test_responses_hub_status_filter_narrows_to_selected_classification():
+def test_responses_hub_status_filter_narrows_to_selected_classification(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3762,9 +3764,9 @@ def test_responses_hub_status_filter_narrows_to_selected_classification():
     assert "lead1@abc.com" not in markdown_text
 
 
-def test_responses_hub_shows_intent_badge_when_classified():
+def test_responses_hub_shows_intent_badge_when_classified(fixture_repo):
     fake_ws = _responses_hub_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
+    fake_ws[f"{FIXTURE_CAMPAIGN} Response Sheet"] = FakeWorksheet([
         {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
          "Snippet": "Interested, tell me more", "Classification": "Genuine Reply",
          "MessageID": "<m1@mail.gmail.com>", "ReceivedAt": "2026-08-29 10:00:00",
@@ -3786,9 +3788,9 @@ def test_responses_hub_shows_intent_badge_when_classified():
     assert "High confidence" in caption_texts
 
 
-def test_responses_hub_status_filter_narrows_by_intent():
+def test_responses_hub_status_filter_narrows_by_intent(fixture_repo):
     fake_ws = _responses_hub_fake_ws()
-    fake_ws["Kelson_Creators_Licensing Response Sheet"] = FakeWorksheet([
+    fake_ws[f"{FIXTURE_CAMPAIGN} Response Sheet"] = FakeWorksheet([
         {"ResponseID": "r1", "LeadID": "1", "From": "lead1@abc.com", "Subject": "Re: Hi",
          "Snippet": "Interested", "Classification": "Genuine Reply", "MessageID": "<m1@mail.gmail.com>",
          "ReceivedAt": "2026-08-29 10:00:00", "ActionTaken": "Stopped Sequence",
@@ -3818,7 +3820,7 @@ def test_responses_hub_status_filter_narrows_by_intent():
     assert "old@abc.com" not in markdown_text
 
 
-def test_responses_hub_search_narrows_by_query():
+def test_responses_hub_search_narrows_by_query(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3839,10 +3841,10 @@ def test_responses_hub_search_narrows_by_query():
     assert "old@abc.com" not in markdown_text  # snippet is "Out of office"
 
 
-def test_responses_hub_conversation_view_shows_full_thread():
+def test_responses_hub_conversation_view_shows_full_thread(fixture_repo):
     fake_ws = _responses_hub_fake_ws()
     # Give lead1 an outgoing Intro too, so the thread has both directions.
-    fake_ws["Kelson_Creators_Licensing Master Sheet"] = FakeWorksheet([
+    fake_ws[f"{FIXTURE_CAMPAIGN} Master Sheet"] = FakeWorksheet([
         {"LeadID": "1", "Email": "lead1@abc.com", "FirstName": "Sam", "Approval": "Yes",
          "SenderAccount": "sales1", "IntroSentAt": "2026-08-20 09:00:00", "IntroVariant": "A"},
         {"LeadID": "2", "Email": "old@abc.com", "Approval": "Yes", "SenderAccount": "sales1"},
@@ -3869,7 +3871,7 @@ def test_responses_hub_conversation_view_shows_full_thread():
     assert "Sam" in body_text  # template variable actually rendered for this lead
 
 
-def test_responses_hub_campaign_filter_narrows_to_selected_campaign():
+def test_responses_hub_campaign_filter_narrows_to_selected_campaign(fixture_repo):
     fake_ws = _responses_hub_fake_ws()
     fake_ws["OtherCampaign Response Sheet"] = FakeWorksheet([
         {"ResponseID": "r3", "LeadID": "9", "From": "third@abc.com", "Subject": "Re: Hey",
@@ -3892,7 +3894,7 @@ def test_responses_hub_campaign_filter_narrows_to_selected_campaign():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
-         patch("preview_logic.list_campaigns", return_value=["Kelson_Creators_Licensing", "OtherCampaign"]), \
+         patch("preview_logic.list_campaigns", return_value=[FIXTURE_CAMPAIGN, "OtherCampaign"]), \
          patch("preview_logic.get_campaign_cfg", fake_get_campaign_cfg):
         at = AppTest.from_file(os.path.join(PAGES_DIR, "responses.py"))
         at.secrets.update(_dashboard_secrets())
@@ -3911,7 +3913,7 @@ def test_responses_hub_campaign_filter_narrows_to_selected_campaign():
     assert "old@abc.com" not in markdown_text
 
 
-def test_responses_hub_unread_filter_hides_opened_response():
+def test_responses_hub_unread_filter_hides_opened_response(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
@@ -3939,7 +3941,7 @@ def test_responses_hub_unread_filter_hides_opened_response():
     assert list(at.exception) == []
 
 
-def test_responses_hub_sync_read_status_marks_pending_and_dispatches_workflow():
+def test_responses_hub_sync_read_status_marks_pending_and_dispatches_workflow(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
     commits_captured, fake_create_file = _mock_github_writes()
     dispatched = []
@@ -3964,7 +3966,7 @@ def test_responses_hub_sync_read_status_marks_pending_and_dispatches_workflow():
         mark_read_button.click()
         at.run(timeout=15)
 
-        assert at.session_state["pending_sync_keys"] == {"Kelson_Creators_Licensing:r1"}
+        assert at.session_state["pending_sync_keys"] == {f"{FIXTURE_CAMPAIGN}:r1"}
 
         sync_button = next(b for b in at.button if "Sync read status" in b.label)
         sync_button.click()
@@ -3972,14 +3974,14 @@ def test_responses_hub_sync_read_status_marks_pending_and_dispatches_workflow():
 
     assert list(at.exception) == [], f"Sync raised: {list(at.exception)}"
     assert list(at.error) == []
-    assert dispatched == [("mark_responses_read.yml", "Kelson_Creators_Licensing")]
+    assert dispatched == [("mark_responses_read.yml", FIXTURE_CAMPAIGN)]
     import json as _json
     payload = _json.loads(commits_captured["commits"][0]["content"].decode("utf-8"))
     assert payload == {"response_ids": ["r1"]}
     assert at.session_state["pending_sync_keys"] == set()  # cleared after a successful sync
 
 
-def test_responses_hub_check_replies_button_triggers_every_campaign():
+def test_responses_hub_check_replies_button_triggers_every_campaign(fixture_repo):
     fake_spreadsheet = FakeSpreadsheet(_responses_hub_fake_ws())
     dispatched = []
 
@@ -4002,10 +4004,10 @@ def test_responses_hub_check_replies_button_triggers_every_campaign():
 
     assert list(at.exception) == []
     assert list(at.error) == []
-    assert dispatched == [("check_replies.yml", "Kelson_Creators_Licensing")]
+    assert dispatched == [("check_replies.yml", FIXTURE_CAMPAIGN)]
 
 
-def test_responses_hub_reply_uses_correct_campaign_for_that_response():
+def test_responses_hub_reply_uses_correct_campaign_for_that_response(fixture_repo):
     fake_ws = _responses_hub_fake_ws()
     fake_ws["OtherCampaign Response Sheet"] = FakeWorksheet([
         {"ResponseID": "r3", "LeadID": "9", "From": "third@abc.com", "Subject": "Re: Hey",
@@ -4027,7 +4029,7 @@ def test_responses_hub_reply_uses_correct_campaign_for_that_response():
 
     with patch("gspread.authorize", return_value=type("C", (), {"open_by_key": lambda self, k: fake_spreadsheet})()), \
          patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()), \
-         patch("preview_logic.list_campaigns", return_value=["Kelson_Creators_Licensing", "OtherCampaign"]), \
+         patch("preview_logic.list_campaigns", return_value=[FIXTURE_CAMPAIGN, "OtherCampaign"]), \
          patch("preview_logic.get_campaign_cfg", lambda name: {
              "_campaign_name": name, "master_tab": f"{name} Master Sheet",
              "responses_tab": f"{name} Response Sheet", "send_log_tab": f"{name} Custom Log Sheet",
