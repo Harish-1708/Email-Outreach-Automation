@@ -187,6 +187,22 @@ before changing any repo's visibility.
 
 ## Known limitations (by design, not bugs)
 
+- **Duplicate column names in the Creator Tracker header no longer
+  abort the sync.** gspread's `get_all_records()` raises "the header
+  row in the worksheet is not unique" if ANY header column name
+  repeats — which killed the entire tracker sync for every lead, even
+  though every column the sync reads or writes was present and
+  unambiguous. The Creator Tracker is a large, hand-maintained sheet
+  and genuinely has repeated headers (a column added twice, repeated
+  blank trailing columns). Records are now built from raw
+  `get_all_values()` instead, resolving a duplicate name to its FIRST
+  occurrence — the same column `header.index()` computes for cell
+  writes, so reads and writes can never disagree about which physical
+  column they mean. Blank header cells are skipped rather than
+  becoming a `""` key. Side benefit: this replaced a separate
+  `row_values(1)` call, so it is one Sheets API read instead of two.
+
+
 - **Creator Tracker no-regression (found by end-to-end audit).** The
   tracker had the SAME multi-campaign regression bug as Asana, still
   live after the Asana one was fixed: an older campaign sharing a
