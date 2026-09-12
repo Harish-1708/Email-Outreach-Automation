@@ -1,0 +1,7 @@
+Subject: Sample intro subject A
+
+Hi {{FirstName}},
+
+Sample fixture body for intro/A.
+
+Company: {{Company}}

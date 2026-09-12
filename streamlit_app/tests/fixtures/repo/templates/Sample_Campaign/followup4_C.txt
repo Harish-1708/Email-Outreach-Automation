@@ -1,0 +1,7 @@
+Subject: 
+
+Hi {{FirstName}},
+
+Sample fixture body for followup4/C.
+
+Company: {{Company}}
