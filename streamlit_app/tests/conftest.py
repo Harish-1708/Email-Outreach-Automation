@@ -42,6 +42,17 @@ FIXTURE_TEMPLATES = os.path.join(FIXTURE_REPO, "templates")
 
 
 @pytest.fixture
+def fixture_repo_without_accounts(monkeypatch, fixture_repo):
+    """Same as fixture_repo, but with the account-slot mapping pointed at
+    a path that does not exist — for tests asserting the app's behaviour
+    when NO email accounts are configured at all. Depends on
+    fixture_repo, so the campaign/config isolation still applies."""
+    monkeypatch.setattr(config, "EMAIL_ACCOUNT_SLOT_MAPPING_ABS_PATH",
+                         os.path.join(FIXTURE_REPO, "config", "_no_such_slots_file.yaml"))
+    return fixture_repo
+
+
+@pytest.fixture
 def fixture_repo(monkeypatch):
     """Points the app's path constants at the fixture repo, so code that
     resolves campaigns and config through `config.*` sees stable,
