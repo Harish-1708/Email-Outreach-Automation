@@ -3,6 +3,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from conftest import FIXTURE_CAMPAIGN, FIXTURE_TEMPLATES
+
 from sequences_logic import (
     get_existing_stages_and_variants, load_variant_content, next_available_variant_letter,
     build_variant_edit_file, build_new_variant_files_for_all_stages, validate_new_variant_contents,
@@ -14,13 +16,13 @@ TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "templates"
 
 
 def test_get_existing_stages_and_variants_against_real_campaign():
-    stages, variants = get_existing_stages_and_variants("Kelson_Creators_Licensing", TEMPLATES_ROOT)
+    stages, variants = get_existing_stages_and_variants(FIXTURE_CAMPAIGN, FIXTURE_TEMPLATES)
     assert len(stages) == 5
     assert variants == ["A", "B", "C", "D"]
 
 
 def test_load_variant_content_against_real_campaign():
-    content = load_variant_content("Kelson_Creators_Licensing", "intro", "A", TEMPLATES_ROOT)
+    content = load_variant_content(FIXTURE_CAMPAIGN, "intro", "A", FIXTURE_TEMPLATES)
     assert content["subject"]
     assert content["body"]
 
