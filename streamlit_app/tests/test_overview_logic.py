@@ -3,6 +3,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from conftest import FIXTURE_CAMPAIGN
+
 from preview_logic import get_campaign_cfg
 from overview_logic import build_campaign_overview_row, build_all_campaigns_overview, OVERVIEW_COLUMNS
 
@@ -23,20 +25,20 @@ def test_overview_columns_has_pending_inserted_after_total_leads():
     assert OVERVIEW_COLUMNS[2] == "Pending (Not Yet Contacted)"
 
 
-def test_build_campaign_overview_row_computes_pending_correctly():
-    cfg = get_campaign_cfg("Kelson_Creators_Licensing")
+def test_build_campaign_overview_row_computes_pending_correctly(fixture_repo):
+    cfg = get_campaign_cfg(FIXTURE_CAMPAIGN)
     leads = _leads(n_with_email=5, n_contacted=2)
     row = build_campaign_overview_row(cfg, leads, responses=[], send_log=[])
 
     row_dict = dict(zip(OVERVIEW_COLUMNS, row))
-    assert row_dict["Campaign"] == "Kelson_Creators_Licensing"
+    assert row_dict["Campaign"] == FIXTURE_CAMPAIGN
     assert row_dict["Total Leads"] == "5"
     assert row_dict["Unique Contacted"] == "2"
     assert row_dict["Pending (Not Yet Contacted)"] == "3"
 
 
-def test_build_campaign_overview_row_pending_never_negative():
-    cfg = get_campaign_cfg("Kelson_Creators_Licensing")
+def test_build_campaign_overview_row_pending_never_negative(fixture_repo):
+    cfg = get_campaign_cfg(FIXTURE_CAMPAIGN)
     # Pathological case: more "contacted" markers than total leads with email
     # shouldn't be possible in real data, but pending must still floor at 0.
     leads = _leads(n_with_email=2, n_contacted=2)
@@ -45,14 +47,14 @@ def test_build_campaign_overview_row_pending_never_negative():
     assert int(row_dict["Pending (Not Yet Contacted)"]) >= 0
 
 
-def test_build_all_campaigns_overview_skips_unreadable_campaigns():
+def test_build_all_campaigns_overview_skips_unreadable_campaigns(fixture_repo):
     def fetch(name):
         if name == "Broken":
             raise RuntimeError("Tab doesn't exist yet")
-        cfg = get_campaign_cfg("Kelson_Creators_Licensing")
+        cfg = get_campaign_cfg(FIXTURE_CAMPAIGN)
         return cfg, _leads(), [], []
 
-    rows, errors = build_all_campaigns_overview(["Kelson_Creators_Licensing", "Broken"], fetch)
+    rows, errors = build_all_campaigns_overview([FIXTURE_CAMPAIGN, "Broken"], fetch)
     assert len(rows) == 1
     assert len(errors) == 1
     assert errors[0][0] == "Broken"
