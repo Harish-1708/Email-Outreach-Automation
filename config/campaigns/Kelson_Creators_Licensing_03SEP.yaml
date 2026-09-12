@@ -9,9 +9,6 @@ schedule:
   send_days:
   - mon
   - tue
-  - wed
-  - thu
-  - fri
 sending:
   daily_limit: 30
   sender_rotation: true
