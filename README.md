@@ -150,7 +150,205 @@ Remove buttons on the Email Accounts page instead:
    `EMAIL_ACCOUNTS_JSON` whenever you're ready; there's no rush, and
    nothing breaks either way in the meantime.
 
+## Actions minutes — schedules ACTIVE (public repo, unlimited)
+
+All original schedules are active. There is no minutes constraint on
+this repository.
+
+**Why:** GitHub Actions minutes are only metered for PRIVATE
+repositories. Public repos get unlimited free Actions that never draw
+from the 2,000-minute included pool. This repo is public, so its
+scheduled runs cost nothing and never count toward that allowance.
+
+Current schedules:
+
+| Workflow | Schedule | Runs/day |
+|---|---|---|
+| check_replies | `*/10 * * * *` | 144 |
+| auto_send | `*/30 * * * *` | 48 |
+| sync_asana | `15,45 * * * *` | 48 |
+| check_account_health | `0 */2 * * *` | 12 |
+| dashboard | `0 */6 * * *` | 4 |
+
+`sync_asana` is deliberately staggered to `15,45` so it never fires on
+the same minute as `auto_send` (`:00`/`:30`). That stagger is about the
+Google Sheets API per-minute READ quota, not Actions minutes — it still
+matters regardless of billing, so keep it if you change frequencies.
+
+**The real quota to watch is Google Sheets, not GitHub.** Sheets
+enforces a per-minute read limit per service account shared across
+every campaign and workflow. See the 429 backoff and the
+fetch-Sheet-once-per-sync notes below.
+
+**If a repo is ever made private**, its Actions become metered and
+these frequencies would consume roughly 256 billed minutes/day —
+about 8 days of the 2,000-minute allowance. Re-check this section
+before changing any repo's visibility.
+
 ## Known limitations (by design, not bugs)
+
+- **Creator Tracker no-regression (found by end-to-end audit).** The
+  tracker had the SAME multi-campaign regression bug as Asana, still
+  live after the Asana one was fixed: an older campaign sharing a
+  tracker row with the active one dragged `Contact Status` back from
+  Negotiating to "Outreached (Intro Sent)" on every run. Automatic
+  computation can now only move a row forward through Sourced →
+  Outreached → Follow up → Negotiating; an explicit `ManualAsanaStage`
+  can still move it any direction.
+
+- **`Last Contacted Date` is now a high-water mark.** Same audit: an
+  older campaign was overwriting a more recent contact date with its
+  own earlier one. A fresh date only wins if it is newer than an
+  existing ISO-shaped value; a hand-typed unparseable value never
+  permanently blocks a real date from being written.
+
+
+- **Automatic stage REGRESSION is now blocked — this was the root cause
+  of tasks endlessly reverting.** The same creator email can exist in
+  more than one campaign (e.g. an older completed campaign plus the
+  current active one) with the SAME `AsanaTaskGID` on both leads' rows.
+  Both campaigns' syncs therefore drive the SAME Asana task, and
+  whichever ran last won. The active campaign would correctly advance
+  the task to Negotiating on a reply; then the older campaign's sync —
+  which has no record of that reply, so computes only "Outreach Sent"
+  from its own send data — would drag it straight back. That loop
+  repeated indefinitely, which is why a task kept reverting no matter
+  how many times it was corrected by hand or how many other bugs were
+  fixed upstream in the reply-detection chain.
+
+  An automatic computation can now only move a task FORWARD through
+  Sourced → Outreach Sent → Follow-up → Negotiating, never backward.
+  Forward progress works exactly as before, an explicit
+  `ManualAsanaStage` override can still move a task in any direction
+  (including backward — a deliberate human decision is never blocked),
+  and the terminal manual-only stages keep their existing separate
+  protection.
+
+  **Worth knowing:** this stops the reverting, but the underlying
+  duplication remains — the same lead in two campaigns still means two
+  syncs writing to one task, and the same inbound reply still gets
+  logged once per campaign. If a creator is genuinely finished in an
+  older campaign, clearing their `AsanaTaskGID` on that campaign's
+  sheet stops it driving the task at all, which is cleaner than
+  relying on the no-regression rule alone.
+
+
+- **Subject matching is now normalized, not a raw string comparison.**
+  A subject makes a long round trip — outbound template, Sheet
+  ThreadSubject cell, SMTP, the recipient's mail client re-encoding it,
+  then MIME-decoded IMAP on the way back — and routinely returns with an
+  en-dash folded to a hyphen, a normal space turned into a non-breaking
+  space, or extra whitespace introduced. Each of those is the same
+  subject to a human and silently not-a-match to `==`, so a genuine
+  reply could fail subject-matching for reasons having nothing to do
+  with whether it was actually a reply. Comparison now folds unicode
+  dashes and exotic whitespace, collapses whitespace runs, and
+  lowercases before comparing. Verified that genuinely different
+  subjects (and same-subject-with-no-`Re:`) still correctly do NOT
+  match — normalization is deliberately not loose enough to weaken the
+  signal.
+
+- **Known remaining behavior worth being aware of:** the same lead
+  email can exist in more than one campaign, and each campaign's
+  `check-replies` run processes its own Sheet independently. A single
+  inbound reply will therefore be logged once per campaign containing
+  that email — including campaigns already completed. Each campaign
+  matches it against its OWN ThreadSubject, so a reply to the active
+  campaign's thread correctly subject-matches there while typically
+  staying an unverified sender-only match in the other. This is
+  working as designed, but it does mean the same reply appears in more
+  than one campaign's Responses tab.
+
+
+- **Removing a sender account from a campaign now actually takes effect
+  for leads already contacted.** A lead's `SenderAccount` is written to
+  the Sheet on first send so every follow-up in a thread comes from the
+  same address — but that pin was validated only against the global
+  `EMAIL_ACCOUNTS_JSON` (where a removed account still exists), never
+  against the campaign's own current `rotation_accounts`. The result:
+  a campaign launched with one sender, then reconfigured to use three
+  different ones, kept sending every follow-up from the removed account
+  indefinitely, and removing it from the campaign silently did nothing
+  for any lead already contacted. Now, when rotation is enabled and a
+  lead's pinned account is no longer in the campaign's current rotation
+  list, the pin is treated as stale and rotation reassigns the lead to a
+  currently-configured account. Unchanged in every other case: a pin
+  still in the rotation list still wins (thread continuity preserved),
+  rotation being disabled leaves pins entirely alone, and an
+  empty/unresolvable rotation list never causes a valid pin to be
+  discarded.
+
+
+- **The actual root cause of "the fix ran but nothing ever updates, no
+  matter how many times I run it":** `check_replies` permanently skips
+  any message whose ID is already in the Response sheet, to prevent
+  duplicate response rows — a genuinely necessary safeguard. But this
+  meant a message logged as Unverified/Email BEFORE the Subject-match
+  logic (above) existed was permanently unable to ever be reconsidered:
+  every subsequent run correctly-by-the-old-rules treated it as
+  "already seen" and skipped it outright, regardless of how many times
+  it ran or that the matching logic had since improved. A code fix to
+  matching logic can never retroactively help a message that's already
+  been recorded under the old logic — no number of re-runs changes
+  that on its own.
+
+  Fixed properly: `get_logged_message_info()` replaces the old bare
+  `get_logged_message_ids()` set with per-message match-method
+  information, so a message previously logged as anything OTHER than
+  a definitive Header or Subject match is now eligible for
+  re-evaluation on a later run. If it now resolves definitively, the
+  EXISTING response row is updated in place (`update_response_match`)
+  — never a duplicate second row — and the lead's own ReplyStatus /
+  Status update normally. If re-evaluation still doesn't resolve it,
+  nothing is touched at all: no wasted re-processing, no phantom
+  changes. A message already logged as Header or Subject is still
+  never touched again, exactly as before. Confirmed directly against
+  a real, previously-stuck Asana task and Sheet row before writing
+  this fix, and sabotage-verified by reverting to the old
+  unconditional skip and confirming the test reproduces the exact
+  "zero actions, permanently stuck" symptom.
+
+- **A reply whose threading headers were entirely stripped by the
+  sender's own mail client can now stop a sequence, without needing a
+  manual override every time.** A confirmed, real case: iOS Mail is
+  known to drop `In-Reply-To` / `References` on short replies, meaning
+  an unmistakably genuine reply — correct sender email, "Re: <exact
+  original subject>", correct recipient — was previously permanently
+  unable to ever advance past "sender-only, never stops a sequence."
+  A new `match_method` tier, "Subject", sits between the existing
+  "Header" (a provable Message-ID thread reference) and plain "Email"
+  (sender-only, still never stops anything on its own) — earned only
+  when the sender's email matches a known lead AND the reply subject
+  is one or more "Re:" prefixes followed by an EXACT match of that
+  lead's own stored `ThreadSubject`. Subject match is deliberately as
+  trusted as Header for stopping a sequence, but the classification
+  step (Genuine Reply vs Auto-Reply vs Bounce) still independently
+  governs whether it actually does — an auto-reply with a perfectly
+  matching subject still correctly never stops anything, exactly like
+  it wouldn't with a Header match either. A subject with no "Re:" at
+  all, a different subject entirely, or a lead with no `ThreadSubject`
+  ever recorded, all correctly stay on the original, narrower
+  sender-only behavior.
+
+- **Creator Tracker disambiguation now resolves a TikTok short-link vs
+  long-link mismatch, not just an identical-string match.** Found by
+  inspecting the real Asana project directly: every persistently
+  "ambiguous match" lead had its Video File recorded as TikTok's
+  short, opaque share link (`tiktok.com/t/AbCdEfG/`) while its
+  matching tracker row (or vice versa) used the long-form URL
+  (`tiktok.com/@handle/video/1234...`) — two different strings for the
+  exact same video, which raw string comparison can never resolve no
+  matter how correct the underlying data actually is. Disambiguation
+  now falls back to comparing the underlying numeric TikTok video ID,
+  extracted from either the long-form Video File URL or a Refunnel
+  Link (which embeds it as `tk_<id>` regardless of surrounding
+  query-param formatting) — this is what actually resolves it, since
+  a short share link alone never contains that numeric ID at all.
+  **Known remaining limitation:** if BOTH sides — the lead's own data
+  and the tracker row it should match — only ever have the short-link
+  form with no Refunnel Link to fall back to, there's still no way to
+  recover the numeric ID without following the redirect (not done
+  during sync), and that case stays genuinely ambiguous.
 
 - **A Google Sheets 429 quota error now gets a realistic chance to
   actually recover**, instead of failing outright. The existing
