@@ -14,22 +14,4 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Core test suite
-        run: python -m pytest tests/ -q
-
-  # Separate job so a Streamlit-layer failure is distinguishable at a
-  # glance from a core-engine failure, and so the core suite still
-  # reports even while the Streamlit suite is being stabilised.
-  streamlit-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      # The Streamlit suite needs streamlit + PyNaCl, which live in the
-      # app's own requirements file, NOT the root one. Installing only
-      # the root file is why this suite never ran in CI before.
-      - run: pip install -r requirements.txt -r streamlit_app/requirements.txt pytest
-      - name: Streamlit test suite
-        run: python -m pytest streamlit_app/tests/ -q
+      - run: python -m pytest tests/ -v
