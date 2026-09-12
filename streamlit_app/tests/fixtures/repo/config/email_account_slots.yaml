@@ -1,0 +1,9 @@
+# FIXTURE account slots — owned by the test suite. Deliberately uses
+# generic names so tests never assert against whatever the real config
+# happens to hold; renaming a production slot must not turn the suite red.
+sales1:
+  address: fixture-sales1@example.com
+  slot: 1
+sales2:
+  address: fixture-sales2@example.com
+  slot: 2
