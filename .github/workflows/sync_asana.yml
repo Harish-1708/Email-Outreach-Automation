@@ -19,24 +19,12 @@ on:
       campaign:
         description: "Campaign name — leave blank to sync every enabled campaign instead"
         required: false
-  # ── SCHEDULE DISABLED (Actions minutes conservation) ──────────────
-  # Disabled because the account hit ~92% of its 2,000 included Actions
-  # minutes with 19 days left in the billing cycle. GitHub bills each
-  # run ROUNDED UP to a full minute, so a ~30-second run still costs a
-  # full minute — the combined schedules were burning ~244 minutes/day,
-  # which would have exhausted the remaining balance in well under a
-  # day and then blocked MANUAL runs too (the same pool funds both).
-  #
-  # Run these manually from the Actions tab until the quota resets on
-  # 2026-10-01. To re-enable afterwards, uncomment the two lines below
-  # — but read the note in streamlit_app/README.md first: restoring the
-  # original frequencies will reproduce the same overage.
-  # schedule:
+  schedule:
     # Every 30 minutes, by request — the same cadence as auto_send.yml.
     # GitHub Actions cron has its own scheduling delay (typically a few
     # minutes under load), so treat this as "within roughly 30-40
     # minutes", not to-the-minute precision.
-  #   - cron: "*/30 * * * *"
+    - cron: "15,45 * * * *"
 
 # Same reasoning as check_replies.yml's concurrency block: two overlapping
 # syncs (a scheduled run and a manual click close together) could both
