@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Core test suite
+        run: python -m pytest tests/ -q
+
+  # Separate job so a Streamlit-layer failure is distinguishable at a glance
+  # from a core-engine failure.
+  streamlit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The Streamlit suite needs streamlit + PyNaCl, which live in the app's
+      # own requirements file, NOT the root one.
+      - run: pip install -r requirements.txt -r streamlit_app/requirements.txt pytest
+
+      # Guard rail. The suite reads a committed fixture repo instead of live
+      # production campaigns. If those fixture files are ever missing from the
+      # checkout, ~120 tests fail with confusing "Settings file not found" /
+      # "Templates directory not found" errors that look like real breakage.
+      # Fail here instead, with a message that says exactly what is wrong.
+      - name: Verify test fixtures are committed
+        run: |
+          set -e
+          FIX=streamlit_app/tests/fixtures/repo
+          MISSING=0
+          for f in "$FIX/config/settings.yaml" \
+                   "$FIX/config/email_account_slots.yaml" \
+                   "$FIX/templates/Sample_Campaign/intro_A.txt"; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; MISSING=1; fi
+          done
+          COUNT=$(ls "$FIX/templates/Sample_Campaign" 2>/dev/null | wc -l)
+          if [ "$COUNT" -ne 20 ]; then
+            echo "EXPECTED 20 fixture template files, found $COUNT"; MISSING=1
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo ""
+            echo "The test fixture repo is incomplete in this checkout."
+            echo "These files must be COMMITTED - the Streamlit suite reads them"
+            echo "instead of live campaign data. Without them ~120 tests fail."
+            exit 1
+          fi
+          echo "Fixture repo present and complete ($COUNT template files)."
+
+      - name: Streamlit test suite
+        run: python -m pytest streamlit_app/tests/ -q
